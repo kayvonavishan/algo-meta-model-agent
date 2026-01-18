@@ -214,6 +214,11 @@ alpha_raw_t = alpha_low + frac * (alpha_high - alpha_low)
 alpha_t = alpha_smooth * alpha_raw_t + (1 - alpha_smooth) * alpha_{t-1}
 ```
 
+Note on clipping:
+
+- We clip `z_t` to `[z_low, z_high]` so `alpha_raw_t` always stays inside `[alpha_low, alpha_high]`.
+- This prevents rare dispersion spikes from creating extreme alpha values that would overreact or over-smooth.
+
 Full worked examples (including the EMA smoothing step):
 
 ```
