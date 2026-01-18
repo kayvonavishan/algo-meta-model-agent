@@ -105,15 +105,51 @@ This section is the core math. All steps below are performed per ticker, for the
 
 ### Step 1. Dispersion -> adaptive alpha
 
-We measure cross-model dispersion each period using the MAD-based robust std:
+Goal: quantify how much the models disagree within a period, then use that to decide how fast the momentum signal should adapt.
+
+#### 1) Dispersion within a single period (robust spread)
+
+We want a single number that says "how spread out are the model returns this period?" Instead of a standard deviation (which can be distorted by outliers), we use the MAD-based robust std:
 
 - `disp_t = 1.4826 * median(|R_{i,t} - median(R_{:,t})|)`
 
-Then compute a rolling z-score over `disp_t` with window `vol_window`. The z-score is mapped to a time-varying EMA alpha:
+Intuition:
+
+- Take the median return for the period (a robust "center").
+- Measure how far each model is from that median.
+- The median of those distances is the MAD (median absolute deviation).
+- Multiply by 1.4826 so that, for a normal distribution, this behaves like a standard deviation.
+
+Toy example for one period (5 models):
+
+```
+returns:  [-0.01, 0.00, 0.01, 0.02, 0.10]
+median:   0.01
+abs devs: [0.02, 0.01, 0.00, 0.01, 0.09]
+MAD:      0.01
+disp_t:   1.4826 * 0.01 = 0.014826
+```
+
+So `disp_t` is the "typical spread" around the median, but robust to that 0.10 outlier.
+
+#### 2) Is dispersion unusually high or low?
+
+Dispersion itself is not enough; we care about whether it is high *relative to recent history*. We standardize it with a rolling z-score over a window `vol_window`:
 
 - `z_t = (disp_t - mean(disp_{t-w+1:t})) / std(disp_{t-w+1:t})`
+
+Intuition:
+
+- `z_t > 0` means dispersion is higher than usual.
+- `z_t < 0` means dispersion is lower than usual.
+- The magnitude tells you how unusual it is.
+
+#### 3) Map dispersion regime to a smoothing speed (alpha)
+
+We convert `z_t` into a time-varying EMA alpha:
+
 - `alpha_t = map(z_t)`
-- `alpha_t` is smoothed by EMA using `alpha_smooth`
+- Then `alpha_t` is smoothed again with an EMA (`alpha_smooth`) so it does not jump around too much.
 
 Mapping is linear between `alpha_low` and `alpha_high`, clipped by `z_low` and `z_high`:
 
@@ -124,8 +160,10 @@ alpha_t = alpha_low + frac * (alpha_high - alpha_low)
 
 Interpretation:
 
-- Higher dispersion -> higher alpha -> shorter memory.
-- Lower dispersion -> lower alpha -> longer memory.
+- Higher dispersion => larger `alpha_t` => *shorter memory* (the model reacts faster to recent info).
+- Lower dispersion => smaller `alpha_t` => *longer memory* (the model smooths more and changes slowly).
+
+In plain terms: when models strongly disagree, we trust recent data more; when they agree, we let the trend evolve slowly.
 
 ### Step 2. Percentile ranks
 
