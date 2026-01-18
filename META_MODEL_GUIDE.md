@@ -178,6 +178,14 @@ frac = (clip(z_t, z_low, z_high) - z_low) / (z_high - z_low)
 alpha_t = alpha_low + frac * (alpha_high - alpha_low)
 ```
 
+Intuition for these equations:
+
+- `clip(z_t, z_low, z_high)` caps extreme dispersion so the mapping stays stable.
+- The `frac` line rescales the clipped z-score from the range `[z_low, z_high]` into `[0, 1]`.
+- The second line is just a linear interpolation between `alpha_low` and `alpha_high` using that 0..1 fraction.
+
+In words: "convert how unusual dispersion is into a normalized slider (0..1), then slide between the slowest and fastest allowed EMA speeds."
+
 Interpretation:
 
 - Higher dispersion => larger `alpha_t` => *shorter memory* (the model reacts faster to recent info).
