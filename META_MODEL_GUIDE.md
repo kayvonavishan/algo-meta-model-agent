@@ -199,6 +199,21 @@ What this changes downstream:
 - In Case C, recent rank changes dominate (faster adaptation).
 - In Case A, older ranks still matter more (slower adaptation).
 
+Mapping vs smoothing (important distinction):
+
+- The mapping step converts dispersion z-scores into a *raw* alpha for the current period:
+
+```
+frac = (clip(z_t, z_low, z_high) - z_low) / (z_high - z_low)
+alpha_raw_t = alpha_low + frac * (alpha_high - alpha_low)
+```
+
+- The smoothing step then uses an EMA over time to avoid jumps:
+
+```
+alpha_t = alpha_smooth * alpha_raw_t + (1 - alpha_smooth) * alpha_{t-1}
+```
+
 Full worked examples (including the EMA smoothing step):
 
 ```
