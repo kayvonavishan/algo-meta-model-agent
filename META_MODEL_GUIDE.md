@@ -144,9 +144,29 @@ Intuition:
 - `z_t < 0` means dispersion is lower than usual.
 - The magnitude tells you how unusual it is.
 
+Example scenarios (assume recent window mean=0.02, std=0.005):
+
+```
+Case A (normal-ish): disp_t = 0.02
+z_t = (0.02 - 0.02) / 0.005 = 0.0  -> typical dispersion
+
+Case B (high dispersion): disp_t = 0.035
+z_t = (0.035 - 0.02) / 0.005 = 3.0 -> much higher than usual
+
+Case C (low dispersion): disp_t = 0.0125
+z_t = (0.0125 - 0.02) / 0.005 = -1.5 -> lower than usual
+```
+
+In practice, large positive `z_t` values occur when a few models are far apart (big disagreement), while large negative `z_t` values occur when most models are clustered tightly (high agreement).
+
 #### 3) Map dispersion regime to a smoothing speed (alpha)
 
-We convert `z_t` into a time-varying EMA alpha:
+We convert `z_t` into a time-varying EMA alpha. Think of `alpha_t` as the "speed knob" for the momentum signal:
+
+- High `alpha_t` = fast response to recent changes (short memory).
+- Low `alpha_t` = slow response (long memory, more smoothing).
+
+Because dispersion changes over time, we want the smoothing speed to change over time too. That is all "time-varying EMA alpha" means: the EMA uses a different alpha each period instead of a single fixed value.
 
 - `alpha_t = map(z_t)`
 - Then `alpha_t` is smoothed again with an EMA (`alpha_smooth`) so it does not jump around too much.
@@ -164,6 +184,20 @@ Interpretation:
 - Lower dispersion => smaller `alpha_t` => *longer memory* (the model smooths more and changes slowly).
 
 In plain terms: when models strongly disagree, we trust recent data more; when they agree, we let the trend evolve slowly.
+
+Example (assume `alpha_low=0.30`, `alpha_high=0.70`, `z_low=-1`, `z_high=1`):
+
+```
+Case A (low dispersion): z_t = -1.0 -> alpha_t = 0.30
+Case B (typical):        z_t =  0.0 -> alpha_t = 0.50
+Case C (high dispersion):z_t =  1.0 -> alpha_t = 0.70
+```
+
+What this changes downstream:
+
+- The adaptive momentum in Step 3 uses `alpha_t` to weight recent periods.
+- In Case C, recent rank changes dominate (faster adaptation).
+- In Case A, older ranks still matter more (slower adaptation).
 
 ### Step 2. Percentile ranks
 
