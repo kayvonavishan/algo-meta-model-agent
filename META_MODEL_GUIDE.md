@@ -199,6 +199,47 @@ What this changes downstream:
 - In Case C, recent rank changes dominate (faster adaptation).
 - In Case A, older ranks still matter more (slower adaptation).
 
+Full worked examples (including the EMA smoothing step):
+
+```
+Defaults:
+alpha_low=0.30, alpha_high=0.70, z_low=-1, z_high=1, vol_window=4, alpha_smooth=0.30
+```
+
+Low dispersion:
+
+```
+disp window: [0.010, 0.012, 0.011, 0.009]
+mean = 0.0105
+std  = 0.0011 (approx)
+current disp_t = 0.009
+z_t = (0.009 - 0.0105) / 0.0011 ≈ -1.36 -> clip to -1.0
+alpha_raw = 0.30
+```
+
+If previous alpha was 0.40:
+
+```
+alpha_t = 0.30 * 0.30 + 0.70 * 0.40 = 0.37
+```
+
+High dispersion:
+
+```
+disp window: [0.020, 0.022, 0.018, 0.021]
+mean = 0.02025
+std  = 0.0017 (approx)
+current disp_t = 0.024
+z_t = (0.024 - 0.02025) / 0.0017 ≈ 2.21 -> clip to 1.0
+alpha_raw = 0.70
+```
+
+If previous alpha was 0.40:
+
+```
+alpha_t = 0.30 * 0.70 + 0.70 * 0.40 = 0.49
+```
+
 ### Step 2. Percentile ranks
 
 Convert raw returns into cross-sectional ranks per period:
