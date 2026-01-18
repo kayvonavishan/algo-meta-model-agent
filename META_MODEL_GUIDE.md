@@ -219,6 +219,29 @@ Note on clipping:
 - We clip `z_t` to `[z_low, z_high]` so `alpha_raw_t` always stays inside `[alpha_low, alpha_high]`.
 - This prevents rare dispersion spikes from creating extreme alpha values that would overreact or over-smooth.
 
+Visual intuition (mapping):
+
+```
+alpha
+0.70 |           ________ alpha_high
+     |          /
+0.50 |         /
+0.30 |________/  alpha_low
+     +---------------------
+      z_low   0    z_high
+```
+
+Example lookup (with defaults):
+
+```
+z_t     alpha_raw_t
+-2.0 -> 0.30  (clipped to z_low)
+-1.0 -> 0.30
+ 0.0 -> 0.50
+ 1.0 -> 0.70
+ 2.0 -> 0.70  (clipped to z_high)
+```
+
 Full worked examples (including the EMA smoothing step):
 
 ```
