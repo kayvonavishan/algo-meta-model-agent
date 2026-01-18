@@ -1,0 +1,32 @@
+{
+  "repo_root": "..",
+  "iterations": 1,
+  "sweep_command": "python adaptive_vol_momentum.py",
+  "sweep_cwd": ".",
+  "results_csv": "C:\\Users\\micha\\myhome\\algo\\artifacts\\period_returns\\meta_config_sweep_results.csv",
+  "baseline_csv": "agentic_experimentation\\baselines\\meta_config_sweep_results_baseline.csv",
+  "base_on_working_tree": true,
+  "keep_worktrees": false,
+  "worktree_root": "agentic_experimentation\\worktrees",
+  "experiments_root": "agentic_experimentation\\experiments",
+  "prompts": {
+    "idea": "agentic_experimentation\\prompts\\idea_prompt.txt",
+    "patch": "agentic_experimentation\\prompts\\patch_prompt.txt"
+  },
+  "llm": {
+    "provider": "dummy",
+    "model": "gpt-4.1",
+    "api_key_env": "OPENAI_API_KEY",
+    "base_url": "",
+    "timeout_sec": 60,
+    "max_tokens": 1200,
+    "temperature": 0.2,
+    "dummy_idea_text": "IDEA: Increase top_n_global by a small amount to test sensitivity.\nRATIONALE: Tests robustness to selection breadth.\nFILES: adaptive_vol_momentum.py\nRISKS: Might dilute signal if too large.",
+    "dummy_patch_mode": "noop",
+    "dummy_patch_path": "agentic_experimentation\\examples\\sample_patch.diff"
+  },
+  "scoring": {
+    "score_column": "CHANGE_ME",
+    "higher_is_better": true
+  }
+}

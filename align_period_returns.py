@@ -1,7 +1,7 @@
 import pandas as pd
 
-from adaptive_vol_momentum import (
-    MetaConfig,
+from config import MetaConfig
+from io_periods import (
     find_first_common_monday,
     wide_to_long_periods,
     aggregate_daily_periods_to_windows,
@@ -12,7 +12,7 @@ from adaptive_vol_momentum import (
 
 def main() -> None:
     cfg = MetaConfig()
-    window_weeks = 2
+    window_weeks = 1
     window_days = window_weeks * 7
 
     file_path = r"C:\Users\micha\myhome\algo\artifacts\period_returns\period_returns_days_1.csv"

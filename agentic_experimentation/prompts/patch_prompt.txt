@@ -1,0 +1,12 @@
+Create a unified diff patch for the idea below.
+
+Idea:
+{idea_text}
+
+Repository context:
+{repo_context}
+
+Rules:
+- Output ONLY the patch text, no code fences.
+- Keep the change minimal.
+- Modify existing files if possible.

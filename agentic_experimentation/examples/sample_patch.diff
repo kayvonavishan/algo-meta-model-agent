@@ -1,0 +1,5 @@
+--- a/adaptive_vol_momentum.py
++++ b/adaptive_vol_momentum.py
+@@
+-    top_n_global=20,
++    top_n_global=25,
