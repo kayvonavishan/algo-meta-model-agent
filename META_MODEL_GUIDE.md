@@ -223,6 +223,13 @@ If previous alpha was 0.40:
 alpha_t = 0.30 * 0.30 + 0.70 * 0.40 = 0.37
 ```
 
+Where the numbers come from:
+
+- `0.30` (first) is `alpha_smooth` (the EMA smoothing factor).
+- `0.30` (second) is `alpha_raw` from the clipped z-score mapping.
+- `0.70` is `(1 - alpha_smooth)`.
+- `0.40` is the previous smoothed alpha value (`alpha_{t-1}`).
+
 High dispersion:
 
 ```
