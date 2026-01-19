@@ -432,6 +432,34 @@ Subtract a cross-sectional baseline to convert to "relative" performance within 
 - `baseline_t = median_i(base_{i,t})` (or mean if configured)
 - `rel_{i,t} = base_{i,t} - baseline_t`
 
+Intuition:
+
+- Raw scores (`base_{i,t}`) can drift up or down together if the whole ticker is in a strong or weak regime.
+- Subtracting the baseline recenters the scores so we measure *relative* strength within the ticker for that period.
+- This keeps the ranking fair even if the entire ticker’s models are having a great (or terrible) period.
+
+Toy example (one period):
+
+```
+base scores by model:
+Model A: 0.20
+Model B: 0.10
+Model C: 0.05
+Model D: 0.00
+
+baseline_t = median(base) = (0.05 + 0.10)/2 = 0.075
+
+relative scores:
+Model A: 0.20 - 0.075 = 0.125
+Model B: 0.10 - 0.075 = 0.025
+Model C: 0.05 - 0.075 = -0.025
+Model D: 0.00 - 0.075 = -0.075
+```
+
+Config value used here:
+
+- `baseline_method` (`median` or `mean`)
+
 ### Step 6. Confidence (training-free)
 
 Confidence is higher when a model's rank is stable and participation is high:
