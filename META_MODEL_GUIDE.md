@@ -391,6 +391,40 @@ Add a small delta term to capture recent acceleration:
 - `D_{i,t} = Q_{i,t} - Q_{i,t-1}`
 - `base_{i,t} = M_{i,t} + delta_weight * D_{i,t}`
 
+Intuition:
+
+- `M_{i,t}` is a smoothed rank signal, so it can lag when a model suddenly improves or deteriorates.
+- `D_{i,t}` is the *one-period change* in rank, so it catches that short-term acceleration.
+- `delta_weight` controls how much of this short-term change we add on top of the smoother momentum.
+
+Toy example:
+
+```
+Assume:
+M_{i,t} = 0.60
+Q_{i,t-1} = 0.40
+Q_{i,t}   = 0.70
+delta_weight = 0.20
+
+D_{i,t} = 0.70 - 0.40 = 0.30
+base_{i,t} = 0.60 + 0.20 * 0.30
+          = 0.60 + 0.06
+          = 0.66
+```
+
+If the rank is falling instead:
+
+```
+Q_{i,t-1} = 0.70
+Q_{i,t}   = 0.40
+D_{i,t} = -0.30
+base_{i,t} = 0.60 + 0.20 * (-0.30) = 0.54
+```
+
+Config value used here:
+
+- `delta_weight` (from `MetaConfig`)
+
 ### Step 5. Ticker-local baseline
 
 Subtract a cross-sectional baseline to convert to "relative" performance within the ticker:
