@@ -513,6 +513,38 @@ A risk penalty is computed on rank residuals:
 
 This penalizes models with frequent or deep negative rank deviations.
 
+Intuition:
+
+- `Q_{i,t}` is a rank in [0, 1]. Subtracting 0.5 recenters it around "average."  
+  - Positive residuals mean the model is usually above average.
+  - Negative residuals mean it is below average.
+- CVaR focuses on the *worst* residuals (left tail), not the typical ones.
+- If a model has occasional large negative drops in rank, its downside CVaR rises, and the penalty increases.
+
+Toy example (one model, 6-period lookback, `cvar_alpha = 0.20`):
+
+```
+Q history:     [0.60, 0.55, 0.20, 0.70, 0.10, 0.40]
+residuals:     [0.10, 0.05, -0.30, 0.20, -0.40, -0.10]
+
+Worst 20% tail (1 value out of 6) is about the most negative residual:
+tail = [-0.40]
+CVaR = mean(tail) = -0.40
+downside CVaR penalty = max(0, -CVaR) = 0.40
+
+If cvar_risk_aversion = 0.75:
+risk_pen = 0.75 * 0.40 = 0.30
+```
+
+So a model that occasionally collapses in rank gets its score reduced more than a model with smaller, steadier fluctuations.
+
+Config values used here:
+
+- `risk_lookback` (rolling window length)
+- `cvar_alpha` (tail depth, e.g., 0.10 = worst 10%)
+- `cvar_risk_aversion` (penalty strength)
+- `cvar_window_stride` (optional downsampling inside the window for speed)
+
 ### Step 8. Uniqueness weighting
 
 `compute_uniqueness_weights` currently returns all-ones to avoid leakage. The intended behavior is:
