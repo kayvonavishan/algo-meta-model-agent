@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
@@ -26,6 +28,26 @@ from reporting import (
     compute_significance_metrics,
 )
 from selection import select_models_universal_v2
+
+
+def _run_scorecard(sweep_path: str) -> None:
+    """
+    Invoke build_scorecard.py on the given sweep results path.
+    Non-fatal: logs and continues on error.
+    """
+    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_scorecard.py")
+    if not os.path.exists(script_path):
+        print(f"[scorecard] build_scorecard.py not found at {script_path}; skipping scorecard.")
+        return
+    try:
+        subprocess.run(
+            [sys.executable, script_path, "--input", sweep_path],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        print(f"[scorecard] Failed to build scorecard: {exc}. stderr: {exc.stderr}")
 
 
 def _stratified_values(values: List[Any], n: int, rng: np.random.Generator) -> List[Any]:
@@ -95,11 +117,14 @@ def run_config_sweep(
     warmup_periods: int = 20,
     oos_start_date: Optional[Union[str, pd.Timestamp]] = None,
     enable_plots: bool = True,
+    scorecard_every: Optional[int] = None,
 ) -> None:
+    if scorecard_every is None and hasattr(base_cfg, "scorecard_every"):
+        scorecard_every = base_cfg.scorecard_every
     configs = build_config_grid_v1(n_configs=n_configs, seed=seed)
     images_dir = os.path.join(os.path.dirname(out_path), "avg_trade_return_plots")
     os.makedirs(images_dir, exist_ok=True)
-    for cfg_rec in configs:
+    for idx, cfg_rec in enumerate(configs):
         cfg = MetaConfig(**{
             **base_cfg.__dict__,
             "vol_window": cfg_rec["vol_window"],
@@ -210,6 +235,10 @@ def run_config_sweep(
                 f"core_metrics_config_{cfg_rec['config_id']:03d}.csv",
             )
             metrics.to_csv(metrics_path)
+            for scope in metrics.columns:
+                series = metrics[scope]
+                for key, val in series.to_dict().items():
+                    row[f"core_{scope}_{key}"] = val
             rel_metrics = compute_relative_edge_metrics(curves)
             rel_metrics_path = os.path.join(
                 images_dir,
@@ -283,3 +312,13 @@ def run_config_sweep(
         out_df = pd.DataFrame([row])
         header = not os.path.exists(out_path)
         out_df.to_csv(out_path, mode="a", header=header, index=False)
+
+        # Periodic scorecard generation
+        if scorecard_every is not None and scorecard_every > 0:
+            if (idx + 1) % scorecard_every == 0:
+                _run_scorecard(out_path)
+
+    # Final scorecard at end (if last batch not aligned to interval)
+    if scorecard_every is not None and scorecard_every > 0:
+        if len(configs) % scorecard_every != 0:
+            _run_scorecard(out_path)

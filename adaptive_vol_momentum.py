@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 
 import pandas as pd
 
@@ -137,7 +138,13 @@ if not aligned_returns:
 long_df = wide_to_long_periods(aligned_df)
 print(f"Aligned long df: {long_df.shape} rows (model-period records)")
 
-out_path = r"C:\Users\micha\myhome\algo\artifacts\period_returns\meta_config_sweep_results.csv"
+base_artifacts_dir = r"C:\Users\micha\myhome\algo\artifacts\period_returns"
+run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+run_dir = os.path.join(base_artifacts_dir, f"run_{run_ts}")
+os.makedirs(run_dir, exist_ok=True)
+print(f"Writing sweep outputs under: {run_dir}")
+
+out_path = os.path.join(run_dir, "meta_config_sweep_results.csv")
 run_config_sweep(
     aligned_returns,
     long_df,
@@ -147,20 +154,21 @@ run_config_sweep(
     seed=42,
     warmup_periods=20,
     oos_start_date="2024-11-09",
+    scorecard_every=cfg.scorecard_every,
 )
 
-selections = select_models_universal_v2(aligned_returns, cfg)
-print(f"Selections: {selections.shape}")
+# selections = select_models_universal_v2(aligned_returns, cfg)
+# print(f"Selections: {selections.shape}")
 
-out_path = r"C:\Users\micha\myhome\algo\artifacts\period_returns\meta_selections_universal_no_ml.csv"
-selections.to_csv(out_path, index=False)
-print(f"Saved selections to: {out_path}")
+# selections_out = os.path.join(run_dir, "meta_selections_universal_no_ml.csv")
+# selections.to_csv(selections_out, index=False)
+# print(f"Saved selections to: {selections_out}")
 
-curves = compute_equity_curves(aligned_returns, selections, long_df, warmup_periods=20, top_n=cfg.top_n_global)
-curves_out = aligned_file_path.replace(".csv", "_equity_curves.csv")
-curves.to_csv(curves_out, index=False)
-print(f"Saved equity curves to: {curves_out}")
+# curves = compute_equity_curves(aligned_returns, selections, long_df, warmup_periods=20, top_n=cfg.top_n_global)
+# curves_out = os.path.join(run_dir, "meta_equity_curves.csv")
+# curves.to_csv(curves_out, index=False)
+# print(f"Saved equity curves to: {curves_out}")
 
-plot_out = aligned_file_path.replace(".csv", "_equity_curves.png")
-plot_equity_curves(curves, plot_out)
-print(f"Saved equity curve plot to: {plot_out}")
+# plot_out = os.path.join(run_dir, "meta_equity_curves.png")
+# plot_equity_curves(curves, plot_out)
+# print(f"Saved equity curve plot to: {plot_out}")

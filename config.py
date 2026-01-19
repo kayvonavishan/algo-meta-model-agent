@@ -44,3 +44,6 @@ class MetaConfig:
     top_m_for_ticker_gate: int = 5   # use top M per ticker to compute ticker score
     per_ticker_cap: Optional[int] = None  # cap selected models per ticker (None = no cap)
     min_ticker_score: Optional[float] = None  # abstain tickers below this score (None = no abstain)
+
+    # Sweep / reporting
+    scorecard_every: Optional[int] = 10  # build scorecard every N configs during sweep (None = disable)
