@@ -564,6 +564,36 @@ Then the score is shifted by 1 period to keep it causal:
 
 - score for period `t` uses data up through period `t-1`.
 
+Intuition:
+
+- `rel_{i,t}` says whether a model is better or worse than its peers this period.
+- `CONF_{i,t}` scales that by how *stable* the model has been.
+- `risk_pen_{i,t}` subtracts a penalty for downside rank shocks.
+- `uniq_i` (when enabled) shrinks scores for highly redundant models.
+
+So the final score is: "relative strength, adjusted for stability, penalized for downside risk, and de-duplicated."
+
+Causal shift (why it matters):
+
+- When you select models for period `t`, you should only use information available *before* period `t` starts.
+- The shift enforces that: scores computed with data through `t-1` are applied to period `t`.
+- This prevents look-ahead bias in backtests.
+
+Toy timeline:
+
+```
+Period 1 returns -> compute score for Period 2
+Period 2 returns -> compute score for Period 3
+...
+```
+
+In code, this is implemented as:
+
+```
+scores_df = scores_df.shift(axis=1)
+ticker_score = ticker_score.shift(1)
+```
+
 ### Step 10. Ticker score
 
 For each period, compute a per-ticker gate score:
