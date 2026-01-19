@@ -345,7 +345,44 @@ Two options exist; the current path uses a bounded lookback window:
 - `M_{i,t} = weighted_avg(Q_{i, t-L+1:t})`
 - Weights are derived from the time-varying `alpha_t` (higher alpha emphasizes recent periods).
 
-This is implemented by `_adaptive_momentum_window`.
+Intuition:
+
+- `Q_{i,t}` is the rank of model `i` this period.
+- `M_{i,t}` is a smoothed version of that rank over recent periods.
+- If ranks are steadily improving, `M_{i,t}` rises.
+- If ranks are choppy, `M_{i,t}` stays closer to the recent average.
+
+What makes it "adaptive" is that the weights change with `alpha_t`:
+
+- When dispersion is high, `alpha_t` is larger, so the most recent ranks get more weight.
+- When dispersion is low, `alpha_t` is smaller, so the window is flatter (more smoothing).
+
+Config values used here:
+
+- `enable_momentum_lookback`: if True, use a fixed window of size `momentum_lookback`.
+- `momentum_lookback`: how many periods are included in the window when enabled.
+- `alpha_t`: time-varying weight derived in Step 1.
+
+Toy example (single model, one period t, fixed alpha for simplicity):
+
+```
+Q history over last 3 periods (L=3):
+Q_{i,t-2} = 0.20
+Q_{i,t-1} = 0.50
+Q_{i,t}   = 0.90
+
+Assume alpha_t = 0.50 (constant in this toy example).
+Window weights (after normalization) are roughly:
+[0.14, 0.29, 0.57]  # oldest -> newest
+
+M_{i,t} = 0.20*0.14 + 0.50*0.29 + 0.90*0.57
+        = 0.028 + 0.145 + 0.513
+        = 0.686 (approx)
+```
+
+If alpha_t were higher (say 0.70), the newest period would get even more weight and M_{i,t} would move closer to 0.90. If alpha_t were lower (say 0.30), the weights would be flatter and M_{i,t} would move closer to the simple average.
+
+This is implemented by `_adaptive_momentum_window` when `enable_momentum_lookback` is True. If it is False, `_adaptive_momentum_recursive` uses a standard EMA over all history (no fixed lookback).
 
 ### Step 4. Delta adjustment
 
