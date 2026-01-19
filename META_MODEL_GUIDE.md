@@ -266,7 +266,7 @@ disp window: [0.010, 0.012, 0.011, 0.009]
 mean = 0.0105
 std  = 0.0011 (approx)
 current disp_t = 0.009
-z_t = (0.009 - 0.0105) / 0.0011 ≈ -1.36 -> clip to -1.0
+z_t = (0.009 - 0.0105) / 0.0011 approx -1.36 -> clip to -1.0
 alpha_raw = 0.30
 ```
 
@@ -290,7 +290,7 @@ disp window: [0.020, 0.022, 0.018, 0.021]
 mean = 0.02025
 std  = 0.0017 (approx)
 current disp_t = 0.024
-z_t = (0.024 - 0.02025) / 0.0017 ≈ 2.21 -> clip to 1.0
+z_t = (0.024 - 0.02025) / 0.0017 approx 2.21 -> clip to 1.0
 alpha_raw = 0.70
 ```
 
@@ -307,6 +307,36 @@ Convert raw returns into cross-sectional ranks per period:
 - `Q_{i,t} = rank(R_{i,t} among models at t)`, scaled to [0,1]
 
 This makes the scoring robust to scale differences and outliers.
+
+How it works (toy example, one period):
+
+```
+returns by model:
+Model A:  0.03
+Model B: -0.01
+Model C:  0.00
+Model D:  0.02
+
+sorted values: [-0.01, 0.00, 0.02, 0.03]
+ranks:          1      2     3     4
+percentiles:   (rank-1)/(n-1) with n=4
+             -> [0.00, 0.33, 0.67, 1.00]
+```
+
+So the percentile ranks are:
+
+```
+Model A: 1.00
+Model B: 0.00
+Model C: 0.33
+Model D: 0.67
+```
+
+Notes:
+
+- NaNs are ignored when ranking (models with missing returns get NaN ranks).
+- Ties are assigned adjacent ranks (no averaging), so equal values will get close but not identical percentiles.
+- No `MetaConfig` parameters affect this step; it is purely a per-period cross-sectional ranking.
 
 ### Step 3. Adaptive momentum of ranks
 
