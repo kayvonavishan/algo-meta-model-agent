@@ -469,6 +469,38 @@ Confidence is higher when a model's rank is stable and participation is high:
 - `raw_conf_{i,t} = 1 / (std_{i,t} + conf_eps) * sqrt(participation_{i,t})`
 - `CONF_{i,t}` = percentile rank of `raw_conf_{i,t}` across models
 
+Intuition:
+
+- If a model’s rank is steady over the last `conf_lookback` periods, its `std_{i,t}` is small.
+- Small std means the model is consistently good (or consistently bad), which is more reliable than a model that whipsaws.
+- `participation_{i,t}` downweights models that are missing lots of data.
+- The final `CONF_{i,t}` is a percentile rank so confidence is compared *within* the ticker at each period.
+
+Toy example (one period, 3-period lookback):
+
+```
+Model A ranks (last 3): [0.80, 0.82, 0.79]  -> std approx 0.015
+Model B ranks (last 3): [0.20, 0.90, 0.10]  -> std approx 0.36
+Model C ranks (last 3): [0.50, 0.50, 0.50]  -> std = 0.00
+
+Assume full participation for all models, conf_eps = 1e-8:
+raw_conf = 1 / (std + conf_eps)
+Model A: 1 / 0.015 = 66.7
+Model B: 1 / 0.36  = 2.8
+Model C: 1 / 0.00  -> very large (capped only by conf_eps)
+```
+
+After percentile ranking within the ticker for that period:
+
+- Model C gets the highest confidence.
+- Model A gets medium confidence.
+- Model B gets low confidence.
+
+Config values used here:
+
+- `conf_lookback` (window length)
+- `conf_eps` (stability floor to avoid divide-by-zero)
+
 ### Step 7. Risk penalty (downside CVaR)
 
 A risk penalty is computed on rank residuals:
