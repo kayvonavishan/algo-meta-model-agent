@@ -1,0 +1,14 @@
+IDEA: Increase top_n_global to 25 to test broader selection breadth.
+RATIONALE: Checks whether a slightly wider roster improves stability without diluting signal.
+FILES: adaptive_vol_momentum.py
+RISKS: May admit weaker candidates and reduce overall Sharpe.
+
+IDEA: Raise min_vol_threshold slightly to filter out extreme low-vol names.
+RATIONALE: Reduces potential over-allocation to ultra-stable assets that can drag returns.
+FILES: adaptive_vol_momentum.py
+RISKS: Could remove genuinely strong low-vol performers.
+
+IDEA: Shorten the momentum lookback window by 10 days to increase responsiveness.
+RATIONALE: Makes the model quicker to adapt to regime shifts.
+FILES: adaptive_vol_momentum.py
+RISKS: Adds turnover and noise if the window becomes too short.

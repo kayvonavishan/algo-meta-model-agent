@@ -1,6 +1,6 @@
 {
   "repo_root": "..",
-  "iterations": 1,
+  "ideas_file": "agentic_experimentation\\ideas.txt",
   "sweep_command": "python adaptive_vol_momentum.py",
   "sweep_cwd": ".",
   "results_csv": "C:\\Users\\micha\\myhome\\algo\\artifacts\\period_returns\\meta_config_sweep_results.csv",
@@ -10,7 +10,6 @@
   "worktree_root": "agentic_experimentation\\worktrees",
   "experiments_root": "agentic_experimentation\\experiments",
   "prompts": {
-    "idea": "agentic_experimentation\\prompts\\idea_prompt.txt",
     "patch": "agentic_experimentation\\prompts\\patch_prompt.txt"
   },
   "llm": {

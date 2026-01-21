@@ -20,14 +20,15 @@ def main():
     args = _parse_args()
     config_path = Path(args.config).resolve()
     config = _load_json(config_path)
-    if args.iterations is not None:
-        config["iterations"] = args.iterations
 
     repo_root = _resolve_repo_root(config, config_path)
     experiments_root = _resolve_path(repo_root, config.get("experiments_root"))
     worktree_root = _resolve_path(repo_root, config.get("worktree_root"))
     baseline_csv = _resolve_path(repo_root, config.get("baseline_csv"))
     results_csv = Path(config.get("results_csv")).expanduser()
+    ideas_path = _resolve_path(repo_root, config.get("ideas_file"))
+    if not ideas_path:
+        raise RuntimeError("ideas_file must be set in the config.")
 
     if args.refresh_baseline:
         _refresh_baseline(results_csv, baseline_csv)
@@ -37,10 +38,21 @@ def main():
     if not baseline_csv.exists():
         raise RuntimeError(f"Baseline CSV not found at {baseline_csv}. Run with --refresh-baseline.")
 
+    ideas = _load_ideas(ideas_path)
+    if not ideas:
+        raise RuntimeError(f"ideas_file provided but no ideas found at {ideas_path}")
+
     llm_config = config.get("llm", {})
     llm = DummyClient(llm_config) if args.dry_run_llm else build_llm_client(llm_config)
 
-    iterations = int(config.get("iterations", 1))
+    iterations_requested = args.iterations
+    if iterations_requested is None:
+        iterations_requested = config.get("iterations", len(ideas))
+    iterations = int(iterations_requested)
+    if iterations > len(ideas):
+        raise RuntimeError(
+            f"Requested {iterations} iterations but only {len(ideas)} ideas in {ideas_path}"
+        )
     experiments_root.mkdir(parents=True, exist_ok=True)
 
     for i in range(iterations):
@@ -54,12 +66,9 @@ def main():
                 sync_working_tree(repo_root, worktree_path)
 
             repo_context = _build_repo_context(repo_root)
-            idea_prompt = _render_prompt(
-                _read_text(_resolve_path(repo_root, config["prompts"]["idea"])),
-                repo_context=repo_context,
-            )
-            _write_text(exp_dir / "idea_prompt.txt", idea_prompt)
-            idea_text = llm.generate(idea_prompt, system_prompt=SYSTEM_PROMPT)
+            idea_text = ideas[i]
+            idea_note = f"Idea loaded from {ideas_path} ({i + 1}/{len(ideas)})."
+            _write_text(exp_dir / "idea_source.txt", idea_note)
             _write_text(exp_dir / "idea.md", idea_text)
 
             patch_prompt = _render_prompt(
@@ -233,6 +242,12 @@ def _write_text(path, content):
 
 def _render_prompt(template, **kwargs):
     return template.format(**kwargs)
+
+
+def _load_ideas(path):
+    content = _read_text(path)
+    blocks = [block.strip() for block in content.split("\n\n") if block.strip()]
+    return blocks
 
 
 if __name__ == "__main__":
