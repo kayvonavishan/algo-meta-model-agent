@@ -3,6 +3,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 
 class LLMClient:
@@ -56,6 +57,9 @@ class OpenAIClient(LLMClient):
             "temperature": self.config.get("temperature", 0.2),
             "max_output_tokens": self.config.get("max_tokens", 1200),
         }
+        reasoning = self.config.get("reasoning")
+        if reasoning:
+            payload["reasoning"] = {"effort": reasoning}
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -85,6 +89,10 @@ class AnthropicClient(LLMClient):
         }
         if system_prompt:
             payload["system"] = system_prompt
+        reasoning = self.config.get("reasoning")
+        if reasoning:
+            payload.setdefault("metadata", {})
+            payload["metadata"]["reasoning"] = reasoning
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
@@ -111,6 +119,10 @@ class GeminiClient(LLMClient):
         if system_prompt:
             parts.insert(0, {"text": system_prompt})
         payload = {"contents": [{"parts": parts}]}
+        reasoning = self.config.get("reasoning")
+        if reasoning:
+            payload.setdefault("safetySettings", [])
+            payload["metadata"] = {"reasoning": reasoning}
         headers = {"content-type": "application/json"}
         result = _post_json(url, payload, headers, self.config.get("timeout_sec", 60))
         if _should_log(self.config):

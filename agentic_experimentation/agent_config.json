@@ -12,6 +12,7 @@
   "experiments_root": "agentic_experimentation\\experiments",
   "test_command": null,
   "test_cwd": ".",
+  "test_pattern": "tests/test_smoke_invariants.py tests/test_statistical_sanity.py",
   "prompts": {
     "planner": "agentic_experimentation\\prompts\\planner\\planner_prompt.txt",
     "coder": "agentic_experimentation\\prompts\\coder\\coder_prompt.txt",
@@ -26,38 +27,29 @@
   },
   "agents": {
     "planner": {
-      "provider": "dummy",
-      "model": "gpt-4.1",
-      "temperature": 0.2,
+      "provider": "openai",
+      "model": "gpt-5.2",
+      "reasoning": "high",
+      "temperature": 0.5,
       "max_tokens": 1200,
       "timeout_sec": 60
     },
     "coder": {
-      "provider": "dummy",
-      "model": "gpt-4.1",
-      "temperature": 0.2,
+      "provider": "openai",
+      "model": "gpt-5.2-codex",
+      "reasoning": "high",
+      "temperature": 0.5,
       "max_tokens": 1200,
       "timeout_sec": 60
     },
     "reviewer": {
-      "provider": "dummy",
-      "model": "gemini-1.5-pro",
-      "temperature": 0.2,
+      "provider": "openai",
+      "model": "gpt-5.2",
+      "reasoning": "high",
+      "temperature": 0.5,
       "max_tokens": 1200,
       "timeout_sec": 60
     }
-  },
-  "llm": {
-    "provider": "dummy",
-    "model": "gpt-4.1",
-    "api_key_env": "OPENAI_API_KEY",
-    "base_url": "",
-    "timeout_sec": 60,
-    "max_tokens": 1200,
-    "temperature": 0.2,
-    "dummy_idea_text": "IDEA: Increase top_n_global by a small amount to test sensitivity.\nRATIONALE: Tests robustness to selection breadth.\nFILES: adaptive_vol_momentum.py\nRISKS: Might dilute signal if too large.",
-    "dummy_patch_mode": "noop",
-    "dummy_patch_path": "agentic_experimentation\\examples\\sample_patch.diff"
   },
   "scoring": {
     "score_column": "CHANGE_ME",

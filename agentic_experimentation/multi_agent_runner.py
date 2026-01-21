@@ -88,6 +88,8 @@ def main():
 
         worktree_path = create_worktree(repo_root, worktree_root, run_id)
         try:
+            # Default LLM debug log to the experiment directory if not set
+            os.environ.setdefault("LLM_DEBUG_FILE", str(exp_dir / "llm_debug.log"))
             if config.get("base_on_working_tree", False):
                 sync_working_tree(repo_root, worktree_path)
 
@@ -151,7 +153,13 @@ def main():
                 test_cwd = Path(test_cwd_value)
                 if not test_cwd.is_absolute():
                     test_cwd = Path(worktree_path) / test_cwd
-                tests_exit = _run_command(test_cmd, test_cwd, tests_log)
+                test_pattern = config.get("test_pattern")
+                final_cmd = test_cmd
+                if test_pattern and isinstance(test_cmd, str):
+                    final_cmd = f"{test_cmd} {test_pattern}"
+                elif test_pattern and isinstance(test_cmd, list):
+                    final_cmd = test_cmd + [test_pattern]
+                tests_exit = _run_command(final_cmd, test_cwd, tests_log)
                 proceed = proceed and tests_exit == 0
 
             # Sweep
