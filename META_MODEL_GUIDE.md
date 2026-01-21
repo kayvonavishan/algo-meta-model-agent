@@ -51,20 +51,53 @@ graph TD
 - **Sweep results CSV (required)**: `meta_config_sweep_results.csv` from the prior sweep; one row per config with metrics (e.g., `mean_topN_avg_return_per_trade_pct`) used to pick the top configs (`--top-n-configs`).
 - These rows supply parameter values used in scoring (see `MetaConfig`); the ensemble then averages scores across the chosen configs before selection.
 
-## 4. Step-by-step pipeline
+## 4. Step-by-step pipeline for `adaptive_vol_momentum.py`
 
-### 4.0 Step 0: Load and filter aligned data
+### 4.1 Step 0: Load config and ensure inputs
+
+- Instantiate `MetaConfig` defaults (can be tweaked inline at the top of the script).
+- Resolve the aligned returns path (`period_returns_weeks_2_aligned.csv` by default); error if missing.
+
+### 4.2 Step 1: Load aligned data
+
+- Read aligned CSV, drop duplicates.
+- Build `aligned_returns` (per-ticker matrices) and `aligned_meta` via `io_periods.load_aligned_periods_from_csv` (same shapes as in Section 3.1).
+- Log surviving tickers and common periods; abort if none remain.
+
+### 4.3 Step 2: Prepare long-form data
+
+- Convert the aligned wide frame to a long DataFrame with `wide_to_long_periods` for downstream evaluation.
+
+### 4.4 Step 3: Set up run directory
+
+- Create a timestamped run directory under `.../run_<timestamp>/` (sibling of the aligned artifacts).
+- Define the sweep output path `meta_config_sweep_results.csv` inside that run directory.
+
+### 4.5 Step 4: Run config sweep
+
+- Call `run_config_sweep` with `aligned_returns`, `long_df`, and the current `MetaConfig`.
+- Sweep hyperparameters over `n_configs` (default 100) with fixed seed/warmup/oos parameters.
+- For each config, select models, compute equity curves, plots, and metrics. Scoring per ticker uses the logic in Section 6 (Score computation for one ticker).
+- Append results to `meta_config_sweep_results.csv`; emit per-config plots/metrics under `avg_trade_return_plots/` and related CSVs.
+
+### 4.6 Step 5: (Optional) Additional outputs
+
+- Commented examples show how to save selections and equity curves; enable as needed if you want raw selections instead of just sweep metrics.
+
+## 5. Step-by-step pipeline for `ensemble/meta_ensemble_from_sweep.py`
+
+### 5.0 Step 0: Load and filter aligned data
 
 - Load aligned returns and build `aligned_returns: Dict[str, DataFrame]`.
 - If no tickers remain after filters, stop.
 
-### 4.1 Step 1: Choose top configs from sweep
+### 5.1 Step 1: Choose top configs from sweep
 
 - Read sweep results, filter to `status == "ok"` if present.
 - Keep top `--top-n-configs` by the chosen metric.
 - Build the "selection config" from the best row; other configs use the same base defaults but replace any values provided in their rows.
 
-### 4.2 Step 2: Score each ticker under each config
+### 5.2 Step 2: Score each ticker under each config
 
 For each ticker and each selected config:
 
@@ -74,7 +107,7 @@ For each ticker and each selected config:
 
 The result is `scores_by_ticker[ticker]`: a DataFrame of mean scores (models x periods).
 
-### 4.3 Step 3: Select models (gated by tickers)
+### 5.3 Step 3: Select models (gated by tickers)
 
 - Compute a per-ticker "ticker score" per period from the scores (median of top M models).
 - Optionally drop tickers below `min_ticker_score`.
@@ -87,7 +120,7 @@ The result is `scores_by_ticker[ticker]`: a DataFrame of mean scores (models x p
 
 This yields the final selection file.
 
-### 4.4 Step 4: Evaluate (optional)
+### 5.4 Step 4: Evaluate (optional)
 
 If `--skip-analysis` is not set:
 
@@ -95,22 +128,22 @@ If `--skip-analysis` is not set:
 - Compute core, relative, stability, trade-quality, and significance metrics.
 - Optionally render plots.
 
-## 5. Score computation for one ticker
+## 6. Score computation for one ticker
 
 This section is the core math. All steps below are performed per ticker, for the aligned returns matrix `R` of shape (n_models, T). The v2 implementation in `scoring.py` is used in the meta ensemble.
 
-### 5.1 Notation
+### 6.1 Notation
 
 - `R_{i,t}` = period return of model `i` at period `t`.
 - `Q_{i,t}` = percentile rank of `R_{i,t}` across models for period `t` (in [0,1]).
 - `M_{i,t}` = adaptive momentum signal.
 - `S_{i,t}` = final score.
 
-### 5.2 Step 1: Dispersion -> adaptive alpha
+### 6.2 Step 1: Dispersion -> adaptive alpha
 
 Goal: quantify how much the models disagree within a period, then use that to decide how fast the momentum signal should adapt.
 
-#### 5.2.1 Dispersion within a single period (robust spread)
+#### 6.2.1 Dispersion within a single period (robust spread)
 
 We want a single number that says "how spread out are the model returns this period?" Instead of a standard deviation (which can be distorted by outliers), we use the MAD-based robust std:
 
@@ -135,7 +168,7 @@ disp_t:   1.4826 * 0.01 = 0.014826
 
 So `disp_t` is the "typical spread" around the median, but robust to that 0.10 outlier.
 
-#### 5.2.2 Is dispersion unusually high or low?
+#### 6.2.2 Is dispersion unusually high or low?
 
 Dispersion itself is not enough; we care about whether it is high *relative to recent history*. We standardize it with a rolling z-score over a window `vol_window`:
 
@@ -162,7 +195,7 @@ z_t = (0.0125 - 0.02) / 0.005 = -1.5 -> lower than usual
 
 In practice, large positive `z_t` values occur when a few models are far apart (big disagreement), while large negative `z_t` values occur when most models are clustered tightly (high agreement).
 
-#### 5.2.3 Map dispersion regime to a smoothing speed (alpha)
+#### 6.2.3 Map dispersion regime to a smoothing speed (alpha)
 
 We convert `z_t` into a time-varying EMA alpha. Think of `alpha_t` as the "speed knob" for the momentum signal:
 
@@ -303,7 +336,7 @@ If previous alpha was 0.40:
 alpha_t = 0.30 * 0.70 + 0.70 * 0.40 = 0.49
 ```
 
-### 5.3 Step 2: Percentile ranks
+### 6.3 Step 2: Percentile ranks
 
 Convert raw returns into cross-sectional ranks per period:
 
@@ -341,7 +374,7 @@ Notes:
 - Ties are assigned adjacent ranks (no averaging), so equal values will get close but not identical percentiles.
 - No `MetaConfig` parameters affect this step; it is purely a per-period cross-sectional ranking.
 
-### 5.4 Step 3: Adaptive momentum of ranks
+### 6.4 Step 3: Adaptive momentum of ranks
 
 Two options exist; the current path uses a bounded lookback window:
 
@@ -387,7 +420,7 @@ If alpha_t were higher (say 0.70), the newest period would get even more weight 
 
 This is implemented by `_adaptive_momentum_window` when `enable_momentum_lookback` is True. If it is False, `_adaptive_momentum_recursive` uses a standard EMA over all history (no fixed lookback).
 
-### 5.5 Step 4: Delta adjustment
+### 6.5 Step 4: Delta adjustment
 
 Add a small delta term to capture recent acceleration:
 
@@ -428,7 +461,7 @@ Config value used here:
 
 - `delta_weight` (from `MetaConfig`)
 
-### 5.6 Step 5: Ticker-local baseline
+### 6.6 Step 5: Ticker-local baseline
 
 Subtract a cross-sectional baseline to convert to "relative" performance within the ticker:
 
@@ -463,7 +496,7 @@ Config value used here:
 
 - `baseline_method` (`median` or `mean`)
 
-### 5.7 Step 6: Confidence (training-free)
+### 6.7 Step 6: Confidence (training-free)
 
 Confidence is higher when a model's rank is stable and participation is high:
 
@@ -504,7 +537,7 @@ Config values used here:
 - `conf_lookback` (window length)
 - `conf_eps` (stability floor to avoid divide-by-zero)
 
-### 5.8 Step 7: Risk penalty (downside CVaR)
+### 6.8 Step 7: Risk penalty (downside CVaR)
 
 A risk penalty is computed on rank residuals:
 
@@ -548,7 +581,7 @@ Config values used here:
 - `cvar_risk_aversion` (penalty strength)
 - `cvar_window_stride` (optional downsampling inside the window for speed)
 
-### 5.9 Step 8: Uniqueness weighting
+### 6.9 Step 8: Uniqueness weighting
 
 `compute_uniqueness_weights` currently returns all-ones to avoid leakage. The intended behavior is:
 
@@ -557,7 +590,7 @@ Config values used here:
 
 If activated, this scales the final score by a per-model weight.
 
-### 5.10 Step 9: Final score and causal shift
+### 6.10 Step 9: Final score and causal shift
 
 Final score:
 
@@ -597,7 +630,7 @@ scores_df = scores_df.shift(axis=1)
 ticker_score = ticker_score.shift(1)
 ```
 
-### 5.11 Step 10: Ticker score
+### 6.11 Step 10: Ticker score
 
 For each period, compute a per-ticker gate score:
 
@@ -605,7 +638,7 @@ For each period, compute a per-ticker gate score:
 
 This is used in the cross-ticker selection gate.
 
-## 6. Ensemble across configs
+## 7. Ensemble across configs
 
 The meta ensemble averages scores from multiple configs to smooth sensitivity to hyperparameters.
 
@@ -621,7 +654,7 @@ Mathematically:
 S_bar_{i,t} = mean_k( normalize(S_{i,t}^{(k)}) )
 ```
 
-## 7. Selection logic in detail
+## 8. Selection logic in detail
 
 This runs in `_select_from_scores` after ensemble scoring.
 
@@ -636,7 +669,7 @@ This runs in `_select_from_scores` after ensemble scoring.
 
 This intentionally balances breadth (multiple tickers) and depth (best models) per period.
 
-## 8. Output artifacts
+## 9. Output artifacts
 
 The pipeline writes several files (paths depend on CLI arguments):
 
@@ -651,7 +684,7 @@ The pipeline writes several files (paths depend on CLI arguments):
 - `meta_ensemble_summary.csv`
 - Optional plots under `meta_ensemble_plots/`
 
-## 9. Worked mini-example (toy numbers)
+## 10. Worked mini-example (toy numbers)
 
 Assume one ticker with 3 models and 4 periods. Returns matrix R:
 
@@ -680,9 +713,9 @@ Risk penalty example:
 
 - Suppose the residuals `Q - 0.5` for model B over the last 5 periods are mostly negative; downside CVaR becomes positive and subtracts from the score.
 
-## 10. Diagrams
+## 11. Diagrams
 
-### 10.1 Scoring pipeline (per ticker)
+### 11.1 Scoring pipeline (per ticker)
 
 ````mermaid
 graph LR
@@ -702,7 +735,7 @@ graph LR
     RISK --> SCORE
 ```
 
-### 10.2 Selection pipeline (per period)
+### 11.2 Selection pipeline (per period)
 
 ````mermaid
 graph TD
@@ -714,7 +747,7 @@ graph TD
     GL --> SEL["Select top N models"]
 ```
 
-## 11. Where to improve (starter ideas)
+## 12. Where to improve (starter ideas)
 
 1) Uniqueness weighting: The function currently returns all-ones. Implement the intended correlation clustering to reduce duplicates.
 2) Ticker gate rule: `sqrt(N)` is a heuristic; consider alternative gates (fixed N, percentile threshold, or volatility-adjusted).
@@ -722,7 +755,7 @@ graph TD
 4) Normalize outputs: Validate `percentile` vs `none` normalization under different return distributions.
 5) Revisit causal shift: Ensure the shift aligns with how periods are defined and how selection would be executed live.
 
-## 12. CLI usage (typical)
+## 13. CLI usage (typical)
 
 ```
 python ensemble/meta_ensemble_from_sweep.py \
@@ -733,7 +766,7 @@ python ensemble/meta_ensemble_from_sweep.py \
   --normalize percentile
 ```
 
-## 13. Key parameters to know
+## 14. Key parameters to know
 
 These are in `MetaConfig`:
 
@@ -743,7 +776,7 @@ These are in `MetaConfig`:
 - `risk_lookback`, `cvar_alpha`, `cvar_risk_aversion`: downside risk penalty.
 - `top_n_global`, `top_m_for_ticker_gate`, `per_ticker_cap`, `min_ticker_score`: selection rules.
 
-## 14. Pointers into code
+## 15. Pointers into code
 
 - Pipeline driver: `ensemble/meta_ensemble_from_sweep.py`
 - Config defaults: `config.py`
