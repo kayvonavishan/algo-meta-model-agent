@@ -6,19 +6,19 @@ This describes the current multi-agent loop driven by `multi_agent_runner.py`.
 
 ```mermaid
 graph TD
-    A[Idea from ideas.txt] --> B[Coordinator LLM\nnotes handoff]
-    B --> C[Planner LLM\nPLAN / RISKS / TESTS]
-    C --> D[Coder LLM\nunified diff]
+    A[Idea from ideas.txt] --> B[Coordinator LLM<br/>notes handoff]
+    B --> C[Planner LLM<br/>PLAN / RISKS / TESTS]
+    C --> D[Coder LLM<br/>unified diff]
     D --> E[git apply patch]
-    E --> F[Reviewer LLM\nAPPROVE/REJECT]
+    E --> F[Reviewer LLM<br/>APPROVE/REJECT]
     F --> G{Proceed?}
-    G -- no --> H[Stop\nrecord summary]
+    G -- no --> H[Stop<br/>record summary]
     G -- yes --> I[Tests (optional)]
     I --> J{Tests pass?}
     J -- no --> H
-    J -- yes --> K[Sweep command\n(adaptive_vol_momentum.py)]
-    K --> L[Copy results\nscore vs baseline]
-    L --> M[Summary\ncleanup worktree]
+    J -- yes --> K[Sweep command<br/>(adaptive_vol_momentum.py)]
+    K --> L[Copy results<br/>score vs baseline]
+    L --> M[Summary<br/>cleanup worktree]
 ```
 
 ## Artifact pipeline (per iteration)
