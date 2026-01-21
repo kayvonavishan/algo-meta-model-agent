@@ -7,6 +7,8 @@ Repository context:
 {repo_context}
 
 Rules:
-- Output ONLY the patch text, no code fences.
+- Output ONLY a git-apply compatible unified diff (like `git diff`), no code fences.
+- The patch MUST include `diff --git a/... b/...` headers (and `---` / `+++` lines).
+- Do NOT output `*** Begin Patch` / `*** Update File` style patches.
 - Keep the change minimal.
 - Modify existing files if possible.

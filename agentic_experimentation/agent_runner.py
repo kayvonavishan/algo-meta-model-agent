@@ -86,10 +86,17 @@ def main():
             patch_text = llm.generate(patch_prompt, system_prompt=SYSTEM_PROMPT)
             _write_text(exp_dir / "patch.diff", patch_text)
 
-            patch_applied = apply_patch_text(worktree_path, patch_text)
+            patch_error = None
+            try:
+                patch_applied = apply_patch_text(worktree_path, patch_text)
+            except Exception as exc:  # pylint: disable=broad-except
+                patch_applied = False
+                patch_error = str(exc)
 
             sweep_log = exp_dir / "sweep.log"
-            sweep_code = _run_sweep(config, config_path, worktree_path, sweep_log)
+            sweep_code = None
+            if patch_applied:
+                sweep_code = _run_sweep(config, config_path, worktree_path, sweep_log)
 
             candidate_csv = exp_dir / "meta_config_sweep_results.csv"
             if results_csv.exists():
@@ -109,6 +116,7 @@ def main():
                 "run_id": run_id,
                 "idea": idea_text.strip(),
                 "patch_applied": patch_applied,
+                "patch_error": patch_error,
                 "sweep_exit_code": sweep_code,
                 "results_csv": str(candidate_csv) if candidate_csv.exists() else None,
                 "score": score_result,

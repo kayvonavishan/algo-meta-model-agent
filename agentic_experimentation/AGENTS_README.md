@@ -7,7 +7,7 @@ This describes the current multi-agent loop driven by `multi_agent_runner.py`.
 ```mermaid
 graph TD
     A["Idea from ideas_file<br/>(file or directory)"] --> B["Coordinator LLM<br/>notes handoff"]
-    B --> C["Planner LLM<br/>PLAN / RISKS / TESTS"]
+    B --> C["Planner LLM<br/>PLAN / RISKS"]
     C --> D["Coder LLM<br/>unified diff"]
     D --> E["git apply patch"]
     E --> F["Reviewer LLM<br/>APPROVE/REJECT"]
@@ -53,6 +53,13 @@ graph TD
 - `baseline_csv` / `results_csv`: scoring inputs/outputs.
 - `worktree_root` / `experiments_root`: isolation of runs.
 - `.env` support: place API keys in `agentic_experimentation/.env` or repo-root `.env`; they are auto-loaded by the runners (vars not already set in the environment).
+
+Reviewer policy
+- The reviewer is intended to gate on code correctness/safety only; tests and docs are not required for approval because test execution is handled by the configured `test_command` gate.
+
+## Patch format
+
+The patch produced by the coder must be a git-apply compatible unified diff (i.e., `git diff` style) because patches are applied via `git apply` inside the worktree.
 
 ## Cleaning up old worktrees
 
