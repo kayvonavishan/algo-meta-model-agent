@@ -12,20 +12,18 @@
   "test_command": null,
   "test_cwd": ".",
   "prompts": {
-    "coordinator": "agentic_experimentation\\prompts\\coordinator_prompt.txt",
     "planner": "agentic_experimentation\\prompts\\planner_prompt.txt",
     "coder": "agentic_experimentation\\prompts\\coder_prompt.txt",
     "reviewer": "agentic_experimentation\\prompts\\reviewer_prompt.txt",
-    "patch": "agentic_experimentation\\prompts\\patch_prompt.txt"
+    "planner_system": "agentic_experimentation\\prompts\\planner_system.txt",
+    "coder_system": "agentic_experimentation\\prompts\\coder_system.txt",
+    "reviewer_system": "agentic_experimentation\\prompts\\reviewer_system.txt",
+    "patch": "agentic_experimentation\\prompts\\patch_prompt.txt",
+    "planner_repo_files": "agentic_experimentation\\prompts\\planner_repo_files.txt",
+    "coder_repo_files": "agentic_experimentation\\prompts\\coder_repo_files.txt",
+    "reviewer_repo_files": "agentic_experimentation\\prompts\\reviewer_repo_files.txt"
   },
   "agents": {
-    "coordinator": {
-      "provider": "dummy",
-      "model": "claude-3-5-sonnet-20241022",
-      "temperature": 0.2,
-      "max_tokens": 1200,
-      "timeout_sec": 60
-    },
     "planner": {
       "provider": "dummy",
       "model": "gpt-4.1",

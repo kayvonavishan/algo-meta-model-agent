@@ -6,7 +6,6 @@ import time
 from pathlib import Path
 
 from agent_runner import (
-    _build_repo_context,
     _load_ideas,
     _load_json,
     _read_text,
@@ -46,18 +45,22 @@ def main():
         raise RuntimeError(f"ideas_file provided but no ideas found at {ideas_path}")
 
     agents_cfg = config.get("agents", {})
-    coordinator_llm = _build_llm_for_role(agents_cfg, "coordinator", args.dry_run_llm)
     planner_llm = _build_llm_for_role(agents_cfg, "planner", args.dry_run_llm)
     coder_llm = _build_llm_for_role(agents_cfg, "coder", args.dry_run_llm)
     reviewer_llm = _build_llm_for_role(agents_cfg, "reviewer", args.dry_run_llm)
 
     prompts_cfg = config.get("prompts", {})
-    coord_prompt_path = _resolve_path(repo_root, prompts_cfg.get("coordinator"))
     planner_prompt_path = _resolve_path(repo_root, prompts_cfg.get("planner"))
+    planner_system_path = _resolve_path(repo_root, prompts_cfg.get("planner_system"))
+    planner_files_path = _resolve_path(repo_root, prompts_cfg.get("planner_repo_files"))
     coder_prompt_path = _resolve_path(repo_root, prompts_cfg.get("coder"))
+    coder_system_path = _resolve_path(repo_root, prompts_cfg.get("coder_system"))
+    coder_files_path = _resolve_path(repo_root, prompts_cfg.get("coder_repo_files"))
     reviewer_prompt_path = _resolve_path(repo_root, prompts_cfg.get("reviewer"))
-    if not (coord_prompt_path and planner_prompt_path and coder_prompt_path and reviewer_prompt_path):
-        raise RuntimeError("Coordinator, planner, coder, and reviewer prompts must be set in config['prompts'].")
+    reviewer_system_path = _resolve_path(repo_root, prompts_cfg.get("reviewer_system"))
+    reviewer_files_path = _resolve_path(repo_root, prompts_cfg.get("reviewer_repo_files"))
+    if not (planner_prompt_path and coder_prompt_path and reviewer_prompt_path):
+        raise RuntimeError("Planner, coder, and reviewer prompts must be set in config['prompts'].")
 
     iterations_requested = args.iterations
     if iterations_requested is None:
@@ -79,29 +82,21 @@ def main():
             if config.get("base_on_working_tree", False):
                 sync_working_tree(repo_root, worktree_path)
 
-            repo_context = _build_repo_context(repo_root)
+            planner_context = _build_repo_context_for_role(repo_root, "planner", planner_files_path)
+            coder_context = _build_repo_context_for_role(repo_root, "coder", coder_files_path)
+            reviewer_context = _build_repo_context_for_role(repo_root, "reviewer", reviewer_files_path)
             idea_text = ideas[i]
             _write_text(exp_dir / "idea.md", idea_text)
-
-            # Coordinator: produce handoff notes
-            coord_prompt = _render_prompt(
-                _read_text(coord_prompt_path),
-                idea_text=idea_text,
-                repo_context=repo_context,
-            )
-            _write_text(exp_dir / "coordinator_prompt.txt", coord_prompt)
-            coord_text = coordinator_llm.generate(coord_prompt, system_prompt=SYSTEM_PROMPT)
-            _write_text(exp_dir / "coordinator.md", coord_text)
 
             # Planner: produce plan
             planner_prompt = _render_prompt(
                 _read_text(planner_prompt_path),
                 idea_text=idea_text,
-                coord_text=coord_text,
-                repo_context=repo_context,
+                repo_context=planner_context,
             )
             _write_text(exp_dir / "planner_prompt.txt", planner_prompt)
-            plan_text = planner_llm.generate(planner_prompt, system_prompt=SYSTEM_PROMPT)
+            planner_system = _read_text(planner_system_path) if planner_system_path else SYSTEM_PROMPT
+            plan_text = planner_llm.generate(planner_prompt, system_prompt=planner_system)
             _write_text(exp_dir / "plan.md", plan_text)
 
             # Coder: produce patch
@@ -109,10 +104,11 @@ def main():
                 _read_text(coder_prompt_path),
                 idea_text=idea_text,
                 plan_text=plan_text,
-                repo_context=repo_context,
+                repo_context=coder_context,
             )
             _write_text(exp_dir / "coder_prompt.txt", coder_prompt)
-            patch_text = coder_llm.generate(coder_prompt, system_prompt=SYSTEM_PROMPT)
+            coder_system = _read_text(coder_system_path) if coder_system_path else SYSTEM_PROMPT
+            patch_text = coder_llm.generate(coder_prompt, system_prompt=coder_system)
             _write_text(exp_dir / "patch.diff", patch_text)
 
             patch_applied, patch_error = _apply_patch_safe(worktree_path, patch_text)
@@ -123,9 +119,11 @@ def main():
                 idea_text=idea_text,
                 plan_text=plan_text,
                 patch_text=patch_text,
+                repo_context=reviewer_context,
             )
             _write_text(exp_dir / "reviewer_prompt.txt", review_prompt)
-            review_text = reviewer_llm.generate(review_prompt, system_prompt=SYSTEM_PROMPT)
+            reviewer_system = _read_text(reviewer_system_path) if reviewer_system_path else SYSTEM_PROMPT
+            review_text = reviewer_llm.generate(review_prompt, system_prompt=reviewer_system)
             _write_text(exp_dir / "review.md", review_text)
             verdict = _parse_reviewer_verdict(review_text)
 
@@ -167,7 +165,6 @@ def main():
             summary = {
                 "run_id": run_id,
                 "idea": idea_text.strip(),
-                "coordinator": coord_text.strip(),
                 "plan": plan_text.strip(),
                 "patch_applied": patch_applied,
                 "patch_error": patch_error,
@@ -229,6 +226,29 @@ def _run_command(cmd, cwd, log_path):
         else:
             proc = subprocess.run(cmd, cwd=cwd, shell=True, stdout=f, stderr=subprocess.STDOUT, check=False)
     return proc.returncode
+
+
+def _build_repo_context_for_role(repo_root, role, files_path):
+    repo_root = Path(repo_root)
+    keep = []
+    if files_path and Path(files_path).exists():
+        raw = _read_text(files_path)
+        for line in raw.splitlines():
+            rel = line.strip()
+            if not rel:
+                continue
+            p = repo_root / rel
+            if p.exists():
+                keep.append(rel)
+    if not keep:
+        return f"Role: {role}\nRepo root: {repo_root}"
+    lines = [
+        f"Role: {role}",
+        f"Repo root: {repo_root}",
+        "Key files:",
+        "\n".join(keep),
+    ]
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

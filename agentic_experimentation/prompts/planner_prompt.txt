@@ -1,10 +1,7 @@
-You are the planner agent. Take the idea (and coordinator notes) and produce a detailed implementation plan.
+You are the planner agent. Take the idea and produce a detailed implementation plan.
 
 Idea:
 {idea_text}
-
-Coordinator notes:
-{coord_text}
 
 Repository context:
 {repo_context}
