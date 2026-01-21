@@ -1,8 +1,4 @@
+META_MODEL_GUIDE.md
 adaptive_vol_momentum.py
 config.py
 scoring.py
-io_periods.py
-evaluation.py
-reporting.py
-sweep.py
-ensemble/meta_ensemble_from_sweep.py
