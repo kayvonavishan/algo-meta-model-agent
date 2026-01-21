@@ -5,6 +5,7 @@
   "sweep_cwd": ".",
   "results_csv": "C:\\Users\\micha\\myhome\\algo\\artifacts\\period_returns\\meta_config_sweep_results.csv",
   "baseline_csv": "agentic_experimentation\\baselines\\meta_config_sweep_results_baseline.csv",
+  "agentic_output_root": "C:\\Users\\micha\\myhome\\algo\\artifacts\\period_returns\\agentic",
   "base_on_working_tree": true,
   "keep_worktrees": false,
   "worktree_root": "agentic_experimentation\\worktrees",

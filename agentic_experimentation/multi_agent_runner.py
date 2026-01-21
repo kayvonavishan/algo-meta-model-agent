@@ -34,6 +34,9 @@ def main():
     worktree_root = _resolve_path(repo_root, config.get("worktree_root"))
     baseline_csv = _resolve_path(repo_root, config.get("baseline_csv"))
     results_csv = Path(config.get("results_csv")).expanduser()
+    agentic_output_root = config.get("agentic_output_root")
+    if agentic_output_root:
+        agentic_output_root = Path(agentic_output_root).expanduser()
     ideas_path = _resolve_path(repo_root, config.get("ideas_file"))
     if not ideas_path:
         raise RuntimeError("ideas_file must be set in the config.")
@@ -148,10 +151,20 @@ def main():
             # Sweep
             if proceed:
                 sweep_log = exp_dir / "sweep.log"
-                sweep_exit = _run_sweep(config, config_path, worktree_path, sweep_log)
+                run_results_csv = results_csv
+                env_extra = None
+                if agentic_output_root:
+                    run_output_dir = agentic_output_root / f"run_{i}"
+                    run_output_dir.mkdir(parents=True, exist_ok=True)
+                    run_results_csv = run_output_dir / "meta_config_sweep_results.csv"
+                    env_extra = {
+                        "AGENTIC_OUTPUT_DIR": str(run_output_dir),
+                        "AGENTIC_RESULTS_CSV": str(run_results_csv),
+                    }
+                sweep_exit = _run_sweep(config, config_path, worktree_path, sweep_log, env_extra=env_extra)
 
-                if results_csv.exists():
-                    shutil.copy2(results_csv, candidate_csv)
+                if run_results_csv.exists():
+                    shutil.copy2(run_results_csv, candidate_csv)
 
                 if candidate_csv.exists():
                     score_cfg = config.get("scoring", {})

@@ -135,7 +135,7 @@ def _refresh_baseline(results_csv, baseline_csv):
     shutil.copy2(results_csv, baseline_csv)
 
 
-def _run_sweep(config, config_path, worktree_path, log_path):
+def _run_sweep(config, config_path, worktree_path, log_path, env_extra=None):
     sweep_command = config.get("sweep_command")
     if not sweep_command:
         raise RuntimeError("sweep_command missing in config.")
@@ -145,10 +145,14 @@ def _run_sweep(config, config_path, worktree_path, log_path):
         sweep_cwd_path = Path(worktree_path) / sweep_cwd_path
     sweep_cwd = sweep_cwd_path
     with open(log_path, "w", encoding="utf-8") as f:
+        env = os.environ.copy()
+        if env_extra:
+            env.update(env_extra)
         if isinstance(sweep_command, list):
             proc = subprocess.run(
                 sweep_command,
                 cwd=sweep_cwd,
+                env=env,
                 stdout=f,
                 stderr=subprocess.STDOUT,
                 check=False,
@@ -158,6 +162,7 @@ def _run_sweep(config, config_path, worktree_path, log_path):
                 sweep_command,
                 cwd=sweep_cwd,
                 shell=True,
+                env=env,
                 stdout=f,
                 stderr=subprocess.STDOUT,
                 check=False,

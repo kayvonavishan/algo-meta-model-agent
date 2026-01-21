@@ -1,3 +1,4 @@
+import argparse
 import os
 from datetime import datetime
 
@@ -105,57 +106,81 @@ __all__ = [
 ]
 
 
-cfg = MetaConfig(
-    # You can tweak these quickly:
-    top_n_global=20,
-    vol_window=4,
-    momentum_lookback=12,
-    conf_lookback=12,
-    risk_lookback=20,
-    enable_uniqueness_weighting=False,  # keep causal by avoiding future-based uniqueness weights
-    per_ticker_cap=10,  # prevents one ticker from dominating global topN
-)
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--aligned-file", default=r"C:\Users\micha\myhome\algo\artifacts\period_returns\period_returns_weeks_2_aligned.csv")
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--results-csv", default=None)
+    return parser.parse_args()
 
-#aligned_file_path = r"C:\Users\micha\myhome\algo\artifacts\period_returns\period_returns_weeks_2_aligned.csv"
-aligned_file_path = r"C:\Users\micha\myhome\algo\artifacts\period_returns\period_returns_weeks_2_aligned.csv"
-if not os.path.exists(aligned_file_path):
-    raise FileNotFoundError(
-        f"Aligned file not found: {aligned_file_path}. Run align_period_returns.py first."
+
+def main():
+    args = parse_args()
+
+    cfg = MetaConfig(
+        # You can tweak these quickly:
+        top_n_global=20,
+        vol_window=4,
+        momentum_lookback=12,
+        conf_lookback=12,
+        risk_lookback=20,
+        enable_uniqueness_weighting=False,  # keep causal by avoiding future-based uniqueness weights
+        per_ticker_cap=10,  # prevents one ticker from dominating global topN
     )
 
-aligned_df = pd.read_csv(aligned_file_path)
-aligned_df = aligned_df.drop_duplicates()
-print(f"Loaded aligned df: {aligned_df.shape} rows/cols")
+    aligned_file_path = args.aligned_file
+    if not os.path.exists(aligned_file_path):
+        raise FileNotFoundError(
+            f"Aligned file not found: {aligned_file_path}. Run align_period_returns.py first."
+        )
 
-aligned_returns, aligned_meta = load_aligned_periods_from_csv(aligned_df, cfg)
-print(f"Tickers kept after alignment load: {len(aligned_returns)}")
-for tkr, mat in aligned_returns.items():
-    print(f"  {tkr}: models={mat.shape[0]}, common_periods={mat.shape[1]}")
+    aligned_df = pd.read_csv(aligned_file_path)
+    aligned_df = aligned_df.drop_duplicates()
+    print(f"Loaded aligned df: {aligned_df.shape} rows/cols")
 
-if not aligned_returns:
-    raise RuntimeError("No tickers survived alignment filters. Lower min_models_per_ticker or require_common_periods.")
+    aligned_returns, aligned_meta = load_aligned_periods_from_csv(aligned_df, cfg)
+    print(f"Tickers kept after alignment load: {len(aligned_returns)}")
+    for tkr, mat in aligned_returns.items():
+        print(f"  {tkr}: models={mat.shape[0]}, common_periods={mat.shape[1]}")
 
-long_df = wide_to_long_periods(aligned_df)
-print(f"Aligned long df: {long_df.shape} rows (model-period records)")
+    if not aligned_returns:
+        raise RuntimeError("No tickers survived alignment filters. Lower min_models_per_ticker or require_common_periods.")
 
-base_artifacts_dir = r"C:\Users\micha\myhome\algo\artifacts\period_returns"
-run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-run_dir = os.path.join(base_artifacts_dir, f"run_{run_ts}")
-os.makedirs(run_dir, exist_ok=True)
-print(f"Writing sweep outputs under: {run_dir}")
+    long_df = wide_to_long_periods(aligned_df)
+    print(f"Aligned long df: {long_df.shape} rows (model-period records)")
 
-out_path = os.path.join(run_dir, "meta_config_sweep_results.csv")
-run_config_sweep(
-    aligned_returns,
-    long_df,
-    cfg,
-    out_path,
-    n_configs=100,
-    seed=42,
-    warmup_periods=20,
-    oos_start_date="2024-11-09",
-    scorecard_every=cfg.scorecard_every,
-)
+    # Determine output paths
+    env_output_dir = os.environ.get("AGENTIC_OUTPUT_DIR") or os.environ.get("OUTPUT_DIR")
+    output_dir = args.output_dir or env_output_dir
+    if output_dir:
+        run_dir = output_dir
+    else:
+        base_artifacts_dir = r"C:\Users\micha\myhome\algo\artifacts\period_returns"
+        run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = os.path.join(base_artifacts_dir, f"run_{run_ts}")
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"Writing sweep outputs under: {run_dir}")
+
+    env_results_csv = os.environ.get("AGENTIC_RESULTS_CSV")
+    out_path = args.results_csv or env_results_csv
+    if not out_path:
+        out_path = os.path.join(run_dir, "meta_config_sweep_results.csv")
+
+    run_config_sweep(
+        aligned_returns,
+        long_df,
+        cfg,
+        out_path,
+        n_configs=100,
+        seed=42,
+        warmup_periods=20,
+        oos_start_date="2024-11-09",
+        scorecard_every=cfg.scorecard_every,
+    )
+
+
+if __name__ == "__main__":
+    main()
 
 # selections = select_models_universal_v2(aligned_returns, cfg)
 # print(f"Selections: {selections.shape}")
