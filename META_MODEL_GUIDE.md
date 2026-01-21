@@ -37,27 +37,19 @@ graph TD
 
 ## 3. Inputs and shapes
 
-### 3.1 Aligned period returns CSV
+### 3.1 `adaptive_vol_momentum.py` (sweep producer)
 
-The aligned file is a wide CSV with columns like:
+- **Aligned period returns CSV (required)**: wide format with per-period columns such as `period_1_return`, `period_1_date_range`, `period_1_avg_return_per_trade`, `period_1_num_trades`, `period_2_return`, etc.
+- **Loaded shape (via `io_periods.load_aligned_periods_from_csv`)**:
+  - `aligned_returns[ticker]`: DataFrame with rows = `model_id`, columns = `period_key` ("YYYY-MM-DD to YYYY-MM-DD"), values = `period_return`.
+  - Optional side columns `avg_return_per_trade` and `num_trades` are also loaded for evaluation.
+- **Artifacts produced**: under `.../run_<timestamp>/`, including `meta_config_sweep_results.csv` plus plots/metrics per config.
 
-- `period_1_return`, `period_1_date_range`, `period_1_avg_return_per_trade`, `period_1_num_trades`
-- `period_2_return`, ... and so on
+### 3.2 `ensemble/meta_ensemble_from_sweep.py` (ensemble consumer)
 
-`io_periods.load_aligned_periods_from_csv` converts this into per-ticker matrices:
-
-- `aligned_returns[ticker]` is a DataFrame:
-  - rows: `model_id`
-  - columns: `period_key` ("YYYY-MM-DD to YYYY-MM-DD")
-  - values: `period_return`
-
-Optional `avg_return_per_trade` and `num_trades` are also loaded for later evaluation.
-
-### 3.2 Sweep results
-
-`sweep_results` is a CSV with one row per config tested. The meta model picks the top `--top-n-configs` rows by a chosen metric (default: `mean_topN_avg_return_per_trade_pct`).
-
-Those rows supply parameter values used in scoring (see `MetaConfig`).
+- **Aligned period returns CSV (same shape as above)**: reused to recompute scores and equity curves.
+- **Sweep results CSV (required)**: `meta_config_sweep_results.csv` from the prior sweep; one row per config with metrics (e.g., `mean_topN_avg_return_per_trade_pct`) used to pick the top configs (`--top-n-configs`).
+- These rows supply parameter values used in scoring (see `MetaConfig`); the ensemble then averages scores across the chosen configs before selection.
 
 ## 4. Step-by-step pipeline
 
