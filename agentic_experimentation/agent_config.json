@@ -30,7 +30,7 @@
       "provider": "openai",
       "model": "gpt-5.2",
       "reasoning": "high",
-      "temperature": 0.5,
+      "temperature": 0.2,
       "max_tokens": 1200,
       "timeout_sec": 60
     },
@@ -38,7 +38,7 @@
       "provider": "openai",
       "model": "gpt-5.2-codex",
       "reasoning": "high",
-      "temperature": 0.5,
+      "temperature": 0.2,
       "max_tokens": 1200,
       "timeout_sec": 60
     },
@@ -46,7 +46,7 @@
       "provider": "openai",
       "model": "gpt-5.2",
       "reasoning": "high",
-      "temperature": 0.5,
+      "temperature": 0.2,
       "max_tokens": 1200,
       "timeout_sec": 60
     }
