@@ -32,7 +32,7 @@
       "reasoning": "high",
       "temperature": 0.2,
       "max_tokens": 50000,
-      "timeout_sec": 60
+      "timeout_sec": 600
     },
     "coder": {
       "provider": "openai",
@@ -40,7 +40,7 @@
       "reasoning": "high",
       "temperature": 0.2,
       "max_tokens": 50000,
-      "timeout_sec": 60
+      "timeout_sec": 600
     },
     "reviewer": {
       "provider": "openai",
@@ -48,7 +48,7 @@
       "reasoning": "high",
       "temperature": 0.2,
       "max_tokens": 50000,
-      "timeout_sec": 60
+      "timeout_sec": 600
     }
   },
   "scoring": {
