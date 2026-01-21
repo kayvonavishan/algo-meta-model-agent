@@ -12,16 +12,16 @@
   "test_command": null,
   "test_cwd": ".",
   "prompts": {
-    "planner": "agentic_experimentation\\prompts\\planner_prompt.txt",
-    "coder": "agentic_experimentation\\prompts\\coder_prompt.txt",
-    "reviewer": "agentic_experimentation\\prompts\\reviewer_prompt.txt",
-    "planner_system": "agentic_experimentation\\prompts\\planner_system.txt",
-    "coder_system": "agentic_experimentation\\prompts\\coder_system.txt",
-    "reviewer_system": "agentic_experimentation\\prompts\\reviewer_system.txt",
+    "planner": "agentic_experimentation\\prompts\\planner\\planner_prompt.txt",
+    "coder": "agentic_experimentation\\prompts\\coder\\coder_prompt.txt",
+    "reviewer": "agentic_experimentation\\prompts\\reviewer\\reviewer_prompt.txt",
+    "planner_system": "agentic_experimentation\\prompts\\planner\\planner_system.txt",
+    "coder_system": "agentic_experimentation\\prompts\\coder\\coder_system.txt",
+    "reviewer_system": "agentic_experimentation\\prompts\\reviewer\\reviewer_system.txt",
     "patch": "agentic_experimentation\\prompts\\patch_prompt.txt",
-    "planner_repo_files": "agentic_experimentation\\prompts\\planner_repo_files.txt",
-    "coder_repo_files": "agentic_experimentation\\prompts\\coder_repo_files.txt",
-    "reviewer_repo_files": "agentic_experimentation\\prompts\\reviewer_repo_files.txt"
+    "planner_repo_files": "agentic_experimentation\\prompts\\planner\\planner_repo_files.txt",
+    "coder_repo_files": "agentic_experimentation\\prompts\\coder\\coder_repo_files.txt",
+    "reviewer_repo_files": "agentic_experimentation\\prompts\\reviewer\\reviewer_repo_files.txt"
   },
   "agents": {
     "planner": {
