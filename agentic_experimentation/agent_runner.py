@@ -258,7 +258,10 @@ def _render_prompt(template, **kwargs):
 def _load_ideas(path):
     if path.is_dir():
         ideas = []
-        for p in sorted(path.glob("*.md")):
+        candidates = []
+        for pattern in ("*.md", "*.txt"):
+            candidates.extend(path.rglob(pattern))
+        for p in sorted(set(candidates)):
             content = _read_text(p).strip()
             if content:
                 ideas.append(content)

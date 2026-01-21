@@ -1,6 +1,6 @@
 {
   "repo_root": "..",
-  "ideas_file": "agentic_experimentation\\ideas.txt",
+  "ideas_file": "agentic_experimentation\\ideas",
   "sweep_command": "python adaptive_vol_momentum.py",
   "sweep_cwd": ".",
   "results_csv": "C:\\Users\\micha\\myhome\\algo\\artifacts\\period_returns\\meta_config_sweep_results.csv",

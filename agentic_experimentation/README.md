@@ -2,7 +2,9 @@ Agentic experimentation scaffold for improving the meta model.
 
 Quick start
 1) Edit `agentic_experimentation/agent_config.json` and point `ideas_file` at your idea list.
-2) Populate `agentic_experimentation/ideas.txt` with blank-line separated ideas (IDEA/RATIONALE/FILES/RISKS blocks work well).
+2) Put your ideas in either:
+   - a single text file (blank-line separated blocks), or
+   - a directory of `*.md`/`*.txt` files (one idea per file), e.g. `agentic_experimentation/ideas/`.
 3) Set your API key env var if you want a hosted LLM (for example `OPENAI_API_KEY`).
 4) Refresh the baseline snapshot:
    `python agentic_experimentation/agent_runner.py --config agentic_experimentation/agent_config.json --refresh-baseline`

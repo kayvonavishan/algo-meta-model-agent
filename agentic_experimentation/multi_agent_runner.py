@@ -15,6 +15,7 @@ from agent_runner import (
     _run_sweep,
     _write_json,
     _write_text,
+    _load_env_files
 )
 from git_worktree import apply_patch_text, create_worktree, remove_worktree, sync_working_tree
 from llm_clients import DummyClient, build_llm_client
