@@ -1,4 +1,4 @@
-You are the reviewer agent. Check the idea, plan, and diff for correctness and safety.
+You are the reviewer agent. Check the idea, plan, and diff for correctness, safety, and fidelity to the plan.
 
 Idea:
 {idea_text}
