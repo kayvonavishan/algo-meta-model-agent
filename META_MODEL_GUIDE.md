@@ -1,13 +1,14 @@
 # Meta Model Guide
 
-This document explains how the current meta model works end to end, based on the code in `ensemble/meta_ensemble_from_sweep.py` and supporting modules (`config.py`, `scoring.py`, `io_periods.py`, `evaluation.py`, `reporting.py`). It is written to help a new analyst understand the math, the data flow, and where to improve the model.
+This document explains how the current meta model works end to end across the two driver scripts: `adaptive_vol_momentum.py` (sweep producer) and `ensemble/meta_ensemble_from_sweep.py` (ensemble consumer), plus the supporting modules (`config.py`, `scoring.py`, `io_periods.py`, `evaluation.py`, `reporting.py`). It is written to help a new analyst understand the math, the data flow, and where to improve the model.
 
 ## 1. Quick orientation
 
+- Two entrypoints: `adaptive_vol_momentum.py` runs a config sweep on aligned period returns and produces artifacts under `.../run_<timestamp>/` (e.g., `meta_config_sweep_results.csv` plus plots/metrics); `ensemble/meta_ensemble_from_sweep.py` runs after that, consuming the sweep output (and the same aligned returns) to ensemble top configs and produce selections/analysis.
 - Goal: Select a small set of the best-performing models each period (the "meta" portfolio) using training-free, per-ticker signals.
-- Inputs: Aligned per-period returns for many models and sweep results for config selection.
-- Output: A per-period selection of models plus evaluation metrics and plots.
-- Core idea: For each ticker, compute per-model scores based on rank momentum, confidence, and risk penalties, then select top models across tickers each period.
+- Inputs: Aligned per-period returns plus sweep results from the first stage.
+- Output: A per-period selection of models, evaluation metrics, and plots.
+- Core idea: For each ticker, compute per-model scores based on rank momentum, confidence, and risk penalties, then select top models across tickers each period; the ensemble stage averages scores from several configs before selection.
 
 ## 2. Data flow (high-level)
 
@@ -703,12 +704,12 @@ graph LR
 
 ```mermaid
 graph TD
-    S[Scores per ticker] --> TG[Ticker score (median top M)]
-    TG --> GT[Gate top sqrt(N) tickers]
-    GT --> RT[Rank models within ticker]
-    RT --> CAP[Apply per-ticker cap]
-    CAP --> GL[Global rank]
-    GL --> SEL[Select top N models]
+    S["Scores per ticker"] --> TG["Ticker score: median top M"]
+    TG --> GT["Gate top sqrt(N) tickers"]
+    GT --> RT["Rank models within ticker"]
+    RT --> CAP["Apply per-ticker cap"]
+    CAP --> GL["Global rank"]
+    GL --> SEL["Select top N models"]
 ```
 
 ## 11. Where to improve (starter ideas)
