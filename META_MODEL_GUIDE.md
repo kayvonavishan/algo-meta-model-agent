@@ -14,7 +14,7 @@ This document explains how the current meta model works end to end across the tw
 
 ```mermaid
 graph TD
-    subgraph Stage1[Stage 1: adaptive_vol_momentum.py (sweep producer)]
+    subgraph Stage1[Stage 1 - adaptive vol momentum (sweep producer)]
         A[Aligned period returns CSV] --> B[load_aligned_periods_from_csv]
         B --> C[Per-ticker returns matrices]
         C --> D[Config sweep: run_config_sweep]
@@ -22,7 +22,7 @@ graph TD
         E --> E1[meta_config_sweep_results.csv]
         E --> E2[avg_trade_return_plots/ + metrics CSVs]
     end
-    subgraph Stage2[Stage 2: ensemble/meta_ensemble_from_sweep.py (ensemble consumer)]
+    subgraph Stage2[Stage 2 - ensemble meta ensemble from sweep (ensemble consumer)]
         E1 --> F[Load top N configs]
         B --> G[Load aligned returns]
         F --> H[Compute scores per ticker per config]
