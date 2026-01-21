@@ -717,7 +717,7 @@ Risk penalty example:
 
 ### 11.1 Scoring pipeline (per ticker)
 
-````mermaid
+```mermaid
 graph LR
     R[Returns matrix R] --> DISP[Dispersion per period]
     DISP --> Z[Rolling z-score]
@@ -737,7 +737,7 @@ graph LR
 
 ### 11.2 Selection pipeline (per period)
 
-````mermaid
+```mermaid
 graph TD
     S["Scores per ticker"] --> TG["Ticker score: median top M"]
     TG --> GT["Gate top sqrt(N) tickers"]
