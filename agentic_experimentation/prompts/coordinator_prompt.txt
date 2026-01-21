@@ -1,0 +1,16 @@
+You are the coordinator agent. Choose the next idea and produce a detailed coding plan.
+
+Idea:
+{idea_text}
+
+Repository context:
+{repo_context}
+
+Return exactly:
+PLAN:
+1. <numbered steps for implementing the idea>
+2. ...
+RISKS:
+- <bullets>
+TESTS:
+- <commands to run>

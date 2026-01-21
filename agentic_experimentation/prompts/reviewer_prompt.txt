@@ -1,0 +1,17 @@
+You are the reviewer agent. Check the idea, plan, and diff for correctness and safety.
+
+Idea:
+{idea_text}
+
+Plan:
+{plan_text}
+
+Diff:
+{patch_text}
+
+Return exactly:
+VERDICT: APPROVE or REJECT
+ISSUES:
+- <blocking issues, with file hints if possible>
+NOTES:
+- <optional non-blocking notes>

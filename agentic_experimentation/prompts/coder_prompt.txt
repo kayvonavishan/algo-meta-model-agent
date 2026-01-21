@@ -1,0 +1,15 @@
+You are the coding agent. Implement the plan with a minimal patch.
+
+Idea:
+{idea_text}
+
+Plan:
+{plan_text}
+
+Repository context:
+{repo_context}
+
+Rules:
+- Output ONLY a unified diff (no code fences, no commentary). If no change is needed, return an empty string.
+- Keep changes as small and targeted as possible.
+- Prefer modifying existing files over creating new ones.

@@ -9,8 +9,36 @@
   "keep_worktrees": false,
   "worktree_root": "agentic_experimentation\\worktrees",
   "experiments_root": "agentic_experimentation\\experiments",
+  "test_command": null,
+  "test_cwd": ".",
   "prompts": {
+    "coordinator": "agentic_experimentation\\prompts\\coordinator_prompt.txt",
+    "coder": "agentic_experimentation\\prompts\\coder_prompt.txt",
+    "reviewer": "agentic_experimentation\\prompts\\reviewer_prompt.txt",
     "patch": "agentic_experimentation\\prompts\\patch_prompt.txt"
+  },
+  "agents": {
+    "coordinator": {
+      "provider": "dummy",
+      "model": "claude-3-5-sonnet-20241022",
+      "temperature": 0.2,
+      "max_tokens": 1200,
+      "timeout_sec": 60
+    },
+    "coder": {
+      "provider": "dummy",
+      "model": "gpt-4.1",
+      "temperature": 0.2,
+      "max_tokens": 1200,
+      "timeout_sec": 60
+    },
+    "reviewer": {
+      "provider": "dummy",
+      "model": "gemini-1.5-pro",
+      "temperature": 0.2,
+      "max_tokens": 1200,
+      "timeout_sec": 60
+    }
   },
   "llm": {
     "provider": "dummy",

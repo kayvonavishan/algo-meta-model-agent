@@ -41,16 +41,16 @@ class OpenAIClient(LLMClient):
     def generate(self, prompt, system_prompt=None):
         if not self.api_key:
             raise RuntimeError("OpenAI API key env var not set.")
-        url = f"{self.base_url}/chat/completions"
-        messages = []
+        url = f"{self.base_url}/responses"
+        inputs = []
         if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
+            inputs.append({"role": "system", "content": system_prompt})
+        inputs.append({"role": "user", "content": prompt})
         payload = {
             "model": self.config.get("model", "gpt-4.1"),
-            "messages": messages,
+            "input": inputs,
             "temperature": self.config.get("temperature", 0.2),
-            "max_tokens": self.config.get("max_tokens", 1200),
+            "max_output_tokens": self.config.get("max_tokens", 1200),
         }
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -131,6 +131,16 @@ def _post_json(url, payload, headers, timeout_sec):
 
 
 def _extract_text(payload):
+    if "output" in payload:
+        out_list = payload.get("output") or []
+        if out_list:
+            content = out_list[0].get("content") if isinstance(out_list[0], dict) else None
+            if isinstance(content, list) and content:
+                text_part = content[0]
+                if isinstance(text_part, dict):
+                    return text_part.get("text", "")
+                if isinstance(text_part, str):
+                    return text_part
     if "choices" in payload:
         return payload["choices"][0]["message"]["content"]
     if "content" in payload and isinstance(payload["content"], list):

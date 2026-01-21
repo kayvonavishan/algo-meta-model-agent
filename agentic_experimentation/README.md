@@ -9,6 +9,8 @@ Quick start
 5) Run iterations (defaults to one per idea):
    `python agentic_experimentation/agent_runner.py --config agentic_experimentation/agent_config.json`
    Use `--iterations N` to run only the first N ideas.
+6) Multi-agent option (coordinator → coder → reviewer → tests → sweep):
+   `python agentic_experimentation/multi_agent_runner.py --config agentic_experimentation/agent_config.json`
 
 Notes
 - Worktrees keep your main repo clean; each iteration runs in its own temp worktree.
