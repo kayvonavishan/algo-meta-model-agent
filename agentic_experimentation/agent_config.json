@@ -31,7 +31,7 @@
       "model": "gpt-5.2",
       "reasoning": "high",
       "temperature": 0.2,
-      "max_tokens": 1200,
+      "max_tokens": 50000,
       "timeout_sec": 60
     },
     "coder": {
@@ -39,7 +39,7 @@
       "model": "gpt-5.2-codex",
       "reasoning": "high",
       "temperature": 0.2,
-      "max_tokens": 1200,
+      "max_tokens": 50000,
       "timeout_sec": 60
     },
     "reviewer": {
@@ -47,7 +47,7 @@
       "model": "gpt-5.2",
       "reasoning": "high",
       "temperature": 0.2,
-      "max_tokens": 1200,
+      "max_tokens": 50000,
       "timeout_sec": 60
     }
   },

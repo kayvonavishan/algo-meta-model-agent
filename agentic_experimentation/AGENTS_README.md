@@ -6,7 +6,7 @@ This describes the current multi-agent loop driven by `multi_agent_runner.py`.
 
 ```mermaid
 graph TD
-    A["Idea from ideas.txt"] --> B["Coordinator LLM<br/>notes handoff"]
+    A["Idea from ideas_file<br/>(file or directory)"] --> B["Coordinator LLM<br/>notes handoff"]
     B --> C["Planner LLM<br/>PLAN / RISKS / TESTS"]
     C --> D["Coder LLM<br/>unified diff"]
     D --> E["git apply patch"]
@@ -53,3 +53,15 @@ graph TD
 - `baseline_csv` / `results_csv`: scoring inputs/outputs.
 - `worktree_root` / `experiments_root`: isolation of runs.
 - `.env` support: place API keys in `agentic_experimentation/.env` or repo-root `.env`; they are auto-loaded by the runners (vars not already set in the environment).
+
+## Cleaning up old worktrees
+
+If you ran with `--keep-worktrees` (or set `keep_worktrees=true`), old worktrees can accumulate under your configured `worktree_root` (default: `agentic_experimentation/worktrees/`).
+
+- List existing worktrees:
+  - `git worktree list`
+- Remove a specific worktree directory:
+  - `git worktree remove --force agentic_experimentation/worktrees/<run_id>`
+- Remove all worktrees under the configured worktree root (PowerShell, from repo root):
+  - `Get-ChildItem agentic_experimentation/worktrees -Directory | ForEach-Object { git worktree remove --force $_.FullName }`
+  - `git worktree prune`
