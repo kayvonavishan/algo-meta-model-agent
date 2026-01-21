@@ -14,15 +14,25 @@ This document explains how the current meta model works end to end across the tw
 
 ```mermaid
 graph TD
-    A[Aligned period returns CSV] --> B[load_aligned_periods_from_csv]
-    B --> C[Per-ticker returns matrices]
-    D[Meta config sweep results] --> E[Top N configs]
-    E --> F[Compute scores per ticker per config]
-    F --> G[Normalize + average scores across configs]
-    G --> H[Ticker gating + global selection]
-    H --> I[Selections CSV]
-    H --> J[Optional ensemble scores CSV]
-    H --> K[Evaluation: equity curves + metrics]
+    subgraph Stage 1: adaptive_vol_momentum.py (sweep producer)
+        A[Aligned period returns CSV] --> B[load_aligned_periods_from_csv]
+        B --> C[Per-ticker returns matrices]
+        C --> D[Config sweep: run_config_sweep]
+        D --> E[Sweep artifacts under run_<ts>/]
+        E --> E1[meta_config_sweep_results.csv]
+        E --> E2[avg_trade_return_plots/ + metrics CSVs]
+    end
+    subgraph Stage 2: ensemble/meta_ensemble_from_sweep.py (ensemble consumer)
+        E1 --> F[Load top N configs]
+        B --> G[Load aligned returns]
+        F --> H[Compute scores per ticker per config]
+        G --> H
+        H --> I[Normalize + average scores across configs]
+        I --> J[Ticker gating + global selection]
+        J --> K[meta_ensemble_selections.csv]
+        J --> L[Optional ensemble scores CSV]
+        J --> M[Evaluation: equity curves + metrics + plots]
+    end
 ```
 
 ## 3. Inputs and shapes
