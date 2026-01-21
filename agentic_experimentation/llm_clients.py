@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -51,20 +52,25 @@ class OpenAIClient(LLMClient):
         if system_prompt:
             inputs.append({"role": "system", "content": system_prompt})
         inputs.append({"role": "user", "content": prompt})
+        model = self.config.get("model", "gpt-4.1")
         payload = {
-            "model": self.config.get("model", "gpt-4.1"),
+            "model": model,
             "input": inputs,
-            "temperature": self.config.get("temperature", 0.2),
             "max_output_tokens": self.config.get("max_tokens", 1200),
         }
         reasoning = self.config.get("reasoning")
         if reasoning:
             payload["reasoning"] = {"effort": reasoning}
+        temperature = self.config.get("temperature", None)
+        if temperature is not None and _openai_model_supports_temperature(model):
+            payload["temperature"] = temperature
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        result = _post_json(url, payload, headers, self.config.get("timeout_sec", 60))
+        result = _post_json_openai_with_fallback(
+            url, payload, headers, self.config.get("timeout_sec", 60)
+        )
         if _should_log(self.config):
             _log_llm_call("openai", payload.get("model"), prompt, result)
         return result
@@ -153,6 +159,39 @@ def _post_json(url, payload, headers, timeout_sec):
 
     parsed = json.loads(raw)
     return _extract_text(parsed)
+
+
+def _openai_model_supports_temperature(model):
+    m = (model or "").lower().strip()
+    return not (m.startswith("gpt-5") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4"))
+
+
+def _try_extract_unsupported_param(error_text):
+    if not error_text:
+        return None
+    match = re.search(r"Unsupported parameter: '([^']+)'", error_text)
+    if match:
+        return match.group(1)
+    match = re.search(r'"param"\\s*:\\s*"([^"]+)"', error_text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _post_json_openai_with_fallback(url, payload, headers, timeout_sec):
+    removed = set()
+    last_error = None
+    for _ in range(3):
+        try:
+            return _post_json(url, payload, headers, timeout_sec)
+        except RuntimeError as exc:
+            last_error = str(exc)
+            param = _try_extract_unsupported_param(last_error)
+            if not param or param in removed or param not in payload:
+                raise
+            removed.add(param)
+            payload.pop(param, None)
+    raise RuntimeError(last_error or "LLM request failed")  # pragma: no cover
 
 
 def _extract_text(payload):
