@@ -21,6 +21,9 @@ def main():
     config_path = Path(args.config).resolve()
     config = _load_json(config_path)
 
+    # Load .env files (config directory first, then repo root)
+    _load_env_files([config_path.parent / ".env"])
+
     repo_root = _resolve_repo_root(config, config_path)
     experiments_root = _resolve_path(repo_root, config.get("experiments_root"))
     worktree_root = _resolve_path(repo_root, config.get("worktree_root"))
@@ -34,6 +37,9 @@ def main():
         _refresh_baseline(results_csv, baseline_csv)
         print(f"Baseline copied to {baseline_csv}")
         return
+
+    # Repo-level .env (if present)
+    _load_env_files([repo_root / ".env"])
 
     if not baseline_csv.exists():
         raise RuntimeError(f"Baseline CSV not found at {baseline_csv}. Run with --refresh-baseline.")
@@ -250,9 +256,37 @@ def _render_prompt(template, **kwargs):
 
 
 def _load_ideas(path):
+    if path.is_dir():
+        ideas = []
+        for p in sorted(path.glob("*.md")):
+            content = _read_text(p).strip()
+            if content:
+                ideas.append(content)
+        return ideas
     content = _read_text(path)
     blocks = [block.strip() for block in content.split("\n\n") if block.strip()]
     return blocks
+
+
+def _load_env_files(paths):
+    for p in paths:
+        if not p:
+            continue
+        try:
+            data = _read_text(p)
+        except FileNotFoundError:
+            continue
+        for line in data.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key and val and key not in os.environ:
+                os.environ[key] = val
 
 
 if __name__ == "__main__":

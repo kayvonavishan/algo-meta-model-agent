@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import urllib.error
 import urllib.request
 
@@ -23,13 +24,16 @@ class DummyClient(LLMClient):
                     with open(path, "r", encoding="utf-8") as f:
                         return f.read()
             return ""
-        return self.config.get(
+        result = self.config.get(
             "dummy_idea_text",
             "IDEA: Increase top_n_global by a small amount to test sensitivity.\n"
             "RATIONALE: Tests robustness to selection breadth.\n"
             "FILES: adaptive_vol_momentum.py\n"
             "RISKS: Might dilute signal if too large.",
         )
+        if _should_log(self.config):
+            _log_llm_call("dummy", self.config.get("model", "dummy"), prompt, result)
+        return result
 
 
 class OpenAIClient(LLMClient):
@@ -56,7 +60,10 @@ class OpenAIClient(LLMClient):
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        return _post_json(url, payload, headers, self.config.get("timeout_sec", 60))
+        result = _post_json(url, payload, headers, self.config.get("timeout_sec", 60))
+        if _should_log(self.config):
+            _log_llm_call("openai", payload.get("model"), prompt, result)
+        return result
 
 
 class AnthropicClient(LLMClient):
@@ -83,7 +90,10 @@ class AnthropicClient(LLMClient):
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
-        return _post_json(url, payload, headers, self.config.get("timeout_sec", 60))
+        result = _post_json(url, payload, headers, self.config.get("timeout_sec", 60))
+        if _should_log(self.config):
+            _log_llm_call("anthropic", payload.get("model"), prompt, result)
+        return result
 
 
 class GeminiClient(LLMClient):
@@ -102,7 +112,10 @@ class GeminiClient(LLMClient):
             parts.insert(0, {"text": system_prompt})
         payload = {"contents": [{"parts": parts}]}
         headers = {"content-type": "application/json"}
-        return _post_json(url, payload, headers, self.config.get("timeout_sec", 60))
+        result = _post_json(url, payload, headers, self.config.get("timeout_sec", 60))
+        if _should_log(self.config):
+            _log_llm_call("gemini", model, prompt, result)
+        return result
 
 
 def build_llm_client(config):
@@ -149,3 +162,39 @@ def _extract_text(payload):
         parts = payload["candidates"][0]["content"]["parts"]
         return parts[0].get("text", "")
     raise RuntimeError("Unexpected LLM response format.")
+
+
+# Debug logging helpers
+
+def _should_log(config):
+    if os.getenv("LLM_DEBUG", "").lower() in ("1", "true", "yes", "on"):
+        return True
+    return bool(config.get("debug_log"))
+
+
+def _log_target_file():
+    path = os.getenv("LLM_DEBUG_FILE", "").strip()
+    return Path(path) if path else None
+
+
+def _log_llm_call(provider, model, prompt, response):
+    # Truncate to avoid huge logs
+    max_len = 4000
+    prompt_trunc = (prompt[:max_len] + "... [truncated]") if len(prompt) > max_len else prompt
+    resp_trunc = (response[:max_len] + "... [truncated]") if len(response) > max_len else response
+    lines = [
+        f"[LLM DEBUG] provider={provider} model={model}",
+        "PROMPT:",
+        prompt_trunc,
+        "RESPONSE:",
+        resp_trunc,
+        "-" * 40,
+    ]
+    out = "\n".join(lines)
+    target = _log_target_file()
+    if target:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "a", encoding="utf-8") as f:
+            f.write(out + "\n")
+    else:
+        print(out, file=sys.stderr)

@@ -29,6 +29,9 @@ def main():
     config_path = Path(args.config).resolve()
     config = _load_json(config_path)
 
+    # Load .env from config directory first
+    _load_env_files([config_path.parent / ".env"])
+
     repo_root = _resolve_repo_root(config, config_path)
     experiments_root = _resolve_path(repo_root, config.get("experiments_root"))
     worktree_root = _resolve_path(repo_root, config.get("worktree_root"))
@@ -38,6 +41,9 @@ def main():
     if agentic_output_root:
         agentic_output_root = Path(agentic_output_root).expanduser()
     ideas_path = _resolve_path(repo_root, config.get("ideas_file"))
+
+    # Load .env from repo root (if present)
+    _load_env_files([repo_root / ".env"])
     if not ideas_path:
         raise RuntimeError("ideas_file must be set in the config.")
     if not baseline_csv.exists():

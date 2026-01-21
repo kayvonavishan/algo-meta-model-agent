@@ -52,3 +52,4 @@ graph TD
 - `sweep_command` / `sweep_cwd`: sweep execution.
 - `baseline_csv` / `results_csv`: scoring inputs/outputs.
 - `worktree_root` / `experiments_root`: isolation of runs.
+- `.env` support: place API keys in `agentic_experimentation/.env` or repo-root `.env`; they are auto-loaded by the runners (vars not already set in the environment).
