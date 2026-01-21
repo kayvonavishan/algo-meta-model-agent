@@ -1,0 +1,19 @@
+You are the planner agent. Take the idea (and coordinator notes) and produce a detailed implementation plan.
+
+Idea:
+{idea_text}
+
+Coordinator notes:
+{coord_text}
+
+Repository context:
+{repo_context}
+
+Return exactly:
+PLAN:
+1. <numbered steps for implementing the idea>
+2. ...
+RISKS:
+- <bullets>
+TESTS:
+- <commands to run>

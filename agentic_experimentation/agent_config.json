@@ -13,6 +13,7 @@
   "test_cwd": ".",
   "prompts": {
     "coordinator": "agentic_experimentation\\prompts\\coordinator_prompt.txt",
+    "planner": "agentic_experimentation\\prompts\\planner_prompt.txt",
     "coder": "agentic_experimentation\\prompts\\coder_prompt.txt",
     "reviewer": "agentic_experimentation\\prompts\\reviewer_prompt.txt",
     "patch": "agentic_experimentation\\prompts\\patch_prompt.txt"
@@ -21,6 +22,13 @@
     "coordinator": {
       "provider": "dummy",
       "model": "claude-3-5-sonnet-20241022",
+      "temperature": 0.2,
+      "max_tokens": 1200,
+      "timeout_sec": 60
+    },
+    "planner": {
+      "provider": "dummy",
+      "model": "gpt-4.1",
       "temperature": 0.2,
       "max_tokens": 1200,
       "timeout_sec": 60

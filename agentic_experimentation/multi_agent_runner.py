@@ -47,15 +47,17 @@ def main():
 
     agents_cfg = config.get("agents", {})
     coordinator_llm = _build_llm_for_role(agents_cfg, "coordinator", args.dry_run_llm)
+    planner_llm = _build_llm_for_role(agents_cfg, "planner", args.dry_run_llm)
     coder_llm = _build_llm_for_role(agents_cfg, "coder", args.dry_run_llm)
     reviewer_llm = _build_llm_for_role(agents_cfg, "reviewer", args.dry_run_llm)
 
     prompts_cfg = config.get("prompts", {})
     coord_prompt_path = _resolve_path(repo_root, prompts_cfg.get("coordinator"))
+    planner_prompt_path = _resolve_path(repo_root, prompts_cfg.get("planner"))
     coder_prompt_path = _resolve_path(repo_root, prompts_cfg.get("coder"))
     reviewer_prompt_path = _resolve_path(repo_root, prompts_cfg.get("reviewer"))
-    if not (coord_prompt_path and coder_prompt_path and reviewer_prompt_path):
-        raise RuntimeError("Coordinator, coder, and reviewer prompts must be set in config['prompts'].")
+    if not (coord_prompt_path and planner_prompt_path and coder_prompt_path and reviewer_prompt_path):
+        raise RuntimeError("Coordinator, planner, coder, and reviewer prompts must be set in config['prompts'].")
 
     iterations_requested = args.iterations
     if iterations_requested is None:
@@ -81,14 +83,25 @@ def main():
             idea_text = ideas[i]
             _write_text(exp_dir / "idea.md", idea_text)
 
-            # Coordinator: produce plan
+            # Coordinator: produce handoff notes
             coord_prompt = _render_prompt(
                 _read_text(coord_prompt_path),
                 idea_text=idea_text,
                 repo_context=repo_context,
             )
             _write_text(exp_dir / "coordinator_prompt.txt", coord_prompt)
-            plan_text = coordinator_llm.generate(coord_prompt, system_prompt=SYSTEM_PROMPT)
+            coord_text = coordinator_llm.generate(coord_prompt, system_prompt=SYSTEM_PROMPT)
+            _write_text(exp_dir / "coordinator.md", coord_text)
+
+            # Planner: produce plan
+            planner_prompt = _render_prompt(
+                _read_text(planner_prompt_path),
+                idea_text=idea_text,
+                coord_text=coord_text,
+                repo_context=repo_context,
+            )
+            _write_text(exp_dir / "planner_prompt.txt", planner_prompt)
+            plan_text = planner_llm.generate(planner_prompt, system_prompt=SYSTEM_PROMPT)
             _write_text(exp_dir / "plan.md", plan_text)
 
             # Coder: produce patch
@@ -154,6 +167,7 @@ def main():
             summary = {
                 "run_id": run_id,
                 "idea": idea_text.strip(),
+                "coordinator": coord_text.strip(),
                 "plan": plan_text.strip(),
                 "patch_applied": patch_applied,
                 "patch_error": patch_error,

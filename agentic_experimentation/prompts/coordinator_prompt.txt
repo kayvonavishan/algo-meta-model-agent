@@ -1,4 +1,4 @@
-You are the coordinator agent. Choose the next idea and produce a detailed coding plan.
+You are the coordinator agent. A planner agent will create the detailed plan. Provide a concise handoff.
 
 Idea:
 {idea_text}
@@ -7,10 +7,5 @@ Repository context:
 {repo_context}
 
 Return exactly:
-PLAN:
-1. <numbered steps for implementing the idea>
-2. ...
-RISKS:
-- <bullets>
-TESTS:
-- <commands to run>
+COORDINATOR_NOTES:
+- <bullets highlighting scope, constraints, risks, priorities>
