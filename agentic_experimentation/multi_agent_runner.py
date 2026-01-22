@@ -64,6 +64,7 @@ def main():
     planner_system_path = _resolve_path(repo_root, prompts_cfg.get("planner_system"))
     planner_files_path = _resolve_path(repo_root, prompts_cfg.get("planner_repo_files"))
     coder_prompt_path = _resolve_path(repo_root, prompts_cfg.get("coder"))
+    coder_fix_prompt_path = _resolve_path(repo_root, prompts_cfg.get("coder_fix"))
     coder_system_path = _resolve_path(repo_root, prompts_cfg.get("coder_system"))
     coder_files_path = _resolve_path(repo_root, prompts_cfg.get("coder_repo_files"))
     reviewer_prompt_path = _resolve_path(repo_root, prompts_cfg.get("reviewer"))
@@ -71,6 +72,8 @@ def main():
     reviewer_files_path = _resolve_path(repo_root, prompts_cfg.get("reviewer_repo_files"))
     if not (planner_prompt_path and coder_prompt_path and reviewer_prompt_path):
         raise RuntimeError("Planner, coder, and reviewer prompts must be set in config['prompts'].")
+    if not coder_fix_prompt_path:
+        coder_fix_prompt_path = coder_prompt_path
 
     iterations_requested = args.iterations
     if iterations_requested is None:
@@ -111,33 +114,84 @@ def main():
             plan_text = planner_llm.generate(planner_prompt, system_prompt=planner_system)
             _write_text(exp_dir / "plan.md", plan_text)
 
-            # Coder: produce patch
-            coder_prompt = _render_prompt(
-                _read_text(coder_prompt_path),
-                idea_text=idea_text,
-                plan_text=plan_text,
-                repo_context=coder_context,
-            )
-            _write_text(exp_dir / "coder_prompt.txt", coder_prompt)
+            # Coder <-> Reviewer repair loop (incremental patches in the same worktree)
             coder_system = _read_text(coder_system_path) if coder_system_path else SYSTEM_PROMPT
-            patch_text = coder_llm.generate(coder_prompt, system_prompt=coder_system)
-            _write_text(exp_dir / "patch.diff", patch_text)
-
-            patch_applied, patch_error = _apply_patch_safe(worktree_path, patch_text)
-
-            # Reviewer: evaluate idea, plan, and diff
-            review_prompt = _render_prompt(
-                _read_text(reviewer_prompt_path),
-                idea_text=idea_text,
-                plan_text=plan_text,
-                patch_text=patch_text,
-                repo_context=reviewer_context,
-            )
-            _write_text(exp_dir / "reviewer_prompt.txt", review_prompt)
             reviewer_system = _read_text(reviewer_system_path) if reviewer_system_path else SYSTEM_PROMPT
-            review_text = reviewer_llm.generate(review_prompt, system_prompt=reviewer_system)
-            _write_text(exp_dir / "review.md", review_text)
-            verdict = _parse_reviewer_verdict(review_text)
+            max_review_rounds = args.max_review_rounds
+            if max_review_rounds is None:
+                max_review_rounds = config.get("max_review_rounds", 2)
+            max_review_rounds = int(max_review_rounds)
+
+            review_rounds = []
+            patch_text = ""
+            patch_applied = False
+            patch_error = None
+            review_text = ""
+            review_issues = ""
+            verdict = "UNKNOWN"
+
+            for round_idx in range(max_review_rounds + 1):
+                coder_template_path = coder_prompt_path if round_idx == 0 else coder_fix_prompt_path
+                coder_prompt = _render_prompt(
+                    _read_text(coder_template_path),
+                    idea_text=idea_text,
+                    plan_text=plan_text,
+                    repo_context=coder_context,
+                    review_text=review_text,
+                    review_issues=review_issues,
+                    prev_patch_text=patch_text,
+                    prev_patch_error=patch_error or "",
+                )
+                _write_text(exp_dir / f"coder_prompt_round_{round_idx}.txt", coder_prompt)
+                patch_text = coder_llm.generate(coder_prompt, system_prompt=coder_system)
+                _write_text(exp_dir / f"patch_round_{round_idx}.diff", patch_text)
+
+                patch_applied, patch_error = _apply_patch_safe(worktree_path, patch_text)
+                if not patch_applied:
+                    verdict = "REJECT"
+                    review_text = (
+                        "VERDICT: REJECT\n"
+                        "ISSUES:\n"
+                        f"- patch did not apply: {patch_error}\n"
+                        "NOTES:\n"
+                        "- regenerate a patch that applies cleanly to the current worktree state\n"
+                    )
+                    review_issues = patch_error or "patch did not apply"
+                    _write_text(exp_dir / f"review_round_{round_idx}.md", review_text)
+                    review_rounds.append(
+                        {
+                            "round": round_idx,
+                            "patch_applied": False,
+                            "patch_error": patch_error,
+                            "review_verdict": verdict,
+                        }
+                    )
+                    continue
+
+                review_prompt = _render_prompt(
+                    _read_text(reviewer_prompt_path),
+                    idea_text=idea_text,
+                    plan_text=plan_text,
+                    patch_text=patch_text,
+                    repo_context=reviewer_context,
+                )
+                _write_text(exp_dir / f"reviewer_prompt_round_{round_idx}.txt", review_prompt)
+                review_text = reviewer_llm.generate(review_prompt, system_prompt=reviewer_system)
+                _write_text(exp_dir / f"review_round_{round_idx}.md", review_text)
+                verdict = _parse_reviewer_verdict(review_text)
+                review_issues = _extract_reviewer_issues(review_text)
+                review_rounds.append(
+                    {
+                        "round": round_idx,
+                        "patch_applied": True,
+                        "patch_error": None,
+                        "review_verdict": verdict,
+                        "review_issues": review_issues,
+                    }
+                )
+
+                if verdict == "APPROVE":
+                    break
 
             tests_exit = None
             sweep_exit = None
@@ -197,6 +251,7 @@ def main():
                 "patch_applied": patch_applied,
                 "patch_error": patch_error,
                 "review_verdict": verdict,
+                "review_rounds": review_rounds,
                 "tests_exit_code": tests_exit,
                 "sweep_exit_code": sweep_exit,
                 "results_csv": str(candidate_csv) if candidate_csv.exists() else None,
@@ -219,6 +274,7 @@ def _parse_args():
     parser.add_argument("--iterations", type=int, default=None)
     parser.add_argument("--dry-run-llm", action="store_true")
     parser.add_argument("--keep-worktrees", action="store_true")
+    parser.add_argument("--max-review-rounds", type=int, default=None)
     return parser.parse_args()
 
 
@@ -245,6 +301,27 @@ def _parse_reviewer_verdict(text):
     if "REJECT" in upper:
         return "REJECT"
     return "UNKNOWN"
+
+
+def _extract_reviewer_issues(text):
+    if not text:
+        return ""
+    lines = text.splitlines()
+    issues = []
+    in_issues = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.upper() == "ISSUES:":
+            in_issues = True
+            continue
+        if stripped.upper() == "NOTES:":
+            break
+        if in_issues:
+            if stripped.startswith("-"):
+                issues.append(stripped[1:].strip())
+            elif stripped:
+                issues.append(stripped)
+    return "\n".join(issues).strip()
 
 
 def _run_command(cmd, cwd, log_path):

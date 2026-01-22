@@ -39,9 +39,44 @@ def apply_patch_text(worktree_path, patch_text):
 
 
 def sync_working_tree(repo_root, worktree_path):
-    _apply_diff(repo_root, worktree_path, cached=False)
-    _apply_diff(repo_root, worktree_path, cached=True)
-    _copy_untracked(repo_root, worktree_path)
+    repo_root = Path(repo_root)
+    worktree_path = Path(worktree_path)
+
+    # Prefer a file-based sync over `git apply` to avoid patch application issues
+    # (notably around line endings on Windows).
+    copy_paths = set()
+    delete_paths = set()
+
+    for p in _git_list_paths(["git", "diff", "--name-only"], cwd=repo_root):
+        copy_paths.add(p)
+    for p in _git_list_paths(["git", "diff", "--name-only", "--cached"], cwd=repo_root):
+        copy_paths.add(p)
+    for p in _git_list_paths(["git", "ls-files", "--others", "--exclude-standard"], cwd=repo_root):
+        copy_paths.add(p)
+
+    for p in _git_list_paths(["git", "diff", "--name-only", "--diff-filter=D"], cwd=repo_root):
+        delete_paths.add(p)
+    for p in _git_list_paths(["git", "diff", "--name-only", "--cached", "--diff-filter=D"], cwd=repo_root):
+        delete_paths.add(p)
+
+    for rel in sorted(delete_paths):
+        target = worktree_path / rel
+        if target.exists():
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                target.unlink()
+
+    for rel in sorted(copy_paths):
+        src = repo_root / rel
+        dst = worktree_path / rel
+        if not src.exists():
+            continue
+        if src.is_dir():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
 
 
 def _apply_diff(repo_root, worktree_path, cached):
@@ -90,6 +125,11 @@ def _run(cmd, cwd, input_text=None, capture_output=False):
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
     return subprocess.run(cmd, **kwargs)
+
+
+def _git_list_paths(cmd, cwd):
+    result = _run(cmd, cwd=cwd, capture_output=True)
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
 
 def _apply_codex_cli_patch(worktree_path, patch_text):

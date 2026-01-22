@@ -26,8 +26,8 @@ graph TD
 - `idea.md`: selected idea text.
 - `coordinator_prompt.txt` / `coordinator.md`: prompt and notes from coordinator.
 - `planner_prompt.txt` / `plan.md`: prompt and detailed plan.
-- `coder_prompt.txt` / `patch.diff`: prompt and generated diff.
-- `reviewer_prompt.txt` / `review.md`: prompt and review verdict.
+- `coder_prompt_round_<n>.txt` / `patch_round_<n>.diff`: coder prompt and generated diff per round.
+- `reviewer_prompt_round_<n>.txt` / `review_round_<n>.md`: reviewer prompt and verdict per round.
 - `tests.log`: optional test run output.
 - `sweep.log`: sweep command output.
 - `meta_config_sweep_results.csv`: copied sweep results (if produced).
@@ -37,8 +37,8 @@ graph TD
 
 1. Create git worktree; optionally sync working tree changes if `base_on_working_tree` is true.
 2. Coordinator produces notes; planner produces the plan.
-3. Coder produces and applies patch. If apply fails, stop.
-4. Reviewer renders verdict. If not APPROVE, stop.
+3. Coder produces and applies patch; reviewer renders verdict.
+4. If reviewer rejects (or patch fails to apply), feed issues back to the coder and retry in the same worktree up to `max_review_rounds` times.
 5. If `test_command` is set, run it; require exit code 0 to proceed.
 6. Run sweep (`sweep_command`) and log output.
 7. Copy sweep `results_csv` into the run dir and score vs `baseline_csv`.
@@ -48,6 +48,7 @@ graph TD
 
 - `agents`: per-role LLM config for coordinator, planner, coder, reviewer.
 - `prompts`: file paths for each agent.
+- `max_review_rounds`: maximum number of coder fix retries after a reviewer rejection (does not include the initial attempt).
 - `test_command` / `test_cwd`: optional test gate.
 - `sweep_command` / `sweep_cwd`: sweep execution.
 - `baseline_csv` / `results_csv`: scoring inputs/outputs.
