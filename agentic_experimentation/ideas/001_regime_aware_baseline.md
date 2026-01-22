@@ -25,6 +25,3 @@ REQUIRED_CHANGES:
 3. Integration:
    - Ensure dispersion z-series is available where baseline is computed (`compute_scores_for_ticker_v2`).
    - Insert the regime logic before baseline subtraction; leave downstream steps unchanged.
-
-TEST:
-- Run a sweep including the new params and compare against baseline; monitor metrics in high/low dispersion periods (Sharpe, drawdowns).

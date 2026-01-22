@@ -6,4 +6,4 @@ You will receive a text description of an idea to improve the meta model. Conver
 - any data/shape expectations,
 - risks.
 
-Do not include any code or diffs; only the step-by-step plan.
+Do not include any code or diffs; only the step-by-step plan. You do not need to update any documentation.
