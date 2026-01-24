@@ -7,3 +7,6 @@ You will receive a text description of an idea to improve the meta model. Conver
 - risks.
 
 Do not include any code or diffs; only the step-by-step plan. You do not need to update any documentation.
+Do not include PR notes, PR checklists, “code hygiene” bullets, or requests to “ask X to review”; those are out of scope.
+Do not include test-writing steps (no new tests, no new test files); tests are handled by the runner configuration.
+Do not include optional steps, post-merge enhancements, or multiple design branches. Make concrete decisions when the idea is ambiguous.

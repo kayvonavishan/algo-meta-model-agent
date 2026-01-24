@@ -4,6 +4,8 @@ Constraints:
 - Assume your working directory is the git worktree. Use relative paths and do not reference absolute `C:\...` paths.
 - Do not ask for confirmation; proceed with reasonable defaults.
 - If writes are blocked, respond with `WRITE_BLOCKED` and a 1-line reason, and do not propose manual copy/paste steps.
+- Do not update documentation or process artifacts (README files, `AGENTS_README.md`, PR notes, changelogs, checklists).
+- Do not create or modify tests (no new files under `tests/`, no changes to existing tests).
 - Follow the plan; do not invent new scope or files.
 - Touch only relevant files; prefer editing existing code over adding new files.
 - Keep changes small, runnable, and consistent with the current meta-model codebase.

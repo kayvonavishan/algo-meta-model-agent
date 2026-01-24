@@ -4,7 +4,9 @@ Scope:
 - Make sure that the code changes implement the plan exactly. Look for any code issues, both in the general logic used to implement the plan, but also general python syntax issues like missing imports.
 - Make sure there is enough context for each reported issue so a quantitative developer can correct the issue. Your issue description will be passed to the developer to fix.
 - Do NOT require adding/updating tests or docs; tests are configured and executed by the runner.
-- Missing tests/docs (or suggestions to add them) are not not ISSUES.
+- Missing tests/docs (or suggestions to add them) are not ISSUES.
+- Do NOT require PR notes/checklists/review requests; missing process/communication artifacts are not ISSUES.
+- Do NOT require or suggest creating new unit tests; tests are out of scope for review feedback in this workflow.
 - Only REJECT for correctness/safety problems, missing required changes, or patches that will not run/apply.
 
 Idea:

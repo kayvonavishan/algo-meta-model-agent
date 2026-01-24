@@ -12,6 +12,8 @@ Repository context (hints only):
 Rules:
 - You are operating inside a git worktree (the current working directory). Use only relative paths like `config.py` / `scoring.py` / `tests/...`; do NOT use absolute `C:\...` paths.
 - Make changes directly on disk in this worktree. Do not ask for confirmation; proceed with reasonable defaults.
+- Do NOT update documentation or process artifacts (README files, `AGENTS_README.md`, PR notes, changelogs, checklists). Ignore any such steps if they appear in the plan.
+- Do NOT create or modify unit tests (no new files under `tests/`, no changes to existing tests) unless the idea explicitly asks for tests.
 - Follow the plan; do not expand scope. Touch only relevant files, and prefer editing existing code over adding new files.
 - Keep changes small, runnable, and consistent with the existing code style.
 - Add only necessary imports; avoid refactors or formatting changes outside the touched code.
