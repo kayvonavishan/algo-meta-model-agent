@@ -6,10 +6,9 @@ This describes the current multi-agent loop driven by `multi_agent_runner.py`.
 
 ```mermaid
 graph TD
-    A["Idea from ideas_file<br/>(file or directory)"] --> B["Coordinator LLM<br/>notes handoff"]
-    B --> C["Planner LLM<br/>PLAN / RISKS"]
-    C --> D["Coder LLM<br/>unified diff"]
-    D --> E["git apply patch"]
+    A["Idea from ideas_file<br/>(file or directory)"] --> C["Planner LLM<br/>PLAN / RISKS"]
+    C --> D["Coder LLM<br/>drives Codex MCP edits"]
+    D --> E["git diff (incl. untracked)"]
     E --> F["Reviewer LLM<br/>APPROVE/REJECT"]
     F --> G{Proceed?}
     G -- no --> H["Stop<br/>record summary"]
@@ -24,21 +23,21 @@ graph TD
 ## Artifact pipeline (per iteration)
 
 - `idea.md`: selected idea text.
-- `coordinator_prompt.txt` / `coordinator.md`: prompt and notes from coordinator.
 - `planner_prompt.txt` / `plan.md`: prompt and detailed plan.
-- `coder_prompt_round_<n>.txt` / `patch_round_<n>.diff`: coder prompt and generated diff per round.
+- `coder_prompt_round_<n>.txt` / `coder_output_round_<n>.txt`: coder prompt and final natural-language summary per round.
+- `diff_round_<n>.diff`: cumulative `git diff` after each coder round (includes untracked files via `git diff --no-index`).
 - `reviewer_prompt_round_<n>.txt` / `review_round_<n>.md`: reviewer prompt and verdict per round.
 - `tests.log`: optional test run output.
 - `sweep.log`: sweep command output.
 - `meta_config_sweep_results.csv`: copied sweep results (if produced).
-- `summary.json`: run metadata (idea, notes, plan, patch status, review verdict, tests/sweep exit codes, score).
+- `summary.json`: run metadata (idea, plan, review verdict, tests/sweep exit codes, score).
 
 ## Control logic
 
 1. Create git worktree; optionally sync working tree changes if `base_on_working_tree` is true.
-2. Coordinator produces notes; planner produces the plan.
-3. Coder produces and applies patch; reviewer renders verdict.
-4. If reviewer rejects (or patch fails to apply), feed issues back to the coder and retry in the same worktree up to `max_review_rounds` times.
+2. Planner produces the plan.
+3. Coder uses Codex MCP to edit files in the worktree; the runner snapshots the resulting `git diff`.
+4. Reviewer renders verdict on the `git diff`. If rejected, feed issues back to the coder and retry in the same worktree up to `max_review_rounds` times.
 5. If `test_command` is set, run it; require exit code 0 to proceed.
 6. Run sweep (`sweep_command`) and log output.
 7. Copy sweep `results_csv` into the run dir and score vs `baseline_csv`.
@@ -46,7 +45,9 @@ graph TD
 
 ## Configuration hooks
 
-- `agents`: per-role LLM config for coordinator, planner, coder, reviewer.
+- `codex_mcp`: how to start Codex CLI as an MCP server (default: `npx -y codex mcp-server`).
+- `agents_sdk`: Agents SDK runtime knobs (for example `max_turns`).
+- `agents`: per-role model selection/settings for planner, coder, reviewer (provider fields are ignored by the MCP runner).
 - `prompts`: file paths for each agent.
 - `max_review_rounds`: maximum number of coder fix retries after a reviewer rejection (does not include the initial attempt).
 - `test_command` / `test_cwd`: optional test gate.
@@ -60,7 +61,7 @@ Reviewer policy
 
 ## Patch format
 
-The patch produced by the coder must be a git-apply compatible unified diff (i.e., `git diff` style) because patches are applied via `git apply` inside the worktree.
+The coder edits files in-place via Codex MCP. The runner records the resulting changes as a cumulative `git diff` for review/auditing. Untracked new files are included using `git diff --no-index`.
 
 ## Cleaning up old worktrees
 

@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import os
 import shutil
 import subprocess
@@ -15,10 +16,9 @@ from agent_runner import (
     _run_sweep,
     _write_json,
     _write_text,
-    _load_env_files
+    _load_env_files,
 )
-from git_worktree import apply_patch_text, create_worktree, remove_worktree, sync_working_tree
-from llm_clients import DummyClient, build_llm_client
+from git_worktree import create_worktree, remove_worktree, sync_working_tree
 from scoring_hooks import compute_score
 
 
@@ -26,11 +26,15 @@ SYSTEM_PROMPT = "You are a coding agent improving a meta model. Keep changes sma
 
 
 def main():
+    asyncio.run(_main_async())
+
+
+async def _main_async():
     args = _parse_args()
     config_path = Path(args.config).resolve()
     config = _load_json(config_path)
 
-    # Load .env from config directory first
+    # Load .env from config directory first, then repo root (if present)
     _load_env_files([config_path.parent / ".env"])
 
     repo_root = _resolve_repo_root(config, config_path)
@@ -43,8 +47,8 @@ def main():
         agentic_output_root = Path(agentic_output_root).expanduser()
     ideas_path = _resolve_path(repo_root, config.get("ideas_file"))
 
-    # Load .env from repo root (if present)
     _load_env_files([repo_root / ".env"])
+
     if not ideas_path:
         raise RuntimeError("ideas_file must be set in the config.")
     if not baseline_csv.exists():
@@ -54,17 +58,12 @@ def main():
     if not ideas:
         raise RuntimeError(f"ideas_file provided but no ideas found at {ideas_path}")
 
-    agents_cfg = config.get("agents", {})
-    planner_llm = _build_llm_for_role(agents_cfg, "planner", args.dry_run_llm)
-    coder_llm = _build_llm_for_role(agents_cfg, "coder", args.dry_run_llm)
-    reviewer_llm = _build_llm_for_role(agents_cfg, "reviewer", args.dry_run_llm)
-
     prompts_cfg = config.get("prompts", {})
     planner_prompt_path = _resolve_path(repo_root, prompts_cfg.get("planner"))
     planner_system_path = _resolve_path(repo_root, prompts_cfg.get("planner_system"))
     planner_files_path = _resolve_path(repo_root, prompts_cfg.get("planner_repo_files"))
     coder_prompt_path = _resolve_path(repo_root, prompts_cfg.get("coder"))
-    coder_fix_prompt_path = _resolve_path(repo_root, prompts_cfg.get("coder_fix"))
+    coder_fix_prompt_path = _resolve_path(repo_root, prompts_cfg.get("coder_fix")) or coder_prompt_path
     coder_system_path = _resolve_path(repo_root, prompts_cfg.get("coder_system"))
     coder_files_path = _resolve_path(repo_root, prompts_cfg.get("coder_repo_files"))
     reviewer_prompt_path = _resolve_path(repo_root, prompts_cfg.get("reviewer"))
@@ -72,8 +71,6 @@ def main():
     reviewer_files_path = _resolve_path(repo_root, prompts_cfg.get("reviewer_repo_files"))
     if not (planner_prompt_path and coder_prompt_path and reviewer_prompt_path):
         raise RuntimeError("Planner, coder, and reviewer prompts must be set in config['prompts'].")
-    if not coder_fix_prompt_path:
-        coder_fix_prompt_path = coder_prompt_path
 
     iterations_requested = args.iterations
     if iterations_requested is None:
@@ -85,6 +82,11 @@ def main():
         )
     experiments_root.mkdir(parents=True, exist_ok=True)
 
+    # Agents SDK / Codex MCP configuration
+    codex_mcp_cfg = config.get("codex_mcp", {})
+    agents_sdk_cfg = config.get("agents_sdk", {})
+    max_turns = int(agents_sdk_cfg.get("max_turns", 30))
+
     for i in range(iterations):
         run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{i:02d}"
         exp_dir = experiments_root / run_id
@@ -92,8 +94,6 @@ def main():
 
         worktree_path = create_worktree(repo_root, worktree_root, run_id)
         try:
-            # Default LLM debug log to the experiment directory if not set
-            os.environ.setdefault("LLM_DEBUG_FILE", str(exp_dir / "llm_debug.log"))
             if config.get("base_on_working_tree", False):
                 sync_working_tree(repo_root, worktree_path)
 
@@ -103,7 +103,7 @@ def main():
             idea_text = ideas[i]
             _write_text(exp_dir / "idea.md", idea_text)
 
-            # Planner: produce plan
+            # Planner: produce plan text
             planner_prompt = _render_prompt(
                 _read_text(planner_prompt_path),
                 idea_text=idea_text,
@@ -111,10 +111,19 @@ def main():
             )
             _write_text(exp_dir / "planner_prompt.txt", planner_prompt)
             planner_system = _read_text(planner_system_path) if planner_system_path else SYSTEM_PROMPT
-            plan_text = planner_llm.generate(planner_prompt, system_prompt=planner_system)
+            plan_text = ""
+            if args.dry_run_llm:
+                plan_text = "PLAN:\n1. (dry-run) No-op.\nRISKS:\n- dry-run\n"
+            else:
+                plan_text = await _agents_sdk_generate_text(
+                    config.get("agents", {}).get("planner", {}),
+                    system_prompt=planner_system,
+                    user_prompt=planner_prompt,
+                    max_turns=max_turns,
+                )
             _write_text(exp_dir / "plan.md", plan_text)
 
-            # Coder <-> Reviewer repair loop (incremental patches in the same worktree)
+            # Coder <-> Reviewer repair loop (in-place edits in the same worktree via Codex MCP)
             coder_system = _read_text(coder_system_path) if coder_system_path else SYSTEM_PROMPT
             reviewer_system = _read_text(reviewer_system_path) if reviewer_system_path else SYSTEM_PROMPT
             max_review_rounds = args.max_review_rounds
@@ -123,9 +132,8 @@ def main():
             max_review_rounds = int(max_review_rounds)
 
             review_rounds = []
-            patch_text = ""
-            patch_applied = False
-            patch_error = None
+            diff_text = ""
+            coder_output = ""
             review_text = ""
             review_issues = ""
             verdict = "UNKNOWN"
@@ -139,31 +147,43 @@ def main():
                     repo_context=coder_context,
                     review_text=review_text,
                     review_issues=review_issues,
-                    prev_patch_text=patch_text,
-                    prev_patch_error=patch_error or "",
+                    prev_diff_text=diff_text,
                 )
                 _write_text(exp_dir / f"coder_prompt_round_{round_idx}.txt", coder_prompt)
-                patch_text = coder_llm.generate(coder_prompt, system_prompt=coder_system)
-                _write_text(exp_dir / f"patch_round_{round_idx}.diff", patch_text)
 
-                patch_applied, patch_error = _apply_patch_safe(worktree_path, patch_text)
-                if not patch_applied:
+                if args.dry_run_llm:
+                    coder_output = "(dry-run) skipped Codex edits."
+                else:
+                    coder_output = await _codex_mcp_edit_repo(
+                        worktree_path=worktree_path,
+                        codex_mcp_cfg=codex_mcp_cfg,
+                        agent_cfg=config.get("agents", {}).get("coder", {}),
+                        system_prompt=coder_system,
+                        user_prompt=coder_prompt,
+                        max_turns=max_turns,
+                    )
+                _write_text(exp_dir / f"coder_output_round_{round_idx}.txt", coder_output)
+
+                diff_text = _git_diff_with_untracked(worktree_path)
+                _write_text(exp_dir / f"diff_round_{round_idx}.diff", diff_text)
+
+                if not diff_text.strip():
                     verdict = "REJECT"
                     review_text = (
                         "VERDICT: REJECT\n"
                         "ISSUES:\n"
-                        f"- patch did not apply: {patch_error}\n"
+                        "- coder produced no changes (empty git diff)\n"
                         "NOTES:\n"
-                        "- regenerate a patch that applies cleanly to the current worktree state\n"
+                        "- ensure the coder edits files in-place using Codex MCP\n"
                     )
-                    review_issues = patch_error or "patch did not apply"
+                    review_issues = "coder produced no changes"
                     _write_text(exp_dir / f"review_round_{round_idx}.md", review_text)
                     review_rounds.append(
                         {
                             "round": round_idx,
-                            "patch_applied": False,
-                            "patch_error": patch_error,
+                            "diff_present": False,
                             "review_verdict": verdict,
+                            "review_issues": review_issues,
                         }
                     )
                     continue
@@ -172,19 +192,26 @@ def main():
                     _read_text(reviewer_prompt_path),
                     idea_text=idea_text,
                     plan_text=plan_text,
-                    patch_text=patch_text,
+                    patch_text=diff_text,
                     repo_context=reviewer_context,
                 )
                 _write_text(exp_dir / f"reviewer_prompt_round_{round_idx}.txt", review_prompt)
-                review_text = reviewer_llm.generate(review_prompt, system_prompt=reviewer_system)
+                if args.dry_run_llm:
+                    review_text = "VERDICT: REJECT\nISSUES:\n- dry-run\nNOTES:\n- dry-run\n"
+                else:
+                    review_text = await _agents_sdk_generate_text(
+                        config.get("agents", {}).get("reviewer", {}),
+                        system_prompt=reviewer_system,
+                        user_prompt=review_prompt,
+                        max_turns=max_turns,
+                    )
                 _write_text(exp_dir / f"review_round_{round_idx}.md", review_text)
                 verdict = _parse_reviewer_verdict(review_text)
                 review_issues = _extract_reviewer_issues(review_text)
                 review_rounds.append(
                     {
                         "round": round_idx,
-                        "patch_applied": True,
-                        "patch_error": None,
+                        "diff_present": True,
                         "review_verdict": verdict,
                         "review_issues": review_issues,
                     }
@@ -198,7 +225,7 @@ def main():
             candidate_csv = exp_dir / "meta_config_sweep_results.csv"
             score_result = None
 
-            proceed = patch_applied and verdict == "APPROVE"
+            proceed = bool(diff_text.strip()) and verdict == "APPROVE"
 
             # Tests
             test_cmd = config.get("test_command")
@@ -248,8 +275,6 @@ def main():
                 "run_id": run_id,
                 "idea": idea_text.strip(),
                 "plan": plan_text.strip(),
-                "patch_applied": patch_applied,
-                "patch_error": patch_error,
                 "review_verdict": verdict,
                 "review_rounds": review_rounds,
                 "tests_exit_code": tests_exit,
@@ -278,19 +303,111 @@ def _parse_args():
     return parser.parse_args()
 
 
-def _build_llm_for_role(cfg_map, role, dry_run):
-    cfg = cfg_map.get(role, {})
-    return DummyClient(cfg) if dry_run else build_llm_client(cfg)
-
-
-def _apply_patch_safe(worktree_path, patch_text):
-    if not patch_text.strip():
-        return False, "empty patch"
+def _import_agents_sdk():
     try:
-        apply_patch_text(worktree_path, patch_text)
-        return True, None
-    except Exception as exc:  # pylint: disable=broad-except
-        return False, str(exc)
+        from agents import Agent, Runner, set_default_openai_api  # type: ignore
+        try:
+            from agents import ModelSettings  # type: ignore
+        except Exception:  # pylint: disable=broad-except
+            ModelSettings = None  # type: ignore
+        from agents.mcp import MCPServerStdio  # type: ignore
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "Missing dependency for Codex MCP workflow. Install:\n"
+            "  pip install openai-agents openai\n"
+            "And ensure Node/Codex CLI are available (e.g. `npx -y codex mcp-server`)."
+        ) from exc
+    return Agent, Runner, ModelSettings, set_default_openai_api, MCPServerStdio
+
+
+def _build_reasoning(effort):
+    if not effort:
+        return None
+    try:
+        from openai.types.shared import Reasoning  # type: ignore
+
+        return Reasoning(effort=str(effort))
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
+def _build_model_settings(ModelSettings, cfg):
+    if not ModelSettings:
+        return None
+    kwargs = {}
+    temperature = cfg.get("temperature", None)
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    reasoning = _build_reasoning(cfg.get("reasoning"))
+    if reasoning is not None:
+        kwargs["reasoning"] = reasoning
+    if not kwargs:
+        return None
+    try:
+        return ModelSettings(**kwargs)
+    except TypeError:
+        return None
+
+
+def _create_agent(Agent, *, name, model, instructions, mcp_servers=None, model_settings=None):
+    kwargs = {
+        "name": name,
+        "model": model,
+        "instructions": instructions,
+    }
+    if mcp_servers:
+        kwargs["mcp_servers"] = mcp_servers
+    if model_settings is not None:
+        kwargs["model_settings"] = model_settings
+    try:
+        return Agent(**kwargs)
+    except TypeError:
+        kwargs.pop("model_settings", None)
+        return Agent(**kwargs)
+
+
+async def _agents_sdk_generate_text(agent_cfg, *, system_prompt, user_prompt, max_turns):
+    Agent, Runner, ModelSettings, set_default_openai_api, _ = _import_agents_sdk()
+    set_default_openai_api(os.getenv("OPENAI_API_KEY"))
+
+    model = agent_cfg.get("model") or "gpt-5"
+    model_settings = _build_model_settings(ModelSettings, agent_cfg or {})
+    agent = _create_agent(Agent, name="Text Agent", model=model, instructions=system_prompt, model_settings=model_settings)
+    result = await Runner.run(agent, user_prompt, max_turns=max_turns)
+    return (getattr(result, "final_output", None) or "").strip() + "\n"
+
+
+async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, system_prompt, user_prompt, max_turns):
+    Agent, Runner, ModelSettings, set_default_openai_api, MCPServerStdio = _import_agents_sdk()
+    set_default_openai_api(os.getenv("OPENAI_API_KEY"))
+
+    command = (codex_mcp_cfg or {}).get("command") or "npx"
+    args = (codex_mcp_cfg or {}).get("args") or ["-y", "codex", "mcp-server"]
+    client_session_timeout_seconds = int((codex_mcp_cfg or {}).get("client_session_timeout_seconds", 360000))
+
+    model = (agent_cfg or {}).get("model") or "gpt-5"
+    model_settings = _build_model_settings(ModelSettings, agent_cfg or {})
+
+    prev = os.getcwd()
+    os.chdir(worktree_path)
+    try:
+        async with MCPServerStdio(
+            name="Codex CLI",
+            params={"command": command, "args": args},
+            client_session_timeout_seconds=client_session_timeout_seconds,
+        ) as codex_mcp_server:
+            agent = _create_agent(
+                Agent,
+                name="Coder",
+                model=model,
+                instructions=system_prompt,
+                mcp_servers=[codex_mcp_server],
+                model_settings=model_settings,
+            )
+            result = await Runner.run(agent, user_prompt, max_turns=max_turns)
+            return (getattr(result, "final_output", None) or "").strip() + "\n"
+    finally:
+        os.chdir(prev)
 
 
 def _parse_reviewer_verdict(text):
@@ -331,6 +448,41 @@ def _run_command(cmd, cwd, log_path):
         else:
             proc = subprocess.run(cmd, cwd=cwd, shell=True, stdout=f, stderr=subprocess.STDOUT, check=False)
     return proc.returncode
+
+
+def _git_diff_with_untracked(worktree_path):
+    worktree_path = Path(worktree_path)
+    base = _run_capture_git(["git", "diff", "--no-color"], cwd=worktree_path)
+    untracked = _run_capture_git(["git", "ls-files", "--others", "--exclude-standard"], cwd=worktree_path).splitlines()
+    chunks = [base.rstrip()]
+    for rel in [p.strip() for p in untracked if p.strip()]:
+        # `--no-index` emits a standard `diff --git ...` header; exit code is 1 when diffs exist.
+        extra = _run_capture_git(
+            ["git", "diff", "--no-color", "--no-index", "--", "/dev/null", rel],
+            cwd=worktree_path,
+            allow_exit_codes={0, 1},
+        ).rstrip()
+        if extra:
+            chunks.append(extra)
+    combined = "\n\n".join([c for c in chunks if c]).strip()
+    return combined + ("\n" if combined else "")
+
+
+def _run_capture_git(cmd, cwd, allow_exit_codes=None):
+    if allow_exit_codes is None:
+        allow_exit_codes = {0}
+    proc = subprocess.run(
+        cmd,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode not in allow_exit_codes:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(detail or f"git command failed: {' '.join(cmd)}")
+    return proc.stdout or ""
 
 
 def _build_repo_context_for_role(repo_root, role, files_path):

@@ -27,6 +27,18 @@
     "coder_repo_files": "agentic_experimentation\\prompts\\coder\\coder_repo_files.txt",
     "reviewer_repo_files": "agentic_experimentation\\prompts\\reviewer\\reviewer_repo_files.txt"
   },
+  "codex_mcp": {
+    "command": "npx",
+    "args": [
+      "-y",
+      "codex",
+      "mcp-server"
+    ],
+    "client_session_timeout_seconds": 360000
+  },
+  "agents_sdk": {
+    "max_turns": 30
+  },
   "agents": {
     "planner": {
       "provider": "openai",
