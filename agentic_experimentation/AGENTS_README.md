@@ -27,6 +27,8 @@ graph TD
 - `coder_prompt_round_<n>.txt` / `coder_output_round_<n>.txt`: coder prompt and final natural-language summary per round.
 - `diff_round_<n>.diff`: cumulative `git diff` after each coder round (includes untracked files via `git diff --no-index`).
 - `reviewer_prompt_round_<n>.txt` / `review_round_<n>.md`: reviewer prompt and verdict per round.
+- `agents_trace.jsonl`: local JSONL trace of outer-agent spans (LLM calls, tool calls, etc.).
+- `codex_mcp_transcript.jsonl`: local JSONL transcript of Codex MCP tool calls (`codex` / `codex-reply`), including inputs/outputs when available.
 - `tests.log`: optional test run output.
 - `sweep.log`: sweep command output.
 - `meta_config_sweep_results.csv`: copied sweep results (if produced).

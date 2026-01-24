@@ -1,5 +1,10 @@
 import argparse
 import asyncio
+import contextlib
+import contextvars
+import dataclasses
+import datetime as _dt
+import json
 import os
 import shutil
 import subprocess
@@ -25,6 +30,217 @@ from scoring_hooks import compute_score
 SYSTEM_PROMPT = "You are a coding agent improving a meta model. Keep changes small and runnable."
 
 
+_TRACE_CONTEXT = contextvars.ContextVar("_TRACE_CONTEXT", default=None)
+_TRACE_PROCESSOR_REGISTERED = False
+
+
+@contextlib.contextmanager
+def _tracing_scope(*, exp_dir, run_id, step, round_idx=None):
+    prev_env = {
+        "AGENTIC_TRACE_DIR": os.environ.get("AGENTIC_TRACE_DIR"),
+        "AGENTIC_TRACE_RUN_ID": os.environ.get("AGENTIC_TRACE_RUN_ID"),
+        "AGENTIC_TRACE_STEP": os.environ.get("AGENTIC_TRACE_STEP"),
+        "AGENTIC_TRACE_ROUND": os.environ.get("AGENTIC_TRACE_ROUND"),
+    }
+    os.environ["AGENTIC_TRACE_DIR"] = str(Path(exp_dir).resolve())
+    os.environ["AGENTIC_TRACE_RUN_ID"] = str(run_id)
+    os.environ["AGENTIC_TRACE_STEP"] = str(step)
+    os.environ["AGENTIC_TRACE_ROUND"] = "" if round_idx is None else str(round_idx)
+    token = _TRACE_CONTEXT.set(
+        {
+            "exp_dir": str(Path(exp_dir).resolve()),
+            "run_id": str(run_id),
+            "step": str(step),
+            "round_idx": round_idx,
+        }
+    )
+    try:
+        yield
+    finally:
+        _TRACE_CONTEXT.reset(token)
+        for k, v in prev_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _ensure_trace_processor_registered():
+    global _TRACE_PROCESSOR_REGISTERED  # pylint: disable=global-statement
+    if _TRACE_PROCESSOR_REGISTERED:
+        return
+    try:
+        from agents.tracing import add_trace_processor  # type: ignore
+        from agents.tracing.processor_interface import TracingProcessor  # type: ignore
+    except ImportError:
+        # Tracing is optional. If the Agents SDK isn't installed, the caller will fail earlier
+        # when trying to run the agents; keep this as best-effort.
+        return
+
+    class _JsonlTraceProcessor(TracingProcessor):
+        def __init__(self):
+            self._lock = None  # reserved for future threading lock if needed
+
+        def on_trace_start(self, trace):  # noqa: ANN001
+            self._write({"event": "trace_start", "trace": _summarize_trace(trace)})
+
+        def on_trace_end(self, trace):  # noqa: ANN001
+            self._write({"event": "trace_end", "trace": _summarize_trace(trace)})
+
+        def on_span_start(self, span):  # noqa: ANN001
+            payload = _summarize_span(span)
+            self._write({"event": "span_start", "span": payload})
+            if _is_codex_tool_span(payload):
+                self._write_codex({"event": "tool_start", "span": payload})
+
+        def on_span_end(self, span):  # noqa: ANN001
+            payload = _summarize_span(span)
+            self._write({"event": "span_end", "span": payload})
+            if _is_codex_tool_span(payload):
+                self._write_codex({"event": "tool_end", "span": payload})
+
+        def shutdown(self) -> None:
+            return
+
+        def force_flush(self) -> None:
+            return
+
+        def _write(self, payload):  # noqa: ANN001
+            ctx = _TRACE_CONTEXT.get() or {}
+            exp_dir = Path(ctx.get("exp_dir") or os.environ.get("AGENTIC_TRACE_DIR") or ".")
+            exp_dir.mkdir(parents=True, exist_ok=True)
+            payload = dict(payload)
+            payload["ts"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+            payload["run_id"] = ctx.get("run_id") or os.environ.get("AGENTIC_TRACE_RUN_ID")
+            payload["step"] = ctx.get("step") or os.environ.get("AGENTIC_TRACE_STEP")
+            payload["round_idx"] = ctx.get("round_idx")
+            if payload["round_idx"] is None:
+                payload["round_idx"] = os.environ.get("AGENTIC_TRACE_ROUND") or None
+            _append_jsonl(exp_dir / "agents_trace.jsonl", payload)
+
+        def _write_codex(self, payload):  # noqa: ANN001
+            ctx = _TRACE_CONTEXT.get() or {}
+            exp_dir = Path(ctx.get("exp_dir") or os.environ.get("AGENTIC_TRACE_DIR") or ".")
+            exp_dir.mkdir(parents=True, exist_ok=True)
+            payload = dict(payload)
+            payload["ts"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+            payload["run_id"] = ctx.get("run_id") or os.environ.get("AGENTIC_TRACE_RUN_ID")
+            payload["step"] = ctx.get("step") or os.environ.get("AGENTIC_TRACE_STEP")
+            payload["round_idx"] = ctx.get("round_idx")
+            if payload["round_idx"] is None:
+                payload["round_idx"] = os.environ.get("AGENTIC_TRACE_ROUND") or None
+            _append_jsonl(exp_dir / "codex_mcp_transcript.jsonl", payload)
+
+    add_trace_processor(_JsonlTraceProcessor())
+    _TRACE_PROCESSOR_REGISTERED = True
+
+
+def _append_jsonl(path, payload):  # noqa: ANN001
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _to_jsonable(obj):  # noqa: ANN001
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, _dt.datetime):
+        return obj.isoformat()
+    if isinstance(obj, _dt.date):
+        return obj.isoformat()
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(v) for v in obj]
+    if dataclasses.is_dataclass(obj):
+        return _to_jsonable(dataclasses.asdict(obj))
+    # Agents SDK tracing SpanData objects expose `export()` and frequently use `__slots__` (no `__dict__`).
+    if hasattr(obj, "export") and callable(getattr(obj, "export")):
+        try:
+            return _to_jsonable(obj.export())
+        except Exception:  # pylint: disable=broad-except
+            pass
+    # pydantic v2
+    if hasattr(obj, "model_dump"):
+        try:
+            return _to_jsonable(obj.model_dump())
+        except Exception:  # pylint: disable=broad-except
+            pass
+    # pydantic v1
+    if hasattr(obj, "dict"):
+        try:
+            return _to_jsonable(obj.dict())
+        except Exception:  # pylint: disable=broad-except
+            pass
+    if hasattr(obj, "__dict__"):
+        try:
+            return _to_jsonable({k: v for k, v in obj.__dict__.items() if not k.startswith("_")})
+        except Exception:  # pylint: disable=broad-except
+            pass
+    return str(obj)
+
+
+def _summarize_trace(trace):  # noqa: ANN001
+    return {
+        "trace_id": getattr(trace, "trace_id", None),
+        "name": getattr(trace, "name", None),
+        "group_id": getattr(trace, "group_id", None),
+        "workflow_name": getattr(trace, "workflow_name", None),
+        "metadata": _to_jsonable(getattr(trace, "metadata", None)),
+    }
+
+
+def _summarize_span(span):  # noqa: ANN001
+    span_data = None
+    try:
+        span_data = getattr(span, "span_data", None)
+    except Exception:  # pylint: disable=broad-except
+        span_data = None
+    span_data_payload = _to_jsonable(span_data)
+    return {
+        "trace_id": getattr(span, "trace_id", None),
+        "span_id": getattr(span, "span_id", None),
+        "parent_id": getattr(span, "parent_id", None),
+        "started_at": _to_jsonable(getattr(span, "started_at", None)),
+        "ended_at": _to_jsonable(getattr(span, "ended_at", None)),
+        "error": _to_jsonable(getattr(span, "error", None)),
+        "span_data_type": type(span_data).__name__ if span_data is not None else None,
+        "span_data": span_data_payload,
+    }
+
+
+def _is_codex_tool_span(span_payload):  # noqa: ANN001
+    # Tool spans typically include a function span payload with name "codex" / "codex-reply".
+    span_data = (span_payload or {}).get("span_data") if isinstance(span_payload, dict) else None
+    if isinstance(span_data, dict):
+        name = (span_data.get("name") or "").lower().strip()
+        typ = (span_data.get("type") or "").lower().strip()
+        if typ == "function" and name in ("codex", "codex-reply"):
+            return True
+        # Some implementations may not normalize name; keep a fallback substring match.
+        if "codex" in name:
+            return True
+
+    payload = span_payload
+
+    def _contains_codex(x):  # noqa: ANN001
+        if x is None:
+            return False
+        if isinstance(x, str):
+            s = x.lower()
+            return "codex" in s
+        if isinstance(x, dict):
+            return any(_contains_codex(k) or _contains_codex(v) for k, v in x.items())
+        if isinstance(x, list):
+            return any(_contains_codex(v) for v in x)
+        return False
+
+    return _contains_codex(payload)
+
+
 def main():
     asyncio.run(_main_async())
 
@@ -48,6 +264,11 @@ async def _main_async():
     ideas_path = _resolve_path(repo_root, config.get("ideas_file"))
 
     _load_env_files([repo_root / ".env"])
+
+    # Ensure Agents SDK tracing is enabled and includes tool I/O, so we can log a full local transcript.
+    # This only affects this process and can still be overridden externally if desired.
+    os.environ.pop("OPENAI_AGENTS_DISABLE_TRACING", None)
+    os.environ.setdefault("OPENAI_AGENTS_TRACE_INCLUDE_SENSITIVE_DATA", "1")
 
     if not ideas_path:
         raise RuntimeError("ideas_file must be set in the config.")
@@ -115,12 +336,14 @@ async def _main_async():
             if args.dry_run_llm:
                 plan_text = "PLAN:\n1. (dry-run) No-op.\nRISKS:\n- dry-run\n"
             else:
-                plan_text = await _agents_sdk_generate_text(
-                    config.get("agents", {}).get("planner", {}),
-                    system_prompt=planner_system,
-                    user_prompt=planner_prompt,
-                    max_turns=max_turns,
-                )
+                _ensure_trace_processor_registered()
+                with _tracing_scope(exp_dir=exp_dir, run_id=run_id, step="planner"):
+                    plan_text = await _agents_sdk_generate_text(
+                        config.get("agents", {}).get("planner", {}),
+                        system_prompt=planner_system,
+                        user_prompt=planner_prompt,
+                        max_turns=max_turns,
+                    )
             _write_text(exp_dir / "plan.md", plan_text)
 
             # Coder <-> Reviewer repair loop (in-place edits in the same worktree via Codex MCP)
@@ -154,14 +377,16 @@ async def _main_async():
                 if args.dry_run_llm:
                     coder_output = "(dry-run) skipped Codex edits."
                 else:
-                    coder_output = await _codex_mcp_edit_repo(
-                        worktree_path=worktree_path,
-                        codex_mcp_cfg=codex_mcp_cfg,
-                        agent_cfg=config.get("agents", {}).get("coder", {}),
-                        system_prompt=coder_system,
-                        user_prompt=coder_prompt,
-                        max_turns=max_turns,
-                    )
+                    _ensure_trace_processor_registered()
+                    with _tracing_scope(exp_dir=exp_dir, run_id=run_id, step="coder", round_idx=round_idx):
+                        coder_output = await _codex_mcp_edit_repo(
+                            worktree_path=worktree_path,
+                            codex_mcp_cfg=codex_mcp_cfg,
+                            agent_cfg=config.get("agents", {}).get("coder", {}),
+                            system_prompt=coder_system,
+                            user_prompt=coder_prompt,
+                            max_turns=max_turns,
+                        )
                 _write_text(exp_dir / f"coder_output_round_{round_idx}.txt", coder_output)
 
                 diff_text = _git_diff_with_untracked(worktree_path)
@@ -199,12 +424,14 @@ async def _main_async():
                 if args.dry_run_llm:
                     review_text = "VERDICT: REJECT\nISSUES:\n- dry-run\nNOTES:\n- dry-run\n"
                 else:
-                    review_text = await _agents_sdk_generate_text(
-                        config.get("agents", {}).get("reviewer", {}),
-                        system_prompt=reviewer_system,
-                        user_prompt=review_prompt,
-                        max_turns=max_turns,
-                    )
+                    _ensure_trace_processor_registered()
+                    with _tracing_scope(exp_dir=exp_dir, run_id=run_id, step="reviewer", round_idx=round_idx):
+                        review_text = await _agents_sdk_generate_text(
+                            config.get("agents", {}).get("reviewer", {}),
+                            system_prompt=reviewer_system,
+                            user_prompt=review_prompt,
+                            max_turns=max_turns,
+                        )
                 _write_text(exp_dir / f"review_round_{round_idx}.md", review_text)
                 verdict = _parse_reviewer_verdict(review_text)
                 review_issues = _extract_reviewer_issues(review_text)
@@ -305,7 +532,7 @@ def _parse_args():
 
 def _import_agents_sdk():
     try:
-        from agents import Agent, Runner, set_default_openai_api  # type: ignore
+        from agents import Agent, Runner, RunConfig, set_default_openai_api  # type: ignore
         try:
             from agents import ModelSettings  # type: ignore
         except Exception:  # pylint: disable=broad-except
@@ -317,7 +544,7 @@ def _import_agents_sdk():
             "  pip install openai-agents openai\n"
             "And ensure Node/Codex CLI are available (e.g. `npx -y codex mcp-server`)."
         ) from exc
-    return Agent, Runner, ModelSettings, set_default_openai_api, MCPServerStdio
+    return Agent, Runner, RunConfig, ModelSettings, set_default_openai_api, MCPServerStdio
 
 
 def _build_reasoning(effort):
@@ -366,19 +593,42 @@ def _create_agent(Agent, *, name, model, instructions, mcp_servers=None, model_s
         return Agent(**kwargs)
 
 
+def _build_run_config(RunConfig):  # noqa: N802
+    ctx = _TRACE_CONTEXT.get() or {}
+    group_id = ctx.get("run_id")
+    step = ctx.get("step")
+    round_idx = ctx.get("round_idx")
+
+    metadata = {"run_id": group_id, "step": step, "round_idx": round_idx}
+
+    kwargs = {
+        "workflow_name": "algo-meta-model-agent/multi_agent_runner",
+        "group_id": group_id,
+        "trace_metadata": metadata,
+    }
+    # Prefer to include tool I/O in traces (which also improves what we can log locally).
+    # If the installed Agents SDK doesn't support this arg, fall back silently.
+    try:
+        kwargs["trace_include_sensitive_data"] = True
+        return RunConfig(**kwargs)
+    except TypeError:
+        kwargs.pop("trace_include_sensitive_data", None)
+        return RunConfig(**kwargs)
+
+
 async def _agents_sdk_generate_text(agent_cfg, *, system_prompt, user_prompt, max_turns):
-    Agent, Runner, ModelSettings, set_default_openai_api, _ = _import_agents_sdk()
+    Agent, Runner, RunConfig, ModelSettings, set_default_openai_api, _ = _import_agents_sdk()
     set_default_openai_api(os.getenv("OPENAI_API_KEY"))
 
     model = agent_cfg.get("model") or "gpt-5"
     model_settings = _build_model_settings(ModelSettings, agent_cfg or {})
     agent = _create_agent(Agent, name="Text Agent", model=model, instructions=system_prompt, model_settings=model_settings)
-    result = await Runner.run(agent, user_prompt, max_turns=max_turns)
+    result = await Runner.run(agent, user_prompt, max_turns=max_turns, run_config=_build_run_config(RunConfig))
     return (getattr(result, "final_output", None) or "").strip() + "\n"
 
 
 async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, system_prompt, user_prompt, max_turns):
-    Agent, Runner, ModelSettings, set_default_openai_api, MCPServerStdio = _import_agents_sdk()
+    Agent, Runner, RunConfig, ModelSettings, set_default_openai_api, MCPServerStdio = _import_agents_sdk()
     set_default_openai_api(os.getenv("OPENAI_API_KEY"))
 
     command = (codex_mcp_cfg or {}).get("command") or "npx"
@@ -404,7 +654,7 @@ async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, syste
                 mcp_servers=[codex_mcp_server],
                 model_settings=model_settings,
             )
-            result = await Runner.run(agent, user_prompt, max_turns=max_turns)
+            result = await Runner.run(agent, user_prompt, max_turns=max_turns, run_config=_build_run_config(RunConfig))
             return (getattr(result, "final_output", None) or "").strip() + "\n"
     finally:
         os.chdir(prev)
