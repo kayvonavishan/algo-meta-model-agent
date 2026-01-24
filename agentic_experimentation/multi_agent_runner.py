@@ -5,9 +5,11 @@ import contextvars
 import dataclasses
 import datetime as _dt
 import json
+import logging
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -32,6 +34,46 @@ SYSTEM_PROMPT = "You are a coding agent improving a meta model. Keep changes sma
 
 _TRACE_CONTEXT = contextvars.ContextVar("_TRACE_CONTEXT", default=None)
 _TRACE_PROCESSOR_REGISTERED = False
+
+
+def _configure_logging():
+    root = logging.getLogger()
+    if getattr(root, "_agentic_configured", False):
+        return
+
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+
+    class _DropNoisyCodexNotifications(logging.Filter):
+        def filter(self, record):  # noqa: ANN001
+            msg = record.getMessage() or ""
+            # Codex MCP server emits custom `codex/event` notifications that the MCP client may warn about.
+            # They are typically safe to ignore and extremely verbose.
+            if msg.startswith("Failed to validate notification:") and "codex/event" in msg:
+                _write_runner_log(record)
+                return False
+            return True
+
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.INFO)
+    handler.addFilter(_DropNoisyCodexNotifications())
+    root.addHandler(handler)
+
+    root._agentic_configured = True  # type: ignore[attr-defined]
+
+
+def _write_runner_log(record):  # noqa: ANN001
+    trace_dir = os.environ.get("AGENTIC_TRACE_DIR")
+    if not trace_dir:
+        return
+    try:
+        path = Path(trace_dir) / "runner_warnings.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8", newline="\n") as f:
+            ts = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+            f.write(f"{ts} {record.levelname} {record.name}: {record.getMessage()}\n")
+    except Exception:  # pylint: disable=broad-except
+        return
 
 
 @contextlib.contextmanager
@@ -246,6 +288,7 @@ def main():
 
 
 async def _main_async():
+    _configure_logging()
     args = _parse_args()
     config_path = Path(args.config).resolve()
     config = _load_json(config_path)
@@ -605,11 +648,17 @@ def _build_run_config(RunConfig):  # noqa: N802
     step = ctx.get("step")
     round_idx = ctx.get("round_idx")
 
-    metadata = {"run_id": group_id, "step": step, "round_idx": round_idx}
+    metadata = {}
+    if group_id is not None:
+        metadata["run_id"] = str(group_id)
+    if step is not None:
+        metadata["step"] = str(step)
+    if round_idx is not None:
+        metadata["round_idx"] = str(round_idx)
 
     kwargs = {
         "workflow_name": "algo-meta-model-agent/multi_agent_runner",
-        "group_id": group_id,
+        "group_id": str(group_id) if group_id is not None else None,
         "trace_metadata": metadata,
     }
     # Prefer to include tool I/O in traces (which also improves what we can log locally).
