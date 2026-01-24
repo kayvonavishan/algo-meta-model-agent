@@ -4,6 +4,7 @@ import contextlib
 import contextvars
 import dataclasses
 import datetime as _dt
+import functools
 import json
 import logging
 import os
@@ -34,6 +35,73 @@ SYSTEM_PROMPT = "You are a coding agent improving a meta model. Keep changes sma
 
 _TRACE_CONTEXT = contextvars.ContextVar("_TRACE_CONTEXT", default=None)
 _TRACE_PROCESSOR_REGISTERED = False
+
+
+def _patch_mcp_codex_event_notifications():
+    """
+    The Codex CLI MCP server emits custom JSON-RPC notifications with method `codex/event`.
+
+    The upstream MCP python client (`mcp`) validates notifications against a strict union of
+    spec-defined notification types, so `codex/event` produces noisy validation warnings.
+
+    This patch teaches the MCP client to accept *either* a normal ServerNotification or a
+    generic JSONRPCNotification, eliminating the warnings while preserving normal behavior
+    for standard notifications (cancel/progress/etc.).
+    """
+    try:
+        import mcp.client.session as _mcp_client_session  # type: ignore
+        import mcp.types as _mcp_types  # type: ignore
+        from pydantic import RootModel  # type: ignore
+        from typing import Union  # noqa: PLC0415
+    except Exception:  # pragma: no cover  # pylint: disable=broad-except
+        return False
+
+    if getattr(_mcp_client_session, "_codex_event_patch_applied", False):
+        return True
+
+    class _ServerNotificationOrJsonRpc(RootModel[Union[_mcp_types.ServerNotificationType, _mcp_types.JSONRPCNotification]]):  # type: ignore[name-defined]
+        pass
+
+    original_init = _mcp_client_session.ClientSession.__init__
+
+    @functools.wraps(original_init)
+    def _patched_init(self, *args, **kwargs):  # noqa: ANN001
+        original_init(self, *args, **kwargs)
+        # BaseSession uses this to validate incoming notifications.
+        # Swapping the model here is much less invasive than reimplementing ClientSession.__init__.
+        try:
+            self._receive_notification_type = _ServerNotificationOrJsonRpc  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover  # pylint: disable=broad-except
+            pass
+
+    _mcp_client_session.ClientSession.__init__ = _patched_init  # type: ignore[assignment]
+    _mcp_client_session._codex_event_patch_applied = True  # type: ignore[attr-defined]
+
+    # Capture a small, non-noisy subset of Codex custom events for debugging.
+    original_received_notification = _mcp_client_session.ClientSession._received_notification
+
+    async def _patched_received_notification(self, notification):  # noqa: ANN001
+        try:
+            root = getattr(notification, "root", None)
+            if getattr(root, "method", None) == "codex/event":
+                params = getattr(root, "params", None) or {}
+                msg = params.get("msg") if isinstance(params, dict) else None
+                msg_type = msg.get("type") if isinstance(msg, dict) else None
+                if msg_type in ("session_configured", "error"):
+                    _append_codex_transcript(
+                        {
+                            "event": "codex_event",
+                            "method": "codex/event",
+                            "msg_type": msg_type,
+                            "params": _to_jsonable(params),
+                        }
+                    )
+        except Exception:  # pragma: no cover  # pylint: disable=broad-except
+            pass
+        return await original_received_notification(self, notification)
+
+    _mcp_client_session.ClientSession._received_notification = _patched_received_notification  # type: ignore[assignment]
+    return True
 
 
 def _configure_logging():
@@ -182,6 +250,45 @@ def _append_jsonl(path, payload):  # noqa: ANN001
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _append_codex_transcript(payload):  # noqa: ANN001
+    ctx = _TRACE_CONTEXT.get() or {}
+    exp_dir = Path(ctx.get("exp_dir") or os.environ.get("AGENTIC_TRACE_DIR") or ".")
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    payload = dict(payload)
+    payload["ts"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+    payload["run_id"] = ctx.get("run_id") or os.environ.get("AGENTIC_TRACE_RUN_ID")
+    payload["step"] = ctx.get("step") or os.environ.get("AGENTIC_TRACE_STEP")
+    payload["round_idx"] = ctx.get("round_idx")
+    if payload["round_idx"] is None:
+        payload["round_idx"] = os.environ.get("AGENTIC_TRACE_ROUND") or None
+    _append_jsonl(exp_dir / "codex_mcp_transcript.jsonl", payload)
+
+
+def _call_tool_result_to_text(result):  # noqa: ANN001
+    if result is None:
+        return ""
+    try:
+        structured = getattr(result, "structuredContent", None)
+        if structured:
+            if isinstance(structured, dict) and structured.get("type") == "text" and "text" in structured:
+                return str(structured.get("text") or "").strip() + "\n"
+            return json.dumps(_to_jsonable(structured), ensure_ascii=False) + "\n"
+    except Exception:  # pylint: disable=broad-except
+        pass
+
+    try:
+        content = getattr(result, "content", None) or []
+        texts = []
+        for item in content:
+            if hasattr(item, "text"):
+                texts.append(str(getattr(item, "text") or ""))
+            else:
+                texts.append(json.dumps(_to_jsonable(item), ensure_ascii=False))
+        return ("\n".join(texts)).strip() + "\n"
+    except Exception:  # pylint: disable=broad-except
+        return str(result).strip() + "\n"
 
 
 def _to_jsonable(obj):  # noqa: ANN001
@@ -362,7 +469,9 @@ async def _main_async():
                 sync_working_tree(repo_root, worktree_path)
 
             planner_context = _build_repo_context_for_role(repo_root, "planner", planner_files_path)
-            coder_context = _build_repo_context_for_role(repo_root, "coder", coder_files_path)
+            # The coder edits files inside the worktree; point "repo root" at the worktree to avoid
+            # generating absolute paths into the original repo (which may be outside Codex's workspace).
+            coder_context = _build_repo_context_for_role(worktree_path, "coder", coder_files_path)
             reviewer_context = _build_repo_context_for_role(repo_root, "reviewer", reviewer_files_path)
             idea_text = ideas[i]
             _write_text(exp_dir / "idea.md", idea_text)
@@ -436,15 +545,32 @@ async def _main_async():
                 _write_text(exp_dir / f"diff_round_{round_idx}.diff", diff_text)
 
                 if not diff_text.strip():
-                    verdict = "REJECT"
-                    review_text = (
-                        "VERDICT: REJECT\n"
-                        "ISSUES:\n"
-                        "- coder produced no changes (empty git diff)\n"
-                        "NOTES:\n"
-                        "- ensure the coder edits files in-place using Codex MCP\n"
+                    lower_out = (coder_output or "").lower()
+                    suspected_write_block = (
+                        "write_blocked" in lower_out
+                        or "writes are blocked" in lower_out
+                        or ("write" in lower_out and "blocked" in lower_out)
+                        or "read-only" in lower_out
+                        or "cannot overwrite" in lower_out
+                        or "can't overwrite" in lower_out
                     )
-                    review_issues = "coder produced no changes"
+                    verdict = "REJECT"
+                    issues_lines = ["- codex produced no changes (empty git diff)"]
+                    notes_lines = []
+                    if suspected_write_block:
+                        issues_lines.append("- suspected Codex filesystem writes are blocked")
+                        notes_lines.extend(
+                            [
+                                "- check `codex_mcp_transcript.jsonl` for a `codex_event` `session_configured` entry and confirm `sandbox_policy.type` is `workspace-write`",
+                                "- avoid absolute `C:\\...` paths; ensure edits target files inside the worktree (cwd) using relative paths",
+                            ]
+                        )
+                    else:
+                        notes_lines.append(
+                            f"- inspect `coder_output_round_{round_idx}.txt` and `codex_mcp_transcript.jsonl` for errors or no-op behavior"
+                        )
+                    review_text = "VERDICT: REJECT\nISSUES:\n" + "\n".join(issues_lines) + "\nNOTES:\n" + "\n".join(notes_lines) + "\n"
+                    review_issues = "; ".join(i.lstrip("- ").strip() for i in issues_lines)
                     _write_text(exp_dir / f"review_round_{round_idx}.md", review_text)
                     review_rounds.append(
                         {
@@ -587,6 +713,9 @@ def _import_agents_sdk():
             "  pip install openai-agents openai\n"
             "And ensure Node/Codex CLI are available (e.g. `npx -y codex mcp-server`)."
         ) from exc
+
+    # Best-effort: suppress extremely noisy warnings from `mcp` when Codex CLI emits `codex/event`.
+    _patch_mcp_codex_event_notifications()
     return Agent, Runner, RunConfig, ModelSettings, set_default_openai_api, MCPServerStdio
 
 
@@ -683,35 +812,87 @@ async def _agents_sdk_generate_text(agent_cfg, *, system_prompt, user_prompt, ma
 
 
 async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, system_prompt, user_prompt, max_turns):
-    Agent, Runner, RunConfig, ModelSettings, set_default_openai_api, MCPServerStdio = _import_agents_sdk()
-    set_default_openai_api(os.getenv("OPENAI_API_KEY"))
-
+    # The coder step delegates to Codex CLI directly (as an MCP server tool), so the "coder model"
+    # in agent_cfg is ignored. Planner/reviewer still use Agents SDK models.
+    _, _, _, _, _, MCPServerStdio = _import_agents_sdk()
     command = (codex_mcp_cfg or {}).get("command") or "npx"
     args = (codex_mcp_cfg or {}).get("args") or ["-y", "codex", "mcp-server"]
     client_session_timeout_seconds = int((codex_mcp_cfg or {}).get("client_session_timeout_seconds", 360000))
 
-    model = (agent_cfg or {}).get("model") or "gpt-5"
-    model_settings = _build_model_settings(ModelSettings, agent_cfg or {}, model)
+    full_prompt = (system_prompt or "").strip()
+    if full_prompt:
+        full_prompt += "\n\n"
+    full_prompt += (user_prompt or "").strip() + "\n"
 
     prev = os.getcwd()
     os.chdir(worktree_path)
     try:
+        _append_codex_transcript(
+            {
+                "event": "mcp_server_start",
+                "server": "Codex CLI",
+                "cwd": str(Path(worktree_path).resolve()),
+                "command": command,
+                "args": args,
+                "client_session_timeout_seconds": client_session_timeout_seconds,
+            }
+        )
         async with MCPServerStdio(
             name="Codex CLI",
             params={"command": command, "args": args},
             client_session_timeout_seconds=client_session_timeout_seconds,
         ) as codex_mcp_server:
-            agent = _create_agent(
-                Agent,
-                name="Coder",
-                model=model,
-                instructions=system_prompt,
-                mcp_servers=[codex_mcp_server],
-                model_settings=model_settings,
+            # Record the available tools (useful for debugging version/config mismatches).
+            try:
+                tools = await codex_mcp_server.list_tools()
+                _append_codex_transcript(
+                    {
+                        "event": "mcp_list_tools",
+                        "server": codex_mcp_server.name,
+                        "tools": [getattr(t, "name", None) for t in tools],
+                    }
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                _append_codex_transcript(
+                    {
+                        "event": "mcp_list_tools_error",
+                        "server": codex_mcp_server.name,
+                        "error": str(exc),
+                    }
+                )
+
+            call_args = {
+                "prompt": full_prompt,
+                "approval-policy": "never",
+                "sandbox": "workspace-write",
+            }
+            _append_codex_transcript(
+                {
+                    "event": "tool_call",
+                    "server": codex_mcp_server.name,
+                    "tool": "codex",
+                    "input": call_args,
+                }
             )
-            result = await Runner.run(agent, user_prompt, max_turns=max_turns, run_config=_build_run_config(RunConfig))
-            return (getattr(result, "final_output", None) or "").strip() + "\n"
+
+            result = await codex_mcp_server.call_tool("codex", call_args)
+            _append_codex_transcript(
+                {
+                    "event": "tool_result",
+                    "server": codex_mcp_server.name,
+                    "tool": "codex",
+                    "output": _to_jsonable(result),
+                }
+            )
+            return _call_tool_result_to_text(result)
     finally:
+        _append_codex_transcript(
+            {
+                "event": "mcp_server_stop",
+                "server": "Codex CLI",
+                "cwd": str(Path(worktree_path).resolve()),
+            }
+        )
         os.chdir(prev)
 
 
@@ -803,10 +984,11 @@ def _build_repo_context_for_role(repo_root, role, files_path):
             if p.exists():
                 keep.append(rel)
     if not keep:
-        return f"Role: {role}\nRepo root: {repo_root}"
+        repo_root_display = "." if role == "coder" else str(repo_root)
+        return f"Role: {role}\nRepo root: {repo_root_display}"
     lines = [
         f"Role: {role}",
-        f"Repo root: {repo_root}",
+        f"Repo root: {'.' if role == 'coder' else str(repo_root)}",
         "Key files:",
         "\n".join(keep),
     ]

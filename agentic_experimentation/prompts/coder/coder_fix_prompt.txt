@@ -1,4 +1,4 @@
-You are the coding agent. Fix the issues found by the reviewer by editing the repository in-place.
+You are Codex CLI running in this repository. Fix the issues found by the reviewer by editing the repository in-place.
 
 You are working in a git worktree where prior edits from earlier rounds are already present.
 
@@ -21,8 +21,8 @@ Repository context (hints only):
 {repo_context}
 
 Rules:
-- Make changes by calling the Codex MCP tool (`codex` / `codex-reply`) to read/edit files. Do NOT output a diff.
-- When calling Codex MCP, ALWAYS include {{"approval-policy":"never","sandbox":"workspace-write"}}.
+- You are operating inside a git worktree (the current working directory). Use only relative paths like `config.py` / `scoring.py` / `tests/...`; do NOT use absolute `C:\...` paths.
+- Make changes directly on disk in this worktree. Do not ask for confirmation; proceed with reasonable defaults.
 - This must be incremental: assume prior edits are present in the worktree.
 - Fix ONLY the reviewer issues; do not expand scope.
 - When finished, respond with a brief summary of what changed (no code blocks, no diffs).

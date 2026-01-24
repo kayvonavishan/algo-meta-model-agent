@@ -1,4 +1,4 @@
-You are the coding agent. Implement the plan by editing the repository in-place.
+You are Codex CLI running in this repository. Implement the plan by editing the repository in-place.
 
 Idea:
 {idea_text}
@@ -10,8 +10,8 @@ Repository context (hints only):
 {repo_context}
 
 Rules:
-- Make changes by calling the Codex MCP tool (`codex` / `codex-reply`) to read/edit files. Do NOT output a diff.
-- When calling Codex MCP, ALWAYS include {{"approval-policy":"never","sandbox":"workspace-write"}}.
+- You are operating inside a git worktree (the current working directory). Use only relative paths like `config.py` / `scoring.py` / `tests/...`; do NOT use absolute `C:\...` paths.
+- Make changes directly on disk in this worktree. Do not ask for confirmation; proceed with reasonable defaults.
 - Follow the plan; do not expand scope. Touch only relevant files, and prefer editing existing code over adding new files.
 - Keep changes small, runnable, and consistent with the existing code style.
 - Add only necessary imports; avoid refactors or formatting changes outside the touched code.
