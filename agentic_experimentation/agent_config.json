@@ -32,11 +32,11 @@
     "args": [
       "-y",
       "codex",
-      "mcp-server",
-      "-c",
-      "approval_policy=\"never\"",
-      "-c",
-      "sandbox_policy.type=\"workspace-write\""
+      "--ask-for-approval",
+      "never",
+      "--sandbox",
+      "workspace-write",
+      "mcp-server"
     ],
     "client_session_timeout_seconds": 360000
   },
