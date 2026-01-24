@@ -558,12 +558,18 @@ def _build_reasoning(effort):
         return None
 
 
-def _build_model_settings(ModelSettings, cfg):
+def _openai_model_supports_temperature(model):
+    m = (model or "").lower().strip()
+    # Reasoning-first models generally do not accept temperature.
+    return not (m.startswith("gpt-5") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4"))
+
+
+def _build_model_settings(ModelSettings, cfg, model):
     if not ModelSettings:
         return None
     kwargs = {}
     temperature = cfg.get("temperature", None)
-    if temperature is not None:
+    if temperature is not None and _openai_model_supports_temperature(model):
         kwargs["temperature"] = temperature
     reasoning = _build_reasoning(cfg.get("reasoning"))
     if reasoning is not None:
@@ -621,7 +627,7 @@ async def _agents_sdk_generate_text(agent_cfg, *, system_prompt, user_prompt, ma
     set_default_openai_api(os.getenv("OPENAI_API_KEY"))
 
     model = agent_cfg.get("model") or "gpt-5"
-    model_settings = _build_model_settings(ModelSettings, agent_cfg or {})
+    model_settings = _build_model_settings(ModelSettings, agent_cfg or {}, model)
     agent = _create_agent(Agent, name="Text Agent", model=model, instructions=system_prompt, model_settings=model_settings)
     result = await Runner.run(agent, user_prompt, max_turns=max_turns, run_config=_build_run_config(RunConfig))
     return (getattr(result, "final_output", None) or "").strip() + "\n"
@@ -636,7 +642,7 @@ async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, syste
     client_session_timeout_seconds = int((codex_mcp_cfg or {}).get("client_session_timeout_seconds", 360000))
 
     model = (agent_cfg or {}).get("model") or "gpt-5"
-    model_settings = _build_model_settings(ModelSettings, agent_cfg or {})
+    model_settings = _build_model_settings(ModelSettings, agent_cfg or {}, model)
 
     prev = os.getcwd()
     os.chdir(worktree_path)
