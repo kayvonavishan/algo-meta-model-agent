@@ -20,6 +20,9 @@ Blocking issues to fix (if present):
 Repository context (hints only):
 {repo_context}
 
+Below is a document defining the current architecture of the meta model:
+{meta_model_guide}
+
 Rules:
 - You are operating inside a git worktree (the current working directory). Use only relative paths like `config.py` / `scoring.py` / `tests/...`; do NOT use absolute `C:\...` paths.
 - Make changes directly on disk in this worktree. Do not ask for confirmation; proceed with reasonable defaults.

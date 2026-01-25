@@ -461,6 +461,11 @@ async def _main_async():
     os.environ.pop("OPENAI_AGENTS_DISABLE_TRACING", None)
     os.environ.setdefault("OPENAI_AGENTS_TRACE_INCLUDE_SENSITIVE_DATA", "1")
 
+    meta_model_guide_path = repo_root / "META_MODEL_GUIDE.md"
+    if not meta_model_guide_path.exists():
+        raise RuntimeError(f"Missing required meta model guide at {meta_model_guide_path}")
+    meta_model_guide = _read_text(meta_model_guide_path)
+
     if not ideas_path:
         raise RuntimeError("ideas_file must be set in the config.")
     if not baseline_csv.exists():
@@ -523,6 +528,7 @@ async def _main_async():
                 _read_text(planner_prompt_path),
                 idea_text=idea_text,
                 repo_context=planner_context,
+                meta_model_guide=meta_model_guide,
             )
             _write_text(exp_dir / "planner_prompt.txt", planner_prompt)
             planner_system = _read_text(planner_system_path) if planner_system_path else SYSTEM_PROMPT
@@ -566,6 +572,7 @@ async def _main_async():
                     review_text=review_text,
                     review_issues=review_issues,
                     prev_diff_text=diff_text,
+                    meta_model_guide=meta_model_guide,
                 )
                 _write_text(exp_dir / f"coder_prompt_round_{round_idx}.txt", coder_prompt)
 
@@ -648,6 +655,7 @@ async def _main_async():
                     plan_text=plan_text,
                     patch_text=diff_text,
                     repo_context=reviewer_context,
+                    meta_model_guide=meta_model_guide,
                 )
                 _write_text(exp_dir / f"reviewer_prompt_round_{round_idx}.txt", review_prompt)
                 if args.dry_run_llm:

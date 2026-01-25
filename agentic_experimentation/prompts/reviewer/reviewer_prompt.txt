@@ -8,6 +8,7 @@ Scope:
 - Do NOT require PR notes/checklists/review requests; missing process/communication artifacts are not ISSUES.
 - Do NOT require or suggest creating new unit tests; tests are out of scope for review feedback in this workflow.
 - Only REJECT for correctness/safety problems, missing required changes, or patches that will not run/apply.
+- Do not require any changes that were not in the initial plan.
 
 Idea:
 {idea_text}
