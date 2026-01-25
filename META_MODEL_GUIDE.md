@@ -1,55 +1,38 @@
 # Meta Model Guide
 
-This document explains how the current meta model works end to end across the two driver scripts: `adaptive_vol_momentum.py` (sweep producer) and `ensemble/meta_ensemble_from_sweep.py` (ensemble consumer), plus the supporting modules (`config.py`, `scoring.py`, `io_periods.py`, `evaluation.py`, `reporting.py`). It is written to help a new analyst understand the math, the data flow, and where to improve the model.
+This document explains the meta-model pipeline implemented by the main driver script `adaptive_vol_momentum.py`, plus the supporting modules (`config.py`, `scoring.py`, `selection.py`, `io_periods.py`, `evaluation.py`, `reporting.py`, `sweep.py`). It is written to help a new analyst understand the math, the data flow, and where to improve the model.
+
+Note: The downstream ensembling stage is intentionally out of scope for this guide and will be documented separately. The typical workflow today is to run `adaptive_vol_momentum.py` first (produce sweep artifacts), then run the ensembling stage afterwards.
 
 ## 1. Quick orientation
 
-- Two entrypoints: `adaptive_vol_momentum.py` runs a config sweep on aligned period returns and produces artifacts under `.../run_<timestamp>/` (e.g., `meta_config_sweep_results.csv` plus plots/metrics); `ensemble/meta_ensemble_from_sweep.py` runs after that, consuming the sweep output (and the same aligned returns) to ensemble top configs and produce selections/analysis.
-- Goal: Select a small set of the best-performing models each period (the "meta" portfolio) using training-free, per-ticker signals.
-- Inputs: Aligned per-period returns plus sweep results from the first stage.
-- Output: A per-period selection of models, evaluation metrics, and plots.
-- Core idea: For each ticker, compute per-model scores based on rank momentum, confidence, and risk penalties, then select top models across tickers each period; the ensemble stage averages scores from several configs before selection.
+- Entrypoint: `adaptive_vol_momentum.py` runs a config sweep on aligned period returns and produces artifacts under `.../run_<timestamp>/` (e.g., `meta_config_sweep_results.csv` plus plots/metrics).
+- Goal: Find robust scoring/selection parameters by sweeping configs, then evaluating the per-period top-N selections.
+- Input: Aligned per-period returns CSV.
+- Output: Sweep results CSV (one row per config) plus per-config plots/metrics.
+- Core idea: For each ticker and period, convert raw returns into robust cross-sectional ranks, apply adaptive momentum + confidence + risk penalties to get a score per model, then select top models across tickers each period.
 
 ## 2. Data flow (high-level)
 
 ```mermaid
 graph TD
-    subgraph Stage1["Stage 1 - adaptive vol momentum (sweep producer)"]
-        A["Aligned period returns CSV"] --> B["load_aligned_periods_from_csv"]
-        B --> C["Per-ticker returns matrices"]
-        C --> D["Config sweep: run_config_sweep"]
-        D --> E["Sweep artifacts under run_<ts>/"]
-        E --> E1["meta_config_sweep_results.csv"]
-        E --> E2["avg_trade_return_plots/ + metrics CSVs"]
-    end
-    subgraph Stage2["Stage 2 - meta ensemble from sweep (ensemble consumer)"]
-        E1 --> F["Load top N configs"]
-        B --> G["Load aligned returns"]
-        F --> H["Compute scores per ticker per config"]
-        G --> H
-        H --> I["Normalize + average scores across configs"]
-        I --> J["Ticker gating + global selection"]
-        J --> K["meta_ensemble_selections.csv"]
-        J --> L["Optional ensemble scores CSV"]
-        J --> M["Evaluation: equity curves + metrics + plots"]
-    end
+    A["Aligned period returns CSV"] --> B["load_aligned_periods_from_csv"]
+    B --> C["Per-ticker returns matrices"]
+    C --> D["Config sweep: run_config_sweep"]
+    D --> E["Sweep artifacts under run_<ts>/"]
+    E --> E1["meta_config_sweep_results.csv"]
+    E --> E2["avg_trade_return_plots/ (plots + per-config metrics CSVs)"]
 ```
 
 ## 3. Inputs and shapes
 
-### 3.1 `adaptive_vol_momentum.py` (sweep producer)
+### 3.1 `adaptive_vol_momentum.py`
 
 - **Aligned period returns CSV (required)**: wide format with per-period columns such as `period_1_return`, `period_1_date_range`, `period_1_avg_return_per_trade`, `period_1_num_trades`, `period_2_return`, etc.
 - **Loaded shape (via `io_periods.load_aligned_periods_from_csv`)**:
   - `aligned_returns[ticker]`: DataFrame with rows = `model_id`, columns = `period_key` ("YYYY-MM-DD to YYYY-MM-DD"), values = `period_return`.
   - Optional side columns `avg_return_per_trade` and `num_trades` are also loaded for evaluation.
 - **Artifacts produced**: under `.../run_<timestamp>/`, including `meta_config_sweep_results.csv` plus plots/metrics per config.
-
-### 3.2 `ensemble/meta_ensemble_from_sweep.py` (ensemble consumer)
-
-- **Aligned period returns CSV (same shape as above)**: reused to recompute scores and equity curves.
-- **Sweep results CSV (required)**: `meta_config_sweep_results.csv` from the prior sweep; one row per config with metrics (e.g., `mean_topN_avg_return_per_trade_pct`) used to pick the top configs (`--top-n-configs`).
-- These rows supply parameter values used in scoring (see `MetaConfig`); the ensemble then averages scores across the chosen configs before selection.
 
 ## 4. Step-by-step pipeline for `adaptive_vol_momentum.py`
 
@@ -84,53 +67,9 @@ graph TD
 
 - Commented examples show how to save selections and equity curves; enable as needed if you want raw selections instead of just sweep metrics.
 
-## 5. Step-by-step pipeline for `ensemble/meta_ensemble_from_sweep.py`
-
-### 5.0 Step 0: Load and filter aligned data
-
-- Load aligned returns and build `aligned_returns: Dict[str, DataFrame]`.
-- If no tickers remain after filters, stop.
-
-### 5.1 Step 1: Choose top configs from sweep
-
-- Read sweep results, filter to `status == "ok"` if present.
-- Keep top `--top-n-configs` by the chosen metric.
-- Build the "selection config" from the best row; other configs use the same base defaults but replace any values provided in their rows.
-
-### 5.2 Step 2: Score each ticker under each config
-
-For each ticker and each selected config:
-
-1) Compute per-model scores by period using `compute_scores_for_ticker_v2`.
-2) Optionally normalize scores per period via percentiles.
-3) Average scores across configs for that ticker.
-
-The result is `scores_by_ticker[ticker]`: a DataFrame of mean scores (models x periods).
-
-### 5.3 Step 3: Select models (gated by tickers)
-
-- Compute a per-ticker "ticker score" per period from the scores (median of top M models).
-- Optionally drop tickers below `min_ticker_score`.
-- For each period:
-  - Rank tickers by ticker score.
-  - Select the top `k` tickers where `k = floor(sqrt(#eligible_tickers))` (at least 1).
-  - Within those tickers, rank models by score.
-  - Apply `per_ticker_cap` if set.
-  - Globally rank remaining candidates and keep `top_n_global`.
-
-This yields the final selection file.
-
-### 5.4 Step 4: Evaluate (optional)
-
-If `--skip-analysis` is not set:
-
-- Build equity curves for "all models" vs "top-N" selections.
-- Compute core, relative, stability, trade-quality, and significance metrics.
-- Optionally render plots.
-
 ## 6. Score computation for one ticker
 
-This section is the core math. All steps below are performed per ticker, for the aligned returns matrix `R` of shape (n_models, T). The v2 implementation in `scoring.py` is used in the meta ensemble.
+This section is the core math. All steps below are performed per ticker, for the aligned returns matrix `R` of shape (n_models, T). In the current pipeline, scoring is computed via `compute_scores_for_ticker_v2` (see `scoring.py`) and consumed by `select_models_universal_v2` (see `selection.py`) during the sweep.
 
 ### 6.1 Notation
 
@@ -638,25 +577,9 @@ For each period, compute a per-ticker gate score:
 
 This is used in the cross-ticker selection gate.
 
-## 7. Ensemble across configs
-
-The meta ensemble averages scores from multiple configs to smooth sensitivity to hyperparameters.
-
-For a ticker and period:
-
-- compute scores for each config
-- if `--normalize=percentile`, transform scores to percentile ranks per period across models
-- average all finite scores across configs
-
-Mathematically:
-
-```
-S_bar_{i,t} = mean_k( normalize(S_{i,t}^{(k)}) )
-```
-
 ## 8. Selection logic in detail
 
-This runs in `_select_from_scores` after ensemble scoring.
+This selection runs once per config during the sweep (see `select_models_universal_v2`), after computing per-ticker per-model scores.
 
 1) Build a long table of `(ticker, model_id, period, score)`.
 2) For each ticker, compute `ticker_score` as median of top `top_m_for_ticker_gate` model scores.
@@ -671,18 +594,10 @@ This intentionally balances breadth (multiple tickers) and depth (best models) p
 
 ## 9. Output artifacts
 
-The pipeline writes several files (paths depend on CLI arguments):
+`adaptive_vol_momentum.py` writes sweep artifacts under the run directory (paths depend on CLI arguments):
 
-- `meta_ensemble_selections.csv` (main output)
-- `meta_ensemble_selected_configs.csv` (chosen sweep rows)
-- `meta_ensemble_equity_curves.csv`
-- `meta_ensemble_core_metrics.csv`
-- `meta_ensemble_relative_metrics.csv`
-- `meta_ensemble_stability_metrics.csv`
-- `meta_ensemble_trade_metrics.csv`
-- `meta_ensemble_significance_metrics.csv`
-- `meta_ensemble_summary.csv`
-- Optional plots under `meta_ensemble_plots/`
+- `meta_config_sweep_results.csv` (main sweep output; one row per config)
+- `avg_trade_return_plots/` (per-config plots + per-config metrics CSVs such as `core_metrics_config_*.csv`, `trade_metrics_config_*.csv`, etc.)
 
 ## 10. Worked mini-example (toy numbers)
 
@@ -752,18 +667,12 @@ graph TD
 1) Uniqueness weighting: The function currently returns all-ones. Implement the intended correlation clustering to reduce duplicates.
 2) Ticker gate rule: `sqrt(N)` is a heuristic; consider alternative gates (fixed N, percentile threshold, or volatility-adjusted).
 3) Confidence/risk shaping: Try different confidence transforms or risk penalties (e.g., asymmetric penalties for streaks).
-4) Normalize outputs: Validate `percentile` vs `none` normalization under different return distributions.
-5) Revisit causal shift: Ensure the shift aligns with how periods are defined and how selection would be executed live.
+4) Revisit causal shift: Ensure the shift aligns with how periods are defined and how selection would be executed live.
 
 ## 13. CLI usage (typical)
 
 ```
-python ensemble/meta_ensemble_from_sweep.py \
-  --aligned-file C:\path\to\period_returns_weeks_2_aligned.csv \
-  --sweep-results C:\path\to\meta_config_sweep_results.csv \
-  --metric mean_topN_avg_return_per_trade_pct \
-  --top-n-configs 10 \
-  --normalize percentile
+python adaptive_vol_momentum.py --aligned-file C:\path\to\period_returns_weeks_2_aligned.csv --output-dir C:\path\to\run_YYYYMMDD_HHMMSS
 ```
 
 ## 14. Key parameters to know
@@ -778,9 +687,11 @@ These are in `MetaConfig`:
 
 ## 15. Pointers into code
 
-- Pipeline driver: `ensemble/meta_ensemble_from_sweep.py`
+- Pipeline driver: `adaptive_vol_momentum.py`
 - Config defaults: `config.py`
 - Scoring math: `scoring.py`
+- Selection: `selection.py`
+- Sweep runner: `sweep.py`
 - Alignment and parsing: `io_periods.py`
 - Evaluation plots: `evaluation.py`
 - Metrics: `reporting.py`

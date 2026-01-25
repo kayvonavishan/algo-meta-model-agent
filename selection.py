@@ -5,7 +5,7 @@ import pandas as pd
 
 from config import MetaConfig
 from io_periods import load_aligned_periods_from_csv
-from scoring import compute_scores_for_ticker, compute_scores_for_ticker_v2
+from scoring import compute_scores_for_ticker_v2
 
 
 def select_models_universal(

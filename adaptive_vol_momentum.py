@@ -32,7 +32,6 @@ from io_periods import (
     write_aligned_periods_to_csv,
 )
 from scoring import (
-    compute_scores_for_ticker,
     compute_scores_for_ticker_v2,
     compute_uniqueness_weights,
     downside_cvar,
