@@ -9,6 +9,8 @@ Quick start
 4) If using the Codex MCP multi-agent runner, install dependencies:
    - `pip install openai-agents openai`
    - Ensure Node is available (for `npx`) and Codex CLI can run (the default config uses `npx -y codex mcp-server`).
+   - If using `coder_backend: "cli"` / `"cli_session"`, ensure Codex CLI is runnable via `codex` (or configure `codex_cli` / `CODEX_CLI_CMD`).
+   - If Codex reports `WRITE_BLOCKED` in a git worktree, upgrade Codex CLI and ensure the runner passes a working root (newer runner versions write `codex_cli_cmd_round_*.txt` for debugging).
 5) Refresh the baseline snapshot:
    `python agentic_experimentation/agent_runner.py --config agentic_experimentation/agent_config.json --refresh-baseline`
 6) Run iterations (defaults to one per idea):

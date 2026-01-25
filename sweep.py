@@ -123,7 +123,9 @@ def run_config_sweep(
         scorecard_every = base_cfg.scorecard_every
     configs = build_config_grid_v1(n_configs=n_configs, seed=seed)
     images_dir = os.path.join(os.path.dirname(out_path), "avg_trade_return_plots")
+    selections_dir = os.path.join(os.path.dirname(out_path), "selections")
     os.makedirs(images_dir, exist_ok=True)
+    os.makedirs(selections_dir, exist_ok=True)
     for idx, cfg_rec in enumerate(configs):
         cfg = MetaConfig(**{
             **base_cfg.__dict__,
@@ -147,8 +149,15 @@ def run_config_sweep(
         row["oos_start_date"] = "" if oos_start_date is None else str(oos_start_date)
         row["status"] = "ok"
         row["error"] = ""
+        row["selections_path"] = ""
         try:
             selections = select_models_universal_v2(aligned_returns, cfg)
+            selections_path = os.path.join(
+                selections_dir,
+                f"meta_selections_config_{cfg_rec['config_id']:03d}.csv.gz",
+            )
+            selections.to_csv(selections_path, index=False, compression="gzip")
+            row["selections_path"] = selections_path
             curves = compute_equity_curves(
                 aligned_returns,
                 selections,

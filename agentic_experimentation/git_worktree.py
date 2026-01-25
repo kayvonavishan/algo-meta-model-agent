@@ -124,6 +124,8 @@ def _run(cmd, cwd, input_text=None, capture_output=False):
     if capture_output:
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
+    else:
+        kwargs["stderr"] = subprocess.STDOUT
     return subprocess.run(cmd, **kwargs)
 
 

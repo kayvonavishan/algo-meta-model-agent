@@ -596,6 +596,7 @@ async def _main_async():
                                 exp_dir=exp_dir,
                                 round_idx=round_idx,
                                 session_id=codex_session_id,
+                                codex_cli_cfg=config.get("codex_cli"),
                             )
                         else:
                             coder_output = await _codex_mcp_edit_repo(
@@ -891,6 +892,7 @@ def _codex_cli_edit_repo_sync(  # noqa: PLR0913
     exp_dir,
     round_idx,
     session_id,
+    codex_cli_cfg=None,
     sandbox_mode="workspace-write",
     approval_policy="never",
 ):
@@ -901,14 +903,13 @@ def _codex_cli_edit_repo_sync(  # noqa: PLR0913
     events_path = exp_dir / f"codex_cli_events_round_{round_idx}.jsonl"
     stderr_path = exp_dir / f"codex_cli_stderr_round_{round_idx}.log"
     last_message_path = exp_dir / f"codex_cli_last_message_round_{round_idx}.txt"
+    cmd_path = exp_dir / f"codex_cli_cmd_round_{round_idx}.txt"
 
-    base_cmd = [
-        "codex",
-        "-a",
-        str(approval_policy),
-        "-s",
-        str(sandbox_mode),
-    ]
+    codex_prefix = _resolve_codex_cli_prefix(codex_cli_cfg=codex_cli_cfg)
+    # `-C` makes the workspace root explicit; this avoids cases where Codex defaults to
+    # a read-only filesystem sandbox because it doesn't infer the working root correctly
+    # (notably in git worktrees on Windows).
+    base_cmd = codex_prefix + ["-a", str(approval_policy), "-s", str(sandbox_mode), "-C", str(worktree_path)]
 
     if session_id:
         cmd = base_cmd + ["exec", "resume", str(session_id), "-"]
@@ -923,15 +924,32 @@ def _codex_cli_edit_repo_sync(  # noqa: PLR0913
         ]
         stdout_is_json = True
 
-    proc = subprocess.run(
-        cmd,
-        cwd=str(worktree_path),
-        input=(prompt or ""),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    _write_text(cmd_path, " ".join(str(x) for x in cmd) + "\n")
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(worktree_path),
+            input=(prompt or ""),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        attempted = " ".join(cmd[:3]) if len(cmd) >= 3 else " ".join(cmd)
+        detail = (
+            "Codex CLI executable not found.\n"
+            f"attempted={attempted}\n"
+            "Fix options:\n"
+            "- Install Codex CLI so `codex` is on PATH, or\n"
+            "- Install Node.js so `npx` is available (runner will fall back to `npx -y codex`), or\n"
+            "- Set `codex_cli` in your config (or `CODEX_CLI_CMD`) to point at the executable.\n"
+        )
+        _write_text(stderr_path, detail)
+        return detail, session_id
 
     stdout_text = proc.stdout or ""
     stderr_text = proc.stderr or ""
@@ -959,7 +977,7 @@ def _codex_cli_edit_repo_sync(  # noqa: PLR0913
     return stdout_text.strip() + "\n", session_id
 
 
-async def _codex_cli_edit_repo(*, worktree_path, prompt, exp_dir, round_idx, session_id):
+async def _codex_cli_edit_repo(*, worktree_path, prompt, exp_dir, round_idx, session_id, codex_cli_cfg=None):
     return await asyncio.to_thread(
         _codex_cli_edit_repo_sync,
         worktree_path=worktree_path,
@@ -967,7 +985,44 @@ async def _codex_cli_edit_repo(*, worktree_path, prompt, exp_dir, round_idx, ses
         exp_dir=exp_dir,
         round_idx=round_idx,
         session_id=session_id,
+        codex_cli_cfg=codex_cli_cfg,
     )
+
+
+def _resolve_codex_cli_prefix(*, codex_cli_cfg=None):
+    """
+    Returns argv prefix for invoking Codex CLI.
+
+    Order:
+    1) config `codex_cli`: {"command": "...", "args": [...]}
+    2) env `CODEX_CLI_CMD` (space-separated, minimal parsing)
+    3) `codex` on PATH
+    4) `npx` on PATH -> `npx -y codex`
+    """
+    cfg = codex_cli_cfg or {}
+    command = (cfg.get("command") or "").strip() if isinstance(cfg, dict) else ""
+    args = cfg.get("args") if isinstance(cfg, dict) else None
+    if command:
+        resolved = shutil.which(command) or command
+        prefix = [resolved]
+        if isinstance(args, list):
+            prefix.extend(str(a) for a in args if str(a).strip())
+        return prefix
+
+    env_cmd = (os.environ.get("CODEX_CLI_CMD") or "").strip()
+    if env_cmd:
+        parts = [p for p in env_cmd.split(" ") if p]
+        if parts:
+            parts[0] = shutil.which(parts[0]) or parts[0]
+        return parts
+
+    codex_path = shutil.which("codex")
+    if codex_path:
+        return [codex_path]
+    npx_path = shutil.which("npx")
+    if npx_path:
+        return [npx_path, "-y", "codex"]
+    return ["codex"]
 
 
 async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, system_prompt, user_prompt, max_turns):
