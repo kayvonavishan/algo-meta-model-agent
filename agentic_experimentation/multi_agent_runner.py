@@ -8,6 +8,7 @@ import functools
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,46 @@ SYSTEM_PROMPT = "You are a coding agent improving a meta model. Keep changes sma
 
 _TRACE_CONTEXT = contextvars.ContextVar("_TRACE_CONTEXT", default=None)
 _TRACE_PROCESSOR_REGISTERED = False
+
+
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _find_first_session_id(payload):  # noqa: ANN001
+    if payload is None:
+        return None
+    if isinstance(payload, dict):
+        for k, v in payload.items():
+            if k == "session_id" and isinstance(v, str) and _UUID_RE.match(v):
+                return v
+            found = _find_first_session_id(v)
+            if found:
+                return found
+        return None
+    if isinstance(payload, list):
+        for item in payload:
+            found = _find_first_session_id(item)
+            if found:
+                return found
+        return None
+    return None
+
+
+def _extract_session_id_from_jsonl(text):  # noqa: ANN001
+    if not text:
+        return None
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:  # pylint: disable=broad-except
+            continue
+        found = _find_first_session_id(obj)
+        if found:
+            return found
+    return None
 
 
 def _patch_mcp_codex_event_notifications():
@@ -457,6 +498,7 @@ async def _main_async():
     codex_mcp_cfg = config.get("codex_mcp", {})
     agents_sdk_cfg = config.get("agents_sdk", {})
     max_turns = int(agents_sdk_cfg.get("max_turns", 30))
+    coder_backend = (config.get("coder_backend") or "mcp").lower().strip()
 
     for i in range(iterations):
         run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{i:02d}"
@@ -512,6 +554,7 @@ async def _main_async():
             review_text = ""
             review_issues = ""
             verdict = "UNKNOWN"
+            codex_session_id = None
 
             for round_idx in range(max_review_rounds + 1):
                 coder_template_path = coder_prompt_path if round_idx == 0 else coder_fix_prompt_path
@@ -531,14 +574,31 @@ async def _main_async():
                 else:
                     _ensure_trace_processor_registered()
                     with _tracing_scope(exp_dir=exp_dir, run_id=run_id, step="coder", round_idx=round_idx):
-                        coder_output = await _codex_mcp_edit_repo(
-                            worktree_path=worktree_path,
-                            codex_mcp_cfg=codex_mcp_cfg,
-                            agent_cfg=config.get("agents", {}).get("coder", {}),
-                            system_prompt=coder_system,
-                            user_prompt=coder_prompt,
-                            max_turns=max_turns,
-                        )
+                        if coder_backend in ("cli", "cli_session", "codex_cli", "codex-cli"):
+                            # For session-backed Codex CLI runs, include the system prompt only on the
+                            # first call; subsequent `resume` prompts benefit from staying small.
+                            full_prompt = ""
+                            if codex_session_id is None:
+                                full_prompt = (coder_system or "").strip()
+                                if full_prompt:
+                                    full_prompt += "\n\n"
+                            full_prompt += (coder_prompt or "").strip() + "\n"
+                            coder_output, codex_session_id = await _codex_cli_edit_repo(
+                                worktree_path=worktree_path,
+                                prompt=full_prompt,
+                                exp_dir=exp_dir,
+                                round_idx=round_idx,
+                                session_id=codex_session_id,
+                            )
+                        else:
+                            coder_output = await _codex_mcp_edit_repo(
+                                worktree_path=worktree_path,
+                                codex_mcp_cfg=codex_mcp_cfg,
+                                agent_cfg=config.get("agents", {}).get("coder", {}),
+                                system_prompt=coder_system,
+                                user_prompt=coder_prompt,
+                                max_turns=max_turns,
+                            )
                 _write_text(exp_dir / f"coder_output_round_{round_idx}.txt", coder_output)
 
                 diff_text = _git_diff_with_untracked(worktree_path)
@@ -667,10 +727,15 @@ async def _main_async():
                         score_cfg.get("higher_is_better", True),
                     )
 
+            if codex_session_id:
+                _write_text(exp_dir / "codex_session_id.txt", str(codex_session_id).strip() + "\n")
+
             summary = {
                 "run_id": run_id,
                 "idea": idea_text.strip(),
                 "plan": plan_text.strip(),
+                "coder_backend": coder_backend,
+                "codex_session_id": codex_session_id,
                 "review_verdict": verdict,
                 "review_rounds": review_rounds,
                 "tests_exit_code": tests_exit,
@@ -809,6 +874,92 @@ async def _agents_sdk_generate_text(agent_cfg, *, system_prompt, user_prompt, ma
     agent = _create_agent(Agent, name="Text Agent", model=model, instructions=system_prompt, model_settings=model_settings)
     result = await Runner.run(agent, user_prompt, max_turns=max_turns, run_config=_build_run_config(RunConfig))
     return (getattr(result, "final_output", None) or "").strip() + "\n"
+
+
+def _codex_cli_edit_repo_sync(  # noqa: PLR0913
+    *,
+    worktree_path,
+    prompt,
+    exp_dir,
+    round_idx,
+    session_id,
+    sandbox_mode="workspace-write",
+    approval_policy="never",
+):
+    worktree_path = Path(worktree_path)
+    exp_dir = Path(exp_dir)
+    exp_dir.mkdir(parents=True, exist_ok=True)
+
+    events_path = exp_dir / f"codex_cli_events_round_{round_idx}.jsonl"
+    stderr_path = exp_dir / f"codex_cli_stderr_round_{round_idx}.log"
+    last_message_path = exp_dir / f"codex_cli_last_message_round_{round_idx}.txt"
+
+    base_cmd = [
+        "codex",
+        "-a",
+        str(approval_policy),
+        "-s",
+        str(sandbox_mode),
+    ]
+
+    if session_id:
+        cmd = base_cmd + ["exec", "resume", str(session_id), "-"]
+        stdout_is_json = False
+    else:
+        cmd = base_cmd + [
+            "exec",
+            "--json",
+            "--output-last-message",
+            str(last_message_path),
+            "-",
+        ]
+        stdout_is_json = True
+
+    proc = subprocess.run(
+        cmd,
+        cwd=str(worktree_path),
+        input=(prompt or ""),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    stdout_text = proc.stdout or ""
+    stderr_text = proc.stderr or ""
+    if stdout_is_json:
+        _write_text(events_path, stdout_text)
+
+    if stderr_text.strip():
+        _write_text(stderr_path, stderr_text)
+
+    if proc.returncode != 0:
+        detail = []
+        detail.append(f"codex_cli_exit_code={proc.returncode}")
+        if stdout_text.strip():
+            detail.append("STDOUT:\n" + stdout_text.strip())
+        if stderr_text.strip():
+            detail.append("STDERR:\n" + stderr_text.strip())
+        return "\n\n".join(detail).strip() + "\n", session_id
+
+    if stdout_is_json:
+        new_session_id = _extract_session_id_from_jsonl(stdout_text) or session_id
+        last_message = _read_text(last_message_path) if last_message_path.exists() else ""
+        return (last_message or "").strip() + "\n", new_session_id
+
+    # Resume calls do not support --output-last-message, so stdout is the best available signal.
+    return stdout_text.strip() + "\n", session_id
+
+
+async def _codex_cli_edit_repo(*, worktree_path, prompt, exp_dir, round_idx, session_id):
+    return await asyncio.to_thread(
+        _codex_cli_edit_repo_sync,
+        worktree_path=worktree_path,
+        prompt=prompt,
+        exp_dir=exp_dir,
+        round_idx=round_idx,
+        session_id=session_id,
+    )
 
 
 async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, system_prompt, user_prompt, max_turns):

@@ -39,6 +39,7 @@
   "agents_sdk": {
     "max_turns": 30
   },
+  "coder_backend": "cli_session",
   "agents": {
     "planner": {
       "provider": "openai",
