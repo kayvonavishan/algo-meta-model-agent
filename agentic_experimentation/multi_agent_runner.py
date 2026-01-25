@@ -46,7 +46,7 @@ def _find_first_session_id(payload):  # noqa: ANN001
         return None
     if isinstance(payload, dict):
         for k, v in payload.items():
-            if k == "session_id" and isinstance(v, str) and _UUID_RE.match(v):
+            if k in ("session_id", "thread_id") and isinstance(v, str) and _UUID_RE.match(v):
                 return v
             found = _find_first_session_id(v)
             if found:
@@ -76,6 +76,30 @@ def _extract_session_id_from_jsonl(text):  # noqa: ANN001
         if found:
             return found
     return None
+
+
+_CODEX_LOGIN_STATUS_CACHE = None
+
+
+def _codex_cli_login_status(codex_prefix):  # noqa: ANN001
+    global _CODEX_LOGIN_STATUS_CACHE  # pylint: disable=global-statement
+    if _CODEX_LOGIN_STATUS_CACHE is not None:
+        return _CODEX_LOGIN_STATUS_CACHE
+    try:
+        proc = subprocess.run(
+            list(codex_prefix) + ["login", "status"],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        out = (proc.stdout or "").strip()
+    except Exception as exc:  # pragma: no cover  # pylint: disable=broad-except
+        out = f"(failed to check login status: {exc})"
+    _CODEX_LOGIN_STATUS_CACHE = out
+    return out
 
 
 def _patch_mcp_codex_event_notifications():
@@ -904,12 +928,27 @@ def _codex_cli_edit_repo_sync(  # noqa: PLR0913
     stderr_path = exp_dir / f"codex_cli_stderr_round_{round_idx}.log"
     last_message_path = exp_dir / f"codex_cli_last_message_round_{round_idx}.txt"
     cmd_path = exp_dir / f"codex_cli_cmd_round_{round_idx}.txt"
+    login_status_path = exp_dir / "codex_cli_login_status.txt"
 
     codex_prefix = _resolve_codex_cli_prefix(codex_cli_cfg=codex_cli_cfg)
     # `-C` makes the workspace root explicit; this avoids cases where Codex defaults to
     # a read-only filesystem sandbox because it doesn't infer the working root correctly
     # (notably in git worktrees on Windows).
     base_cmd = codex_prefix + ["-a", str(approval_policy), "-s", str(sandbox_mode), "-C", str(worktree_path)]
+
+    login_status = _codex_cli_login_status(codex_prefix)
+    if login_status and not login_status_path.exists():
+        _write_text(login_status_path, login_status.strip() + "\n")
+    if "Logged in using ChatGPT" in (login_status or ""):
+        detail = (
+            "WRITE_BLOCKED: Codex CLI is logged in using ChatGPT, which forces a `read-only` sandbox and ignores `-s`/`-C`.\n"
+            "Fix:\n"
+            "- Run `codex logout`\n"
+            "- Then login with an API key (PowerShell): set `$env:OPENAI_API_KEY` and run `$env:OPENAI_API_KEY | codex login --with-api-key`\n"
+            "- Re-run this script.\n"
+        )
+        _write_text(stderr_path, detail)
+        return detail, session_id
 
     if session_id:
         cmd = base_cmd + ["exec", "resume", str(session_id), "-"]

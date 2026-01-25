@@ -11,6 +11,7 @@ Quick start
    - Ensure Node is available (for `npx`) and Codex CLI can run (the default config uses `npx -y codex mcp-server`).
    - If using `coder_backend: "cli"` / `"cli_session"`, ensure Codex CLI is runnable via `codex` (or configure `codex_cli` / `CODEX_CLI_CMD`).
    - If Codex reports `WRITE_BLOCKED` in a git worktree, upgrade Codex CLI and ensure the runner passes a working root (newer runner versions write `codex_cli_cmd_round_*.txt` for debugging).
+   - If Codex CLI says it is "Logged in using ChatGPT", it currently runs in a forced `read-only` sandbox for local repos; run `codex logout` then login with an API key via `$env:OPENAI_API_KEY | codex login --with-api-key`.
 5) Refresh the baseline snapshot:
    `python agentic_experimentation/agent_runner.py --config agentic_experimentation/agent_config.json --refresh-baseline`
 6) Run iterations (defaults to one per idea):
