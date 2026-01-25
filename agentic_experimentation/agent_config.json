@@ -32,10 +32,6 @@
     "args": [
       "-y",
       "codex",
-      "--ask-for-approval",
-      "never",
-      "--sandbox",
-      "workspace-write",
       "mcp-server"
     ],
     "client_session_timeout_seconds": 360000

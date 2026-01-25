@@ -812,9 +812,25 @@ async def _agents_sdk_generate_text(agent_cfg, *, system_prompt, user_prompt, ma
 
 
 async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, system_prompt, user_prompt, max_turns):
-    # The coder step delegates to Codex CLI directly (as an MCP server tool), so the "coder model"
-    # in agent_cfg is ignored. Planner/reviewer still use Agents SDK models.
-    _, _, _, _, _, MCPServerStdio = _import_agents_sdk()
+    # The coder step delegates to Codex CLI via MCP. We intentionally avoid the Agents SDK MCP wrapper
+    # so we can supply an elicitation callback. Codex uses MCP elicitation to request approvals for
+    # commands/patches; without this callback, the default MCP client responds "Elicitation not supported",
+    # and Codex falls back to a read-only sandbox (WRITE_BLOCKED).
+    try:
+        from datetime import timedelta  # noqa: PLC0415
+
+        import mcp.client.stdio as mcp_stdio  # type: ignore
+        import mcp.types as mcp_types  # type: ignore
+        from mcp import ClientSession  # type: ignore
+    except Exception as exc:  # pragma: no cover  # pylint: disable=broad-except
+        raise RuntimeError(
+            "Missing dependency for Codex MCP workflow. Install:\n"
+            "  pip install mcp openai-agents openai\n"
+            "And ensure Node/Codex CLI are available (e.g. `npx -y codex mcp-server`)."
+        ) from exc
+
+    _patch_mcp_codex_event_notifications()
+
     command = (codex_mcp_cfg or {}).get("command") or "npx"
     args = (codex_mcp_cfg or {}).get("args") or ["-y", "codex", "mcp-server"]
     client_session_timeout_seconds = int((codex_mcp_cfg or {}).get("client_session_timeout_seconds", 360000))
@@ -823,6 +839,24 @@ async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, syste
     if full_prompt:
         full_prompt += "\n\n"
     full_prompt += (user_prompt or "").strip() + "\n"
+
+    async def _elicitation_callback(_context, params):  # noqa: ANN001
+        # Auto-accept elicitation so Codex can proceed non-interactively.
+        #
+        # Codex MCP currently uses elicitation for approvals (executing commands and applying patches).
+        # It expects a non-standard top-level `decision` field in the elicitation result payload.
+        payload = _to_jsonable(params)
+        message = None
+        try:
+            message = getattr(params, "message", None)
+        except Exception:  # pylint: disable=broad-except
+            message = None
+        _append_codex_transcript({"event": "elicitation_request", "message": message, "params": payload})
+
+        decision = "approved_for_session"
+        result = mcp_types.ElicitResult(action="accept", decision=decision)
+        _append_codex_transcript({"event": "elicitation_response", "action": "accept", "decision": decision})
+        return result
 
     prev = os.getcwd()
     os.chdir(worktree_path)
@@ -837,54 +871,59 @@ async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, syste
                 "client_session_timeout_seconds": client_session_timeout_seconds,
             }
         )
-        async with MCPServerStdio(
-            name="Codex CLI",
-            params={"command": command, "args": args},
-            client_session_timeout_seconds=client_session_timeout_seconds,
-        ) as codex_mcp_server:
-            # Record the available tools (useful for debugging version/config mismatches).
-            try:
-                tools = await codex_mcp_server.list_tools()
+
+        server_params = mcp_stdio.StdioServerParameters(command=command, args=list(args), cwd=str(worktree_path))
+        async with mcp_stdio.stdio_client(server_params) as (read, write):
+            async with ClientSession(
+                read,
+                write,
+                timedelta(seconds=client_session_timeout_seconds) if client_session_timeout_seconds else None,
+                elicitation_callback=_elicitation_callback,
+            ) as session:
+                await session.initialize()
+
+                # Record tools (useful for debugging version/config mismatches).
+                try:
+                    tools_result = await session.list_tools()
+                    _append_codex_transcript(
+                        {
+                            "event": "mcp_list_tools",
+                            "server": "Codex CLI",
+                            "tools": [t.name for t in getattr(tools_result, "tools", [])],
+                        }
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    _append_codex_transcript(
+                        {
+                            "event": "mcp_list_tools_error",
+                            "server": "Codex CLI",
+                            "error": str(exc),
+                        }
+                    )
+
+                call_args = {
+                    "prompt": full_prompt,
+                    "approval-policy": "on-request",
+                    "sandbox": "workspace-write",
+                }
                 _append_codex_transcript(
                     {
-                        "event": "mcp_list_tools",
-                        "server": codex_mcp_server.name,
-                        "tools": [getattr(t, "name", None) for t in tools],
+                        "event": "tool_call",
+                        "server": "Codex CLI",
+                        "tool": "codex",
+                        "input": call_args,
                     }
                 )
-            except Exception as exc:  # pylint: disable=broad-except
+                result = await session.call_tool("codex", call_args)
                 _append_codex_transcript(
                     {
-                        "event": "mcp_list_tools_error",
-                        "server": codex_mcp_server.name,
-                        "error": str(exc),
+                        "event": "tool_result",
+                        "server": "Codex CLI",
+                        "tool": "codex",
+                        "output": _to_jsonable(result),
                     }
                 )
-
-            call_args = {
-                "prompt": full_prompt,
-                "approval-policy": "never",
-                "sandbox": "workspace-write",
-            }
-            _append_codex_transcript(
-                {
-                    "event": "tool_call",
-                    "server": codex_mcp_server.name,
-                    "tool": "codex",
-                    "input": call_args,
-                }
-            )
-
-            result = await codex_mcp_server.call_tool("codex", call_args)
-            _append_codex_transcript(
-                {
-                    "event": "tool_result",
-                    "server": codex_mcp_server.name,
-                    "tool": "codex",
-                    "output": _to_jsonable(result),
-                }
-            )
-            return _call_tool_result_to_text(result)
+                return _call_tool_result_to_text(result)
     finally:
         _append_codex_transcript(
             {

@@ -47,11 +47,13 @@ Each iteration creates an isolated git worktree, then loops `plan → edit → d
    - Tracing: `agents_trace.jsonl` has `step=planner` spans
 3. **Coder round: Codex edits the worktree in-place**
    - The runner sends the *full* composed prompt (system + `coder_prompt_round_<n>.txt`) to Codex via MCP in a single `codex(...)` call.
+   - The runner auto-accepts Codex MCP approval prompts (MCP elicitation) so edits can proceed non-interactively inside the worktree sandbox.
    - Outputs: `coder_prompt_round_<n>.txt`, `coder_output_round_<n>.txt`
    - Tracing: `codex_mcp_transcript.jsonl` includes:
      - `mcp_server_start` / `mcp_server_stop`
      - `mcp_list_tools`
      - `tool_call` / `tool_result` for `codex`
+     - `elicitation_request` / `elicitation_response` (approval prompts)
      - `codex_event` `session_configured` (includes `sandbox_policy` and `rollout_path`)
 4. **Snapshot cumulative changes**
    - Output: `diff_round_<n>.diff` is the cumulative diff from the worktree (includes untracked files)
