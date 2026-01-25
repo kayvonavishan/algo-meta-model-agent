@@ -43,7 +43,7 @@
   "agents": {
     "planner": {
       "provider": "openai",
-      "model": "gpt-5-mini",
+      "model": "gpt-5.2",
       "reasoning": "high",
       "temperature": 0.2,
       "max_tokens": 50000,
@@ -51,7 +51,7 @@
     },
     "coder": {
       "provider": "openai",
-      "model": "gpt-5-mini",
+      "model": "gpt-5.2",
       "reasoning": "high",
       "temperature": 0.2,
       "max_tokens": 50000,
@@ -59,7 +59,7 @@
     },
     "reviewer": {
       "provider": "openai",
-      "model": "gpt-5-mini",
+      "model": "gpt-5.2",
       "reasoning": "high",
       "temperature": 0.2,
       "max_tokens": 50000,
