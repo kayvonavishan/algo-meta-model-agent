@@ -78,6 +78,28 @@ def _extract_session_id_from_jsonl(text):  # noqa: ANN001
     return None
 
 
+def _pick_session_arg_key(tool_input_schema):  # noqa: ANN001
+    """
+    Best-effort: determine which request field (if any) the Codex MCP tool accepts to resume
+    a prior conversation/thread.
+
+    Codex CLI uses `exec resume <session_id>` in CLI mode. The MCP tool may expose a similar
+    handle via its input schema (commonly `thread_id` or `session_id`).
+    """
+    if not tool_input_schema:
+        return None
+    if not isinstance(tool_input_schema, dict):
+        return None
+    properties = tool_input_schema.get("properties")
+    if not isinstance(properties, dict):
+        return None
+
+    for key in ("thread_id", "session_id", "conversation_id", "thread", "session"):
+        if key in properties:
+            return key
+    return None
+
+
 _CODEX_LOGIN_STATUS_CACHE = None
 
 
@@ -623,13 +645,14 @@ async def _main_async():
                                 codex_cli_cfg=config.get("codex_cli"),
                             )
                         else:
-                            coder_output = await _codex_mcp_edit_repo(
+                            coder_output, codex_session_id = await _codex_mcp_edit_repo(
                                 worktree_path=worktree_path,
                                 codex_mcp_cfg=codex_mcp_cfg,
                                 agent_cfg=config.get("agents", {}).get("coder", {}),
                                 system_prompt=coder_system,
                                 user_prompt=coder_prompt,
                                 max_turns=max_turns,
+                                session_id=codex_session_id,
                             )
                 _write_text(exp_dir / f"coder_output_round_{round_idx}.txt", coder_output)
 
@@ -1064,7 +1087,7 @@ def _resolve_codex_cli_prefix(*, codex_cli_cfg=None):
     return ["codex"]
 
 
-async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, system_prompt, user_prompt, max_turns):
+async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, system_prompt, user_prompt, max_turns, session_id=None):
     # The coder step delegates to Codex CLI via MCP. We intentionally avoid the Agents SDK MCP wrapper
     # so we can supply an elicitation callback. Codex uses MCP elicitation to request approvals for
     # commands/patches; without this callback, the default MCP client responds "Elicitation not supported",
@@ -1088,9 +1111,13 @@ async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, syste
     args = (codex_mcp_cfg or {}).get("args") or ["-y", "codex", "mcp-server"]
     client_session_timeout_seconds = int((codex_mcp_cfg or {}).get("client_session_timeout_seconds", 360000))
 
-    full_prompt = (system_prompt or "").strip()
-    if full_prompt:
-        full_prompt += "\n\n"
+    # Keep the prompt small after we have a session/thread handle; this mirrors the CLI backend's
+    # `exec resume <id>` behavior and avoids repeatedly sending the full system prompt.
+    full_prompt = ""
+    if not session_id:
+        full_prompt = (system_prompt or "").strip()
+        if full_prompt:
+            full_prompt += "\n\n"
     full_prompt += (user_prompt or "").strip() + "\n"
 
     async def _elicitation_callback(_context, params):  # noqa: ANN001
@@ -1136,13 +1163,42 @@ async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, syste
                 await session.initialize()
 
                 # Record tools (useful for debugging version/config mismatches).
+                codex_tool_json = None
+                session_arg_key = None
                 try:
                     tools_result = await session.list_tools()
+                    tools_json = _to_jsonable(tools_result)
+                    codex_tool = None
+                    try:
+                        for tool in (getattr(tools_result, "tools", None) or []):
+                            if getattr(tool, "name", None) == "codex":
+                                codex_tool = tool
+                                break
+                    except Exception:  # pylint: disable=broad-except
+                        codex_tool = None
+                    codex_tool_json = _to_jsonable(codex_tool) if codex_tool else None
+                    if isinstance(codex_tool_json, dict):
+                        session_arg_key = _pick_session_arg_key(
+                            codex_tool_json.get("inputSchema") or codex_tool_json.get("input_schema")
+                        )
                     _append_codex_transcript(
                         {
                             "event": "mcp_list_tools",
                             "server": "Codex CLI",
                             "tools": [t.name for t in getattr(tools_result, "tools", [])],
+                            "codex_tool_input_keys": (
+                                sorted(
+                                    (
+                                        (codex_tool_json.get("inputSchema") or {}).get("properties") or {}
+                                        if isinstance(codex_tool_json, dict)
+                                        else {}
+                                    ).keys()
+                                )
+                                if codex_tool_json
+                                else None
+                            ),
+                            "codex_tool_session_arg_key": session_arg_key,
+                            "mcp_list_tools_raw": tools_json,
                         }
                     )
                 except Exception as exc:  # pylint: disable=broad-except
@@ -1154,29 +1210,38 @@ async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, syste
                         }
                     )
 
+                # Best-effort: if the Codex MCP tool exposes a session/thread handle in its input
+                # schema, pass it back to resume conversation state across calls.
                 call_args = {
                     "prompt": full_prompt,
                     "approval-policy": "on-request",
                     "sandbox": "workspace-write",
                 }
+                if session_id and session_arg_key:
+                    call_args[session_arg_key] = str(session_id)
                 _append_codex_transcript(
                     {
                         "event": "tool_call",
                         "server": "Codex CLI",
                         "tool": "codex",
                         "input": call_args,
+                        "resume_session_id": str(session_id) if session_id else None,
+                        "resume_session_arg_key": session_arg_key,
                     }
                 )
                 result = await session.call_tool("codex", call_args)
+                result_json = _to_jsonable(result)
+                new_session_id = _find_first_session_id(result_json) or session_id
                 _append_codex_transcript(
                     {
                         "event": "tool_result",
                         "server": "Codex CLI",
                         "tool": "codex",
-                        "output": _to_jsonable(result),
+                        "output": result_json,
+                        "new_session_id": str(new_session_id) if new_session_id else None,
                     }
                 )
-                return _call_tool_result_to_text(result)
+                return _call_tool_result_to_text(result), new_session_id
     finally:
         _append_codex_transcript(
             {
