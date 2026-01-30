@@ -160,8 +160,12 @@ def _select_from_scores(
     )
     ticker_gate["ticker_rank"] = ticker_gate.groupby("period_key").cumcount() + 1
     ticker_counts = ticker_gate.groupby("period_key")["ticker"].transform("count")
-    k_tickers = np.maximum(1, np.floor(np.sqrt(ticker_counts)).astype(int))
-    chosen_tickers = ticker_gate[ticker_gate["ticker_rank"] <= k_tickers]
+    if cfg.include_n_top_tickers is None:
+        chosen_tickers = ticker_gate
+    else:
+        if cfg.include_n_top_tickers <= 0:
+            raise ValueError("include_n_top_tickers must be a positive int or None.")
+        chosen_tickers = ticker_gate[ticker_gate["ticker_rank"] <= cfg.include_n_top_tickers]
     candidates = scores_long.merge(
         chosen_tickers[["period_key", "ticker", "ticker_score", "ticker_rank"]],
         on=["period_key", "ticker"],

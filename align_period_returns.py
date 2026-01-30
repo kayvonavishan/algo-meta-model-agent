@@ -12,7 +12,7 @@ from io_periods import (
 
 def main() -> None:
     cfg = MetaConfig()
-    window_weeks = 1
+    window_weeks = 2
     window_days = window_weeks * 7
 
     file_path = r"C:\Users\micha\myhome\algo\artifacts\period_returns\period_returns_days_1.csv"

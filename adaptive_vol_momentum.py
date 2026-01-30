@@ -44,7 +44,7 @@ from scoring import (
     rolling_zscore,
     rolling_zscore_v2,
 )
-from selection import select_models_universal, select_models_universal_v2
+from selection import select_models_universal_v2
 from reporting import (
     compute_core_performance_metrics,
     compute_relative_edge_metrics,
@@ -97,7 +97,6 @@ __all__ = [
     "rolling_zscore",
     "rolling_zscore_v2",
     "run_config_sweep",
-    "select_models_universal",
     "select_models_universal_v2",
     "wide_to_long_periods",
     "write_aligned_periods_to_csv",
@@ -110,13 +109,14 @@ def parse_args():
     parser.add_argument("--aligned-file", default=r"C:\Users\micha\myhome\algo\artifacts\period_returns\period_returns_weeks_2_aligned.csv")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--results-csv", default=None)
+    parser.add_argument("--per-symbol-outer-trial-cap", type=int, default=None)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    cfg = MetaConfig(
+    cfg_kwargs = dict(
         # You can tweak these quickly:
         top_n_global=20,
         vol_window=4,
@@ -126,6 +126,11 @@ def main():
         enable_uniqueness_weighting=False,  # keep causal by avoiding future-based uniqueness weights
         per_ticker_cap=10,  # prevents one ticker from dominating global topN
     )
+    # Only override defaults when explicitly provided.
+    if args.per_symbol_outer_trial_cap is not None:
+        cfg_kwargs["per_symbol_outer_trial_cap"] = args.per_symbol_outer_trial_cap
+
+    cfg = MetaConfig(**cfg_kwargs)
 
     aligned_file_path = args.aligned_file
     if not os.path.exists(aligned_file_path):
@@ -137,7 +142,7 @@ def main():
     aligned_df = aligned_df.drop_duplicates()
     print(f"Loaded aligned df: {aligned_df.shape} rows/cols")
 
-    aligned_returns, aligned_meta = load_aligned_periods_from_csv(aligned_df, cfg)
+    aligned_returns, _ = load_aligned_periods_from_csv(aligned_df, cfg)
     print(f"Tickers kept after alignment load: {len(aligned_returns)}")
     for tkr, mat in aligned_returns.items():
         print(f"  {tkr}: models={mat.shape[0]}, common_periods={mat.shape[1]}")

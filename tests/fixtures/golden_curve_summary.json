@@ -1,7 +1,7 @@
 {
-  "mean_all_models_return": 0.003165,
-  "mean_topN_return": 0.012956,
-  "mean_edge": 0.009791,
   "final_equity_all": 1.061865,
-  "final_equity_topN": 1.277054
+  "final_equity_topN": 1.384116,
+  "mean_all_models_return": 0.003165,
+  "mean_edge": 0.014091,
+  "mean_topN_return": 0.017257
 }

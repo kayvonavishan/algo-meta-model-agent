@@ -585,7 +585,7 @@ This selection runs once per config during the sweep (see `select_models_univers
 2) For each ticker, compute `ticker_score` as median of top `top_m_for_ticker_gate` model scores.
 3) Optionally filter tickers by `min_ticker_score`.
 4) For each period, rank tickers by ticker_score.
-5) Choose `k = floor(sqrt(#tickers))` (minimum 1). Keep top `k` tickers.
+5) Choose tickers for the period. If `include_n_top_tickers` is `None`, keep all tickers; otherwise keep the top `include_n_top_tickers` tickers by `ticker_score`.
 6) From chosen tickers, rank models within each ticker by score.
 7) Apply `per_ticker_cap` if set.
 8) Global ranking by score across tickers; keep top `top_n_global`.
@@ -655,7 +655,7 @@ graph LR
 ```mermaid
 graph TD
     S["Scores per ticker"] --> TG["Ticker score: median top M"]
-    TG --> GT["Gate top sqrt(N) tickers"]
+    TG --> GT["Gate top N tickers (optional)"]
     GT --> RT["Rank models within ticker"]
     RT --> CAP["Apply per-ticker cap"]
     CAP --> GL["Global rank"]
@@ -665,7 +665,7 @@ graph TD
 ## 12. Where to improve (starter ideas)
 
 1) Uniqueness weighting: The function currently returns all-ones. Implement the intended correlation clustering to reduce duplicates.
-2) Ticker gate rule: `sqrt(N)` is a heuristic; consider alternative gates (fixed N, percentile threshold, or volatility-adjusted).
+2) Ticker gate rule: you can keep all tickers, or gate to a fixed `N` best tickers using `include_n_top_tickers`.
 3) Confidence/risk shaping: Try different confidence transforms or risk penalties (e.g., asymmetric penalties for streaks).
 4) Revisit causal shift: Ensure the shift aligns with how periods are defined and how selection would be executed live.
 

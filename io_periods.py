@@ -570,10 +570,10 @@ def load_aligned_periods_from_csv(
                 continue
             if cfg is not None and mat.shape[1] < cfg.require_common_periods:
                 continue
-    
+
             aligned_returns[ticker] = mat
             meta_dict: Dict[str, pd.DataFrame] = {}
-    
+
             if avg_wide is not None:
                 avg_mat = avg_wide[avg_wide["ticker"] == ticker].set_index("model_id")[period_keys]
                 avg_mat = avg_mat.apply(pd.to_numeric, errors="coerce").reindex(index=mat.index)

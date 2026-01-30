@@ -42,7 +42,9 @@ class MetaConfig:
     # Selection
     top_n_global: int = 20           # total selected per period across all tickers
     top_m_for_ticker_gate: int = 5   # use top M per ticker to compute ticker score
-    per_ticker_cap: Optional[int] = None  # cap selected models per ticker (None = no cap)
+    include_n_top_tickers: Optional[int] = None  # None = include all tickers; else take top N tickers per period by ticker_score
+    per_ticker_cap: Optional[int] = 10  # cap selected models per ticker (None = no cap)
+    per_symbol_outer_trial_cap: Optional[int] = 3  # cap selected models per (ticker, outer_trial_number) per period
     min_ticker_score: Optional[float] = None  # abstain tickers below this score (None = no abstain)
 
     # Sweep / reporting

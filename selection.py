@@ -10,11 +10,15 @@ from scoring import compute_scores_for_ticker_v2
 
 def select_models_universal_v2(
     aligned_by_ticker: Union[Dict[str, pd.DataFrame], pd.DataFrame],
-    cfg: MetaConfig
+    cfg: MetaConfig,
 ) -> pd.DataFrame:
     """
     Vectorized version of select_models_universal for faster selection.
     """
+    if cfg.per_symbol_outer_trial_cap is not None and cfg.per_symbol_outer_trial_cap <= 0:
+        raise ValueError("per_symbol_outer_trial_cap must be a positive int or None.")
+    if cfg.include_n_top_tickers is not None and cfg.include_n_top_tickers <= 0:
+        raise ValueError("include_n_top_tickers must be a positive int or None.")
     if isinstance(aligned_by_ticker, pd.DataFrame):
         aligned_by_ticker, _ = load_aligned_periods_from_csv(aligned_by_ticker, cfg)
     elif isinstance(aligned_by_ticker, dict):
@@ -63,9 +67,11 @@ def select_models_universal_v2(
         kind="mergesort",
     )
     ticker_gate["ticker_rank"] = ticker_gate.groupby("period_key").cumcount() + 1
-    ticker_counts = ticker_gate.groupby("period_key")["ticker"].transform("count")
-    k_tickers = np.maximum(1, np.floor(np.sqrt(ticker_counts)).astype(int))
-    chosen_tickers = ticker_gate[ticker_gate["ticker_rank"] <= k_tickers]
+
+    if cfg.include_n_top_tickers is None:
+        chosen_tickers = ticker_gate
+    else:
+        chosen_tickers = ticker_gate[ticker_gate["ticker_rank"] <= cfg.include_n_top_tickers]
     
     candidates = scores_long.merge(
         chosen_tickers[["period_key", "ticker", "ticker_score", "ticker_rank"]],
@@ -79,6 +85,29 @@ def select_models_universal_v2(
     candidates = candidates.dropna(subset=["score"])
     if candidates.empty:
         return pd.DataFrame()
+
+    if cfg.per_symbol_outer_trial_cap is not None:
+        model_parts = candidates["model_id"].astype(str).str.split("|")
+        inferred = []
+        for parts in model_parts:
+            nums = []
+            for p in parts:
+                if p.isdigit():
+                    nums.append(p)
+            outer = None
+            # If we see consecutive numeric fields, assume (outer, inner, ...).
+            for i in range(len(parts) - 1):
+                if parts[i].isdigit() and parts[i + 1].isdigit():
+                    outer = parts[i]
+                    break
+            if outer is None and nums:
+                outer = nums[0]
+            inferred.append(outer)
+        outer_num = pd.to_numeric(pd.Series(inferred, index=candidates.index, dtype="object"), errors="coerce")
+
+        # If we can't infer an outer trial, use a unique key per model_id so we don't unexpectedly apply the cap.
+        candidates["_outer_trial_key"] = outer_num.where(~pd.isna(outer_num), candidates["model_id"].astype(str))
+        candidates["_outer_trial_key"] = candidates["_outer_trial_key"].astype(str)
     
     # Deterministic rank within ticker.
     candidates = candidates.sort_values(
@@ -86,6 +115,16 @@ def select_models_universal_v2(
         ascending=[True, True, False, True],
         kind="mergesort",
     )
+
+    if cfg.per_symbol_outer_trial_cap is not None:
+        candidates["rank_in_outer_trial"] = candidates.groupby(
+            ["ticker", "period_key", "_outer_trial_key"],
+            dropna=False,
+        ).cumcount() + 1
+        candidates = candidates[candidates["rank_in_outer_trial"] <= cfg.per_symbol_outer_trial_cap]
+        if candidates.empty:
+            return pd.DataFrame()
+
     candidates["rank_in_ticker"] = candidates.groupby(["ticker", "period_key"]).cumcount() + 1
     if cfg.per_ticker_cap is not None:
         candidates = candidates[candidates["rank_in_ticker"] <= cfg.per_ticker_cap]

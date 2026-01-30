@@ -144,7 +144,9 @@ def run_config_sweep(
         row = dict(cfg_rec)
         row["seed"] = seed
         row["top_n_global"] = cfg.top_n_global
+        row["include_n_top_tickers"] = cfg.include_n_top_tickers
         row["per_ticker_cap"] = cfg.per_ticker_cap
+        row["per_symbol_outer_trial_cap"] = cfg.per_symbol_outer_trial_cap
         row["min_ticker_score"] = cfg.min_ticker_score
         row["oos_start_date"] = "" if oos_start_date is None else str(oos_start_date)
         row["status"] = "ok"

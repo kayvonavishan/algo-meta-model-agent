@@ -82,3 +82,32 @@ def test_load_aligned_periods_round_trip() -> None:
     for ticker, mat in aligned_returns.items():
         loaded = loaded_returns[ticker]
         pd.testing.assert_frame_equal(mat, loaded)
+
+
+def test_per_symbol_outer_trial_cap_enforced() -> None:
+    cfg = make_test_config()
+    cfg.per_ticker_cap = None
+    cfg.top_n_global = 4
+    cfg.per_symbol_outer_trial_cap = 1
+
+    aligned_returns, _, _ = make_synthetic_aligned_returns(n_tickers=1, n_models=6)
+    # Encode outer+inner trial numbers into model_id so selection can infer outer_trial_number.
+    ticker = next(iter(aligned_returns.keys()))
+    mat = aligned_returns[ticker]
+    new_ids = []
+    for model_id in mat.index:
+        m = int(str(model_id).split("_m", 1)[1])
+        outer = m // 3
+        inner = m
+        new_ids.append(f"{ticker}|{outer}|{inner}|{model_id}")
+    aligned_returns[ticker] = mat.copy()
+    aligned_returns[ticker].index = new_ids
+
+    selections = select_models_universal_v2(aligned_returns, cfg)
+
+    model_parts = selections["model_id"].astype(str).str.split("|")
+    outer = model_parts.str[1].astype(int)
+    sel_with_outer = selections.assign(outer_trial_number=outer)
+
+    counts = sel_with_outer.groupby(["period_end", "ticker", "outer_trial_number"]).size()
+    assert (counts <= cfg.per_symbol_outer_trial_cap).all()

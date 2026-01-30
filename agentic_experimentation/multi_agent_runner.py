@@ -605,6 +605,7 @@ async def _main_async():
             coder_output = ""
             review_text = ""
             review_issues = ""
+            baseline_review_issues = ""
             verdict = "UNKNOWN"
             codex_session_id = None
 
@@ -704,6 +705,8 @@ async def _main_async():
                     patch_text=diff_text,
                     repo_context=reviewer_context,
                     meta_model_guide=meta_model_guide,
+                    review_round_idx=round_idx,
+                    baseline_issues=(baseline_review_issues or "(none)"),
                 )
                 _write_text(exp_dir / f"reviewer_prompt_round_{round_idx}.txt", review_prompt)
                 if args.dry_run_llm:
@@ -719,13 +722,32 @@ async def _main_async():
                         )
                 _write_text(exp_dir / f"review_round_{round_idx}.md", review_text)
                 verdict = _parse_reviewer_verdict(review_text)
-                review_issues = _extract_reviewer_issues(review_text)
+                extracted_issues = _extract_reviewer_issues(review_text)
+                dropped_new = []
+                if round_idx == 0:
+                    baseline_review_issues = extracted_issues
+                    review_issues = extracted_issues
+                else:
+                    review_issues, dropped_new = _filter_issues_to_baseline(
+                        current_issues=extracted_issues,
+                        baseline_issues=baseline_review_issues,
+                    )
+                    # Prevent accidental scope creep: pass only baseline issues to the coder even if the
+                    # reviewer violates the "no new issues after round 0" rule.
+                    review_text = _replace_issues_section(review_text, review_issues)
+                    _write_text(exp_dir / f"review_round_{round_idx}_sanitized.md", review_text)
+                    if dropped_new:
+                        _write_text(
+                            exp_dir / f"review_round_{round_idx}_dropped_new_issues.txt",
+                            "\n".join(dropped_new).strip() + "\n",
+                        )
                 review_rounds.append(
                     {
                         "round": round_idx,
                         "diff_present": True,
                         "review_verdict": verdict,
                         "review_issues": review_issues,
+                        "dropped_new_issues": dropped_new,
                     }
                 )
 
@@ -1282,6 +1304,71 @@ def _extract_reviewer_issues(text):
             elif stripped:
                 issues.append(stripped)
     return "\n".join(issues).strip()
+
+
+def _normalize_issue_text(text):  # noqa: ANN001
+    text = (text or "").strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _filter_issues_to_baseline(*, current_issues, baseline_issues):  # noqa: ANN001
+    """
+    Enforce convergence: after the first review, only allow issues that match the baseline
+    issue set from round 0.
+    """
+    baseline_lines = [l.strip() for l in (baseline_issues or "").splitlines() if l.strip()]
+    baseline_map = {_normalize_issue_text(l): l for l in baseline_lines}
+    if not baseline_map:
+        return (current_issues or "").strip(), []
+
+    filtered = []
+    dropped = []
+    for line in [l.strip() for l in (current_issues or "").splitlines() if l.strip()]:
+        key = _normalize_issue_text(line)
+        if key in baseline_map:
+            filtered.append(baseline_map[key])
+        else:
+            dropped.append(line)
+    return "\n".join(filtered).strip(), dropped
+
+
+def _replace_issues_section(review_text, issues_text):  # noqa: ANN001
+    """
+    Replace the ISSUES section content in a reviewer response while keeping VERDICT/NOTES.
+    The format is the stable contract in the reviewer prompt.
+    """
+    if not review_text:
+        return ""
+    lines = (review_text or "").splitlines()
+    out = []
+    in_issues = False
+    replaced = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.upper() == "ISSUES:":
+            out.append("ISSUES:")
+            in_issues = True
+            if issues_text:
+                for issue in [l.strip() for l in issues_text.splitlines() if l.strip()]:
+                    out.append(f"- {issue}")
+            replaced = True
+            continue
+        if stripped.upper() == "NOTES:":
+            in_issues = False
+            out.append("NOTES:")
+            continue
+        if in_issues:
+            continue
+        out.append(line)
+    if not replaced:
+        # Fallback: append an ISSUES section if the model didn't follow format.
+        out.append("ISSUES:")
+        if issues_text:
+            for issue in [l.strip() for l in issues_text.splitlines() if l.strip()]:
+                out.append(f"- {issue}")
+        out.append("NOTES:")
+    return "\n".join(out).strip() + "\n"
 
 
 def _run_command(cmd, cwd, log_path):
