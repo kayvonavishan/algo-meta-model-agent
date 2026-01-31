@@ -135,7 +135,7 @@ def main():
                 if completed_ideas_dir_cfg:
                     completed_dir = _resolve_path(repo_root, completed_ideas_dir_cfg)
                 if not completed_dir:
-                    completed_dir = ideas_path / "completed_ideas"
+                    completed_dir = ideas_path / "completed"
                 dest = _archive_idea_file(idea_path=idea_entry["path"], completed_dir=completed_dir, run_id=run_id)
                 _write_text(exp_dir / "idea_archived_to.txt", str(dest) + "\n")
         finally:
@@ -285,7 +285,7 @@ def _load_ideas(path):
         for pattern in ("*.md", "*.txt"):
             candidates.extend(path.rglob(pattern))
         for p in sorted(set(candidates)):
-            if any(part.lower() == "completed_ideas" for part in p.parts):
+            if any(part.lower() in ("completed", "completed_ideas") for part in p.parts):
                 continue
             content = _read_text(p).strip()
             if content:
@@ -309,7 +309,7 @@ def _load_idea_entries(path):
         for pattern in ("*.md", "*.txt"):
             candidates.extend(path.rglob(pattern))
         for p in sorted(set(candidates)):
-            if any(part.lower() == "completed_ideas" for part in p.parts):
+            if any(part.lower() in ("completed", "completed_ideas") for part in p.parts):
                 continue
             content = _read_text(p).strip()
             if content:
