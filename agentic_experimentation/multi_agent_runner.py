@@ -530,6 +530,7 @@ async def _main_async():
     coder_system_path = _resolve_path(repo_root, prompts_cfg.get("coder_system"))
     coder_files_path = _resolve_path(repo_root, prompts_cfg.get("coder_repo_files"))
     reviewer_prompt_path = _resolve_path(repo_root, prompts_cfg.get("reviewer"))
+    reviewer_fix_prompt_path = _resolve_path(repo_root, prompts_cfg.get("reviewer_fix")) or reviewer_prompt_path
     reviewer_system_path = _resolve_path(repo_root, prompts_cfg.get("reviewer_system"))
     reviewer_files_path = _resolve_path(repo_root, prompts_cfg.get("reviewer_repo_files"))
     if not (planner_prompt_path and coder_prompt_path and reviewer_prompt_path):
@@ -550,6 +551,7 @@ async def _main_async():
     agents_sdk_cfg = config.get("agents_sdk", {})
     max_turns = int(agents_sdk_cfg.get("max_turns", 30))
     coder_backend = (config.get("coder_backend") or "mcp").lower().strip()
+    proceed_on_max_review_rounds = bool(config.get("proceed_on_max_review_rounds", False))
 
     for i in range(iterations):
         run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{i:02d}"
@@ -608,6 +610,7 @@ async def _main_async():
             baseline_review_issues = ""
             verdict = "UNKNOWN"
             codex_session_id = None
+            approved = False
 
             for round_idx in range(max_review_rounds + 1):
                 coder_template_path = coder_prompt_path if round_idx == 0 else coder_fix_prompt_path
@@ -699,7 +702,7 @@ async def _main_async():
                     continue
 
                 review_prompt = _render_prompt(
-                    _read_text(reviewer_prompt_path),
+                    _read_text(reviewer_prompt_path if round_idx == 0 else reviewer_fix_prompt_path),
                     idea_text=idea_text,
                     plan_text=plan_text,
                     patch_text=diff_text,
@@ -752,6 +755,7 @@ async def _main_async():
                 )
 
                 if verdict == "APPROVE":
+                    approved = True
                     break
 
             tests_exit = None
@@ -759,7 +763,8 @@ async def _main_async():
             candidate_csv = exp_dir / "meta_config_sweep_results.csv"
             score_result = None
 
-            proceed = bool(diff_text.strip()) and verdict == "APPROVE"
+            hit_max_rounds = (not approved) and (round_idx >= max_review_rounds)
+            proceed = bool(diff_text.strip()) and (approved or (hit_max_rounds and proceed_on_max_review_rounds))
 
             # Tests
             test_cmd = config.get("test_command")
@@ -815,6 +820,9 @@ async def _main_async():
                 "coder_backend": coder_backend,
                 "codex_session_id": codex_session_id,
                 "review_verdict": verdict,
+                "approved": approved,
+                "hit_max_review_rounds": hit_max_rounds,
+                "proceed_on_max_review_rounds": proceed_on_max_review_rounds,
                 "review_rounds": review_rounds,
                 "tests_exit_code": tests_exit,
                 "sweep_exit_code": sweep_exit,

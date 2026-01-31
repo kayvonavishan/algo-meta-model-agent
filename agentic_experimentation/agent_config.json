@@ -14,11 +14,13 @@
   "test_cwd": ".",
   "test_pattern": "tests/test_smoke_invariants.py tests/test_statistical_sanity.py",
   "max_review_rounds": 2,
+  "proceed_on_max_review_rounds": false,
   "prompts": {
     "planner": "agentic_experimentation\\prompts\\planner\\planner_prompt.txt",
     "coder": "agentic_experimentation\\prompts\\coder\\coder_prompt.txt",
     "coder_fix": "agentic_experimentation\\prompts\\coder\\coder_fix_prompt.txt",
     "reviewer": "agentic_experimentation\\prompts\\reviewer\\reviewer_prompt.txt",
+    "reviewer_fix": "agentic_experimentation\\prompts\\reviewer\\reviewer_fix_prompt.txt",
     "planner_system": "agentic_experimentation\\prompts\\planner\\planner_system.txt",
     "coder_system": "agentic_experimentation\\prompts\\coder\\coder_system.txt",
     "reviewer_system": "agentic_experimentation\\prompts\\reviewer\\reviewer_system.txt",
