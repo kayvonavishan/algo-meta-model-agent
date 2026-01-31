@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from agent_runner import (
-    _load_ideas,
+    _load_idea_entries,
     _load_json,
     _read_text,
     _render_prompt,
@@ -26,6 +26,7 @@ from agent_runner import (
     _write_json,
     _write_text,
     _load_env_files,
+    _archive_idea_file,
 )
 from git_worktree import create_worktree, remove_worktree, sync_working_tree
 from scoring_hooks import compute_score
@@ -517,8 +518,9 @@ async def _main_async():
     if not baseline_csv.exists():
         raise RuntimeError(f"Baseline CSV not found at {baseline_csv}. Run with --refresh-baseline.")
 
-    ideas = _load_ideas(ideas_path)
-    if not ideas:
+    idea_entries = _load_idea_entries(ideas_path)
+    ideas = [e.get("content", "") for e in idea_entries]
+    if not ideas or not any((s or "").strip() for s in ideas):
         raise RuntimeError(f"ideas_file provided but no ideas found at {ideas_path}")
 
     prompts_cfg = config.get("prompts", {})
@@ -552,6 +554,8 @@ async def _main_async():
     max_turns = int(agents_sdk_cfg.get("max_turns", 30))
     coder_backend = (config.get("coder_backend") or "mcp").lower().strip()
     proceed_on_max_review_rounds = bool(config.get("proceed_on_max_review_rounds", False))
+    archive_completed_ideas = bool(config.get("archive_completed_ideas", False))
+    completed_ideas_dir_cfg = config.get("completed_ideas_dir")
 
     for i in range(iterations):
         run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{i:02d}"
@@ -568,8 +572,11 @@ async def _main_async():
             # generating absolute paths into the original repo (which may be outside Codex's workspace).
             coder_context = _build_repo_context_for_role(worktree_path, "coder", coder_files_path)
             reviewer_context = _build_repo_context_for_role(repo_root, "reviewer", reviewer_files_path)
-            idea_text = ideas[i]
+            idea_entry = idea_entries[i] if 0 <= i < len(idea_entries) else {"content": ideas[i], "path": None}
+            idea_text = idea_entry.get("content") or ""
             _write_text(exp_dir / "idea.md", idea_text)
+            if idea_entry.get("path"):
+                _write_text(exp_dir / "idea_source_path.txt", str(idea_entry["path"]).strip() + "\n")
 
             # Planner: produce plan text
             planner_prompt = _render_prompt(
@@ -831,6 +838,16 @@ async def _main_async():
             }
             _write_json(exp_dir / "summary.json", summary)
             print(f"Finished multi-agent iteration {i + 1}/{iterations}: {run_id}")
+
+            # Archive idea file after completing the full loop (dir-based ideas only).
+            if archive_completed_ideas and ideas_path and Path(ideas_path).is_dir() and idea_entry.get("path"):
+                completed_dir = None
+                if completed_ideas_dir_cfg:
+                    completed_dir = _resolve_path(repo_root, completed_ideas_dir_cfg)
+                if not completed_dir:
+                    completed_dir = Path(ideas_path) / "completed_ideas"
+                dest = _archive_idea_file(idea_path=idea_entry["path"], completed_dir=completed_dir, run_id=run_id)
+                _write_text(exp_dir / "idea_archived_to.txt", str(dest) + "\n")
         finally:
             if not config.get("keep_worktrees", False) and not args.keep_worktrees:
                 remove_worktree(repo_root, worktree_path)

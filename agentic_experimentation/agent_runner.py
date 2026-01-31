@@ -44,12 +44,16 @@ def main():
     if not baseline_csv.exists():
         raise RuntimeError(f"Baseline CSV not found at {baseline_csv}. Run with --refresh-baseline.")
 
-    ideas = _load_ideas(ideas_path)
-    if not ideas:
+    idea_entries = _load_idea_entries(ideas_path)
+    ideas = [e.get("content", "") for e in idea_entries]
+    if not ideas or not any((s or "").strip() for s in ideas):
         raise RuntimeError(f"ideas_file provided but no ideas found at {ideas_path}")
 
     llm_config = config.get("llm", {})
     llm = DummyClient(llm_config) if args.dry_run_llm else build_llm_client(llm_config)
+
+    archive_completed_ideas = bool(config.get("archive_completed_ideas", False))
+    completed_ideas_dir_cfg = config.get("completed_ideas_dir")
 
     iterations_requested = args.iterations
     if iterations_requested is None:
@@ -72,8 +76,10 @@ def main():
                 sync_working_tree(repo_root, worktree_path)
 
             repo_context = _build_repo_context(repo_root)
-            idea_text = ideas[i]
-            idea_note = f"Idea loaded from {ideas_path} ({i + 1}/{len(ideas)})."
+            idea_entry = idea_entries[i] if 0 <= i < len(idea_entries) else {"content": ideas[i], "path": None}
+            idea_text = (idea_entry.get("content") or "").strip()
+            idea_source = idea_entry.get("path") or str(ideas_path)
+            idea_note = f"Idea loaded from {idea_source} ({i + 1}/{len(ideas)})."
             _write_text(exp_dir / "idea_source.txt", idea_note)
             _write_text(exp_dir / "idea.md", idea_text)
 
@@ -123,6 +129,15 @@ def main():
             }
             _write_json(exp_dir / "summary.json", summary)
             print(f"Finished iteration {i + 1}/{iterations}: {run_id}")
+
+            if archive_completed_ideas and ideas_path.is_dir() and idea_entry.get("path"):
+                completed_dir = None
+                if completed_ideas_dir_cfg:
+                    completed_dir = _resolve_path(repo_root, completed_ideas_dir_cfg)
+                if not completed_dir:
+                    completed_dir = ideas_path / "completed_ideas"
+                dest = _archive_idea_file(idea_path=idea_entry["path"], completed_dir=completed_dir, run_id=run_id)
+                _write_text(exp_dir / "idea_archived_to.txt", str(dest) + "\n")
         finally:
             if not config.get("keep_worktrees", False) and not args.keep_worktrees:
                 remove_worktree(repo_root, worktree_path)
@@ -270,6 +285,8 @@ def _load_ideas(path):
         for pattern in ("*.md", "*.txt"):
             candidates.extend(path.rglob(pattern))
         for p in sorted(set(candidates)):
+            if any(part.lower() == "completed_ideas" for part in p.parts):
+                continue
             content = _read_text(p).strip()
             if content:
                 ideas.append(content)
@@ -277,6 +294,46 @@ def _load_ideas(path):
     content = _read_text(path)
     blocks = [block.strip() for block in content.split("\n\n") if block.strip()]
     return blocks
+
+
+def _load_idea_entries(path):
+    """
+    Like `_load_ideas`, but preserves the source path for directory-based ideas.
+
+    Returns a list of dicts:
+      - {"content": <str>, "path": <str|None>}
+    """
+    if path.is_dir():
+        entries = []
+        candidates = []
+        for pattern in ("*.md", "*.txt"):
+            candidates.extend(path.rglob(pattern))
+        for p in sorted(set(candidates)):
+            if any(part.lower() == "completed_ideas" for part in p.parts):
+                continue
+            content = _read_text(p).strip()
+            if content:
+                entries.append({"content": content, "path": str(p)})
+        return entries
+    content = _read_text(path)
+    blocks = [block.strip() for block in content.split("\n\n") if block.strip()]
+    return [{"content": block, "path": None} for block in blocks]
+
+
+def _archive_idea_file(*, idea_path, completed_dir, run_id):
+    idea_path = Path(idea_path)
+    completed_dir = Path(completed_dir)
+    completed_dir.mkdir(parents=True, exist_ok=True)
+
+    dest = completed_dir / idea_path.name
+    if dest.exists():
+        dest = completed_dir / f"{run_id}_{idea_path.name}"
+        if dest.exists():
+            stem = idea_path.stem
+            suffix = idea_path.suffix
+            dest = completed_dir / f"{run_id}_{stem}_{int(time.time())}{suffix}"
+    shutil.move(str(idea_path), str(dest))
+    return dest
 
 
 def _load_env_files(paths):
