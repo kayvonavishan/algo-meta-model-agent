@@ -40,6 +40,7 @@ _TRACE_PROCESSOR_REGISTERED = False
 
 
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_AGENTIC_OUTPUT_TS_RE = re.compile(r"^(?P<base>.+)_(\d{8})_(\d{6})(_\d{3,6})?$")
 
 
 def _find_first_session_id(payload):  # noqa: ANN001
@@ -498,9 +499,14 @@ async def _main_async():
     worktree_root = _resolve_path(repo_root, config.get("worktree_root"))
     baseline_csv = _resolve_path(repo_root, config.get("baseline_csv"))
     results_csv = Path(config.get("results_csv")).expanduser()
-    agentic_output_root = config.get("agentic_output_root")
-    if agentic_output_root:
-        agentic_output_root = Path(agentic_output_root).expanduser()
+    agentic_output_root = None
+    agentic_output_root_cfg = config.get("agentic_output_root")
+    if agentic_output_root_cfg:
+        base = Path(str(agentic_output_root_cfg)).expanduser()
+        # Create a unique root per multi-agent runner invocation to avoid overwriting prior runs.
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        agentic_output_root = base if _AGENTIC_OUTPUT_TS_RE.match(base.name) else (base.parent / f"{base.name}_{ts}")
+        agentic_output_root.mkdir(parents=True, exist_ok=True)
     ideas_path = _resolve_path(repo_root, config.get("ideas_file"))
 
     _load_env_files([repo_root / ".env"])
@@ -771,6 +777,7 @@ async def _main_async():
             sweep_exit = None
             candidate_csv = exp_dir / "meta_config_sweep_results.csv"
             score_result = None
+            agentic_run_results_csv = None
 
             hit_max_rounds = (not approved) and (round_idx >= max_review_rounds)
             proceed = bool(diff_text.strip()) and (approved or (hit_max_rounds and proceed_on_max_review_rounds))
@@ -801,6 +808,7 @@ async def _main_async():
                     run_output_dir = agentic_output_root / f"run_{i}"
                     run_output_dir.mkdir(parents=True, exist_ok=True)
                     run_results_csv = run_output_dir / "meta_config_sweep_results.csv"
+                    agentic_run_results_csv = str(run_results_csv)
                     env_extra = {
                         "AGENTIC_OUTPUT_DIR": str(run_output_dir),
                         "AGENTIC_RESULTS_CSV": str(run_results_csv),
@@ -837,6 +845,8 @@ async def _main_async():
                 "tests_exit_code": tests_exit,
                 "sweep_exit_code": sweep_exit,
                 "results_csv": str(candidate_csv) if candidate_csv.exists() else None,
+                "agentic_output_root": str(agentic_output_root) if agentic_output_root else None,
+                "agentic_run_results_csv": agentic_run_results_csv,
                 "score": score_result,
                 "sweep_config_limit": config.get("sweep_config_limit"),
             }
