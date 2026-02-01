@@ -99,3 +99,76 @@ config_id,metric
     assert result["baseline_mean"] == 5.0
     assert result["candidate_mean"] == 6.0
     assert result["delta"] == 1.0
+
+
+def test_compute_score_recommendation_should_explore_true_on_clear_improvement(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline.csv"
+    candidate = tmp_path / "candidate.csv"
+    _write_csv(
+        baseline,
+        """
+config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_cagr,core_topN_sharpe,core_topN_max_drawdown,core_topN_cvar_05
+0,0.02,0.60,1.50,-0.25,-0.09
+""",
+    )
+    _write_csv(
+        candidate,
+        """
+config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_cagr,core_topN_sharpe,core_topN_max_drawdown,core_topN_cvar_05
+0,0.022,0.63,1.55,-0.24,-0.088
+""",
+    )
+
+    result = compute_score(baseline, candidate, score_column=None, higher_is_better=True)
+    rec = result["recommendation"]
+    assert rec["should_explore"] is True
+    assert rec["grade"] in {"promising", "strong"}
+    assert rec["score"] > 0
+
+
+def test_compute_score_recommendation_blocks_on_primary_metric_regression(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline.csv"
+    candidate = tmp_path / "candidate.csv"
+    _write_csv(
+        baseline,
+        """
+config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_cagr,core_topN_sharpe,core_topN_max_drawdown,core_topN_cvar_05
+0,0.02,0.60,1.50,-0.25,-0.09
+""",
+    )
+    _write_csv(
+        candidate,
+        """
+config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_cagr,core_topN_sharpe,core_topN_max_drawdown,core_topN_cvar_05
+0,0.018,0.62,1.55,-0.25,-0.09
+""",
+    )
+
+    result = compute_score(baseline, candidate, score_column=None, higher_is_better=True)
+    rec = result["recommendation"]
+    assert rec["should_explore"] is False
+    assert "primary_metric_regressed" in rec["reasons"]
+
+
+def test_compute_score_recommendation_blocks_on_risk_regression(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline.csv"
+    candidate = tmp_path / "candidate.csv"
+    _write_csv(
+        baseline,
+        """
+config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_max_drawdown,core_topN_cvar_05
+0,0.02,-0.25,-0.09
+""",
+    )
+    _write_csv(
+        candidate,
+        """
+config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_max_drawdown,core_topN_cvar_05
+0,0.022,-0.35,-0.12
+""",
+    )
+
+    result = compute_score(baseline, candidate, score_column=None, higher_is_better=True)
+    rec = result["recommendation"]
+    assert rec["should_explore"] is False
+    assert any(r.startswith("risk_regressed:") for r in rec["reasons"])
