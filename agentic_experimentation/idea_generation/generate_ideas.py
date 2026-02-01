@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -402,6 +403,26 @@ def main() -> int:
             "ANTHROPIC_API_KEY is not set. Put it in `agentic_experimentation/.env` or set it in your environment."
         )
 
+    # Make `agentic_experimentation/*.py` importable even when this script is invoked as a file path
+    # (e.g. `python agentic_experimentation/idea_generation/generate_ideas.py`).
+    agentic_root_str = str(agentic_root.resolve())
+    if agentic_root_str not in sys.path:
+        sys.path.insert(0, agentic_root_str)
+
+    phoenix_obs = None
+    phoenix_tracer = None
+    try:
+        import phoenix_tracing as phoenix_obs  # type: ignore
+
+        phoenix_tracer = phoenix_obs.init_phoenix_tracing(
+            project_name=None,
+            endpoint=None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[phoenix] tracing disabled: {exc}", file=sys.stderr)
+        phoenix_obs = None
+        phoenix_tracer = None
+
     prompt_path = agentic_root / "prompts" / "idea_generator" / "idea_generator_prompt.txt"
     guide_path = repo_root / "META_MODEL_GUIDE.md"
     driver_path = repo_root / "adaptive_vol_momentum.py"
@@ -415,59 +436,117 @@ def main() -> int:
     created: List[Path] = []
     next_num = _next_idea_number(ideas_dir, completed_dir)
 
-    for _ in range(cfg.count):
-        # Re-scan each loop so the newly written idea becomes context for the next call.
-        prior_idea_files = _collect_idea_files(ideas_dir, completed_dir)
-
-        prompt = _bundle_context(
-            prompt_template=prompt_template,
-            meta_model_guide=meta_model_guide,
-            driver_code=driver_code,
-            idea_files=prior_idea_files,
-            max_context_chars=int(cfg.max_context_chars),
+    run_span_cm = contextlib.nullcontext()
+    if phoenix_tracer is not None:
+        run_span_cm = phoenix_tracer.start_as_current_span(
+            "idea_generation.run",
+            attributes={
+                "count": int(cfg.count),
+                "max_context_chars": int(cfg.max_context_chars),
+                "ideas_dir": str(ideas_dir),
+                "repo_root": str(repo_root),
+            },
         )
+    with run_span_cm as run_span:
+        if phoenix_obs is not None and run_span is not None:
+            phoenix_obs.set_openinference_kind(run_span, "CHAIN")
 
-        try:
-            idea_md = asyncio.run(
-                _run_claude_agent_sdk_once(
-                    prompt=prompt,
-                    model=cfg.model,
-                    cwd=run_cwd,
-                    cli_path=cfg.cli_path,
-                )
+        for _ in range(cfg.count):
+            # Re-scan each loop so the newly written idea becomes context for the next call.
+            prior_idea_files = _collect_idea_files(ideas_dir, completed_dir)
+
+            prompt = _bundle_context(
+                prompt_template=prompt_template,
+                meta_model_guide=meta_model_guide,
+                driver_code=driver_code,
+                idea_files=prior_idea_files,
+                max_context_chars=int(cfg.max_context_chars),
             )
-        except RuntimeError:
-            # Common failure mode: unsupported/invalid model string for Claude Code.
-            # If a model was specified, retry once with default model to reduce friction.
-            if cfg.model is None:
-                raise
-            idea_md = asyncio.run(
-                _run_claude_agent_sdk_once(
-                    prompt=prompt,
-                    model=None,
-                    cwd=run_cwd,
-                    cli_path=cfg.cli_path,
+
+            prompt_dump_dir = Path(__file__).resolve().parent / ".idea_generation_logs"
+            prompt_dump_path = prompt_dump_dir / f"prompt_{_now_tag()}_{next_num:03d}.txt"
+            _write_text(prompt_dump_path, prompt)
+
+            idea_span_cm = contextlib.nullcontext()
+            if phoenix_tracer is not None:
+                idea_span_cm = phoenix_tracer.start_as_current_span(
+                    "idea_generation.idea",
+                    attributes={
+                        "idea_number": int(next_num),
+                        "prompt_path": str(prompt_dump_path),
+                        "model": str(cfg.model) if cfg.model else None,
+                    },
                 )
-            )
-        _validate_idea_output(idea_md)
+            with idea_span_cm as idea_span:
+                if phoenix_obs is not None and idea_span is not None:
+                    phoenix_obs.set_openinference_kind(idea_span, "CHAIN")
+                    phoenix_obs.set_io(idea_span, input_text=prompt)
 
-        title = _parse_idea_title(idea_md)
-        slug = _slugify(title)
+                llm_span_cm = contextlib.nullcontext()
+                if phoenix_tracer is not None:
+                    llm_span_cm = phoenix_tracer.start_as_current_span(
+                        "llm.claude_agent_sdk",
+                        attributes={
+                            "llm.provider": "anthropic",
+                            "llm.model_name": str(cfg.model) if cfg.model else None,
+                            "prompt_path": str(prompt_dump_path),
+                        },
+                    )
+                with llm_span_cm as llm_span:
+                    if phoenix_obs is not None and llm_span is not None:
+                        phoenix_obs.set_openinference_kind(llm_span, "LLM")
+                        phoenix_obs.set_io(llm_span, input_text=prompt)
 
-        out_path = ideas_dir / f"{next_num:03d}_{slug}.md"
-        # Avoid overwriting if numbers collide or slug repeats.
-        if out_path.exists():
-            suffix = 2
-            while True:
-                cand = ideas_dir / f"{next_num:03d}_{slug}_{suffix}.md"
-                if not cand.exists():
-                    out_path = cand
-                    break
-                suffix += 1
+                    try:
+                        idea_md = asyncio.run(
+                            _run_claude_agent_sdk_once(
+                                prompt=prompt,
+                                model=cfg.model,
+                                cwd=run_cwd,
+                                cli_path=cfg.cli_path,
+                            )
+                        )
+                    except RuntimeError:
+                        # Common failure mode: unsupported/invalid model string for Claude Code.
+                        # If a model was specified, retry once with default model to reduce friction.
+                        if cfg.model is None:
+                            raise
+                        idea_md = asyncio.run(
+                            _run_claude_agent_sdk_once(
+                                prompt=prompt,
+                                model=None,
+                                cwd=run_cwd,
+                                cli_path=cfg.cli_path,
+                            )
+                        )
 
-        _write_text(out_path, idea_md.rstrip() + "\n")
-        created.append(out_path)
-        next_num += 1
+                    if phoenix_obs is not None and llm_span is not None:
+                        phoenix_obs.set_io(llm_span, output_text=idea_md)
+
+                _validate_idea_output(idea_md)
+
+                title = _parse_idea_title(idea_md)
+                slug = _slugify(title)
+
+                out_path = ideas_dir / f"{next_num:03d}_{slug}.md"
+                # Avoid overwriting if numbers collide or slug repeats.
+                if out_path.exists():
+                    suffix = 2
+                    while True:
+                        cand = ideas_dir / f"{next_num:03d}_{slug}_{suffix}.md"
+                        if not cand.exists():
+                            out_path = cand
+                            break
+                        suffix += 1
+
+                _write_text(out_path, idea_md.rstrip() + "\n")
+                created.append(out_path)
+
+                if phoenix_obs is not None and idea_span is not None:
+                    phoenix_obs.set_attrs(idea_span, {"output_path": str(out_path)})
+                    phoenix_obs.set_io(idea_span, output_text=idea_md)
+
+                next_num += 1
 
     for p in created:
         print(str(p))

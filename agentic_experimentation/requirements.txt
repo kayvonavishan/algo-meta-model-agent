@@ -1,3 +1,6 @@
 openai-agents
 openai
 claude-agent-sdk
+arize-phoenix
+arize-phoenix-otel
+openinference-instrumentation-openai-agents

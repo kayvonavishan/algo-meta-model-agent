@@ -516,6 +516,20 @@ async def _main_async():
     os.environ.pop("OPENAI_AGENTS_DISABLE_TRACING", None)
     os.environ.setdefault("OPENAI_AGENTS_TRACE_INCLUDE_SENSITIVE_DATA", "1")
 
+    phoenix_obs = None
+    phoenix_tracer = None
+    try:
+        import phoenix_tracing as phoenix_obs  # type: ignore
+
+        phoenix_tracer = phoenix_obs.init_phoenix_tracing(
+            project_name=(config.get("phoenix_project_name") or None),
+            endpoint=(config.get("phoenix_collector_endpoint") or None),
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        logging.getLogger(__name__).warning("Phoenix tracing disabled: %s", exc)
+        phoenix_obs = None
+        phoenix_tracer = None
+
     meta_model_guide_path = repo_root / "META_MODEL_GUIDE.md"
     if not meta_model_guide_path.exists():
         raise RuntimeError(f"Missing required meta model guide at {meta_model_guide_path}")
@@ -570,8 +584,29 @@ async def _main_async():
         exp_dir = experiments_root / run_id
         exp_dir.mkdir(parents=True, exist_ok=True)
 
-        worktree_path = create_worktree(repo_root, worktree_root, run_id)
+        run_stack = contextlib.ExitStack()
+        run_stack.__enter__()
+        run_span = None
+        if phoenix_tracer is not None:
+            run_span = run_stack.enter_context(
+                phoenix_tracer.start_as_current_span(
+                    "agentic.run",
+                    attributes={
+                        "run_id": run_id,
+                        "iteration_idx": i,
+                        "coder_backend": coder_backend,
+                        "config_path": str(config_path),
+                        "exp_dir": str(exp_dir),
+                    },
+                )
+            )
+            if phoenix_obs is not None and run_span is not None:
+                phoenix_obs.set_openinference_kind(run_span, "CHAIN")
+
+        exc_info = (None, None, None)
+        worktree_path = None
         try:
+            worktree_path = create_worktree(repo_root, worktree_root, run_id)
             if config.get("base_on_working_tree", False):
                 sync_working_tree(repo_root, worktree_path)
 
@@ -586,6 +621,16 @@ async def _main_async():
             if idea_entry.get("path"):
                 _write_text(exp_dir / "idea_source_path.txt", str(idea_entry["path"]).strip() + "\n")
 
+            if phoenix_obs is not None and run_span is not None:
+                phoenix_obs.set_attrs(
+                    run_span,
+                    {
+                        "idea_source_path": str(idea_entry.get("path") or ""),
+                        "worktree_path": str(worktree_path),
+                    },
+                )
+                phoenix_obs.set_io(run_span, input_text=idea_text)
+
             # Planner: produce plan text
             planner_prompt = _render_prompt(
                 _read_text(planner_prompt_path),
@@ -596,17 +641,37 @@ async def _main_async():
             _write_text(exp_dir / "planner_prompt.txt", planner_prompt)
             planner_system = _read_text(planner_system_path) if planner_system_path else SYSTEM_PROMPT
             plan_text = ""
-            if args.dry_run_llm:
-                plan_text = "PLAN:\n1. (dry-run) No-op.\nRISKS:\n- dry-run\n"
-            else:
-                _ensure_trace_processor_registered()
-                with _tracing_scope(exp_dir=exp_dir, run_id=run_id, step="planner"):
-                    plan_text = await _agents_sdk_generate_text(
-                        config.get("agents", {}).get("planner", {}),
-                        system_prompt=planner_system,
-                        user_prompt=planner_prompt,
-                        max_turns=max_turns,
-                    )
+
+            planner_span_cm = contextlib.nullcontext()
+            if phoenix_tracer is not None:
+                planner_span_cm = phoenix_tracer.start_as_current_span(
+                    "agentic.planner",
+                    attributes={
+                        "run_id": run_id,
+                        "step": "planner",
+                        "planner_prompt_path": str(exp_dir / "planner_prompt.txt"),
+                    },
+                )
+            with planner_span_cm as planner_span:
+                if phoenix_obs is not None and planner_span is not None:
+                    phoenix_obs.set_openinference_kind(planner_span, "CHAIN")
+                    phoenix_obs.set_text(planner_span, "system_prompt", planner_system or "")
+                    phoenix_obs.set_io(planner_span, input_text=planner_prompt)
+
+                if args.dry_run_llm:
+                    plan_text = "PLAN:\n1. (dry-run) No-op.\nRISKS:\n- dry-run\n"
+                else:
+                    _ensure_trace_processor_registered()
+                    with _tracing_scope(exp_dir=exp_dir, run_id=run_id, step="planner"):
+                        plan_text = await _agents_sdk_generate_text(
+                            config.get("agents", {}).get("planner", {}),
+                            system_prompt=planner_system,
+                            user_prompt=planner_prompt,
+                            max_turns=max_turns,
+                        )
+
+                if phoenix_obs is not None and planner_span is not None:
+                    phoenix_obs.set_io(planner_span, output_text=plan_text)
             _write_text(exp_dir / "plan.md", plan_text)
 
             # Coder <-> Reviewer repair loop (in-place edits in the same worktree via Codex MCP)
@@ -646,37 +711,82 @@ async def _main_async():
                 else:
                     _ensure_trace_processor_registered()
                     with _tracing_scope(exp_dir=exp_dir, run_id=run_id, step="coder", round_idx=round_idx):
-                        if coder_backend in ("cli", "cli_session", "codex_cli", "codex-cli"):
-                            # For session-backed Codex CLI runs, include the system prompt only on the
-                            # first call; subsequent `resume` prompts benefit from staying small.
-                            full_prompt = ""
-                            if codex_session_id is None:
-                                full_prompt = (coder_system or "").strip()
-                                if full_prompt:
-                                    full_prompt += "\n\n"
-                            full_prompt += (coder_prompt or "").strip() + "\n"
-                            coder_output, codex_session_id = await _codex_cli_edit_repo(
-                                worktree_path=worktree_path,
-                                prompt=full_prompt,
-                                exp_dir=exp_dir,
-                                round_idx=round_idx,
-                                session_id=codex_session_id,
-                                codex_cli_cfg=config.get("codex_cli"),
+                        codex_span_cm = contextlib.nullcontext()
+                        if phoenix_tracer is not None:
+                            codex_span_cm = phoenix_tracer.start_as_current_span(
+                                "agentic.codex_edit_repo",
+                                attributes={
+                                    "run_id": run_id,
+                                    "step": "coder",
+                                    "round_idx": round_idx,
+                                    "backend": coder_backend,
+                                    "worktree_path": str(worktree_path),
+                                    "coder_prompt_path": str(exp_dir / f"coder_prompt_round_{round_idx}.txt"),
+                                    "codex_session_id": str(codex_session_id) if codex_session_id else None,
+                                },
                             )
-                        else:
-                            coder_output, codex_session_id = await _codex_mcp_edit_repo(
-                                worktree_path=worktree_path,
-                                codex_mcp_cfg=codex_mcp_cfg,
-                                agent_cfg=config.get("agents", {}).get("coder", {}),
-                                system_prompt=coder_system,
-                                user_prompt=coder_prompt,
-                                max_turns=max_turns,
-                                session_id=codex_session_id,
-                            )
+                        with codex_span_cm as codex_span:
+                            if phoenix_obs is not None and codex_span is not None:
+                                phoenix_obs.set_openinference_kind(codex_span, "TOOL")
+                                phoenix_obs.set_attrs(codex_span, {"tool.name": "codex"})
+                                phoenix_obs.set_text(codex_span, "system_prompt", coder_system or "")
+
+                            if coder_backend in ("cli", "cli_session", "codex_cli", "codex-cli"):
+                                # For session-backed Codex CLI runs, include the system prompt only on the
+                                # first call; subsequent `resume` prompts benefit from staying small.
+                                full_prompt = ""
+                                if codex_session_id is None:
+                                    full_prompt = (coder_system or "").strip()
+                                    if full_prompt:
+                                        full_prompt += "\n\n"
+                                full_prompt += (coder_prompt or "").strip() + "\n"
+                                if phoenix_obs is not None and codex_span is not None:
+                                    phoenix_obs.set_io(codex_span, input_text=full_prompt)
+                                coder_output, codex_session_id = await _codex_cli_edit_repo(
+                                    worktree_path=worktree_path,
+                                    prompt=full_prompt,
+                                    exp_dir=exp_dir,
+                                    round_idx=round_idx,
+                                    session_id=codex_session_id,
+                                    codex_cli_cfg=config.get("codex_cli"),
+                                )
+                            else:
+                                if phoenix_obs is not None and codex_span is not None:
+                                    phoenix_obs.set_io(codex_span, input_text=coder_prompt)
+                                coder_output, codex_session_id = await _codex_mcp_edit_repo(
+                                    worktree_path=worktree_path,
+                                    codex_mcp_cfg=codex_mcp_cfg,
+                                    agent_cfg=config.get("agents", {}).get("coder", {}),
+                                    system_prompt=coder_system,
+                                    user_prompt=coder_prompt,
+                                    max_turns=max_turns,
+                                    session_id=codex_session_id,
+                                )
+
+                            if phoenix_obs is not None and codex_span is not None:
+                                phoenix_obs.set_attrs(
+                                    codex_span,
+                                    {"codex_session_id": str(codex_session_id) if codex_session_id else None},
+                                )
+                                phoenix_obs.set_io(codex_span, output_text=coder_output)
                 _write_text(exp_dir / f"coder_output_round_{round_idx}.txt", coder_output)
 
                 diff_text = _git_diff_with_untracked(worktree_path)
                 _write_text(exp_dir / f"diff_round_{round_idx}.diff", diff_text)
+
+                if run_span is not None:
+                    try:
+                        run_span.add_event(
+                            "agentic.round_artifacts",
+                            {
+                                "round_idx": round_idx,
+                                "coder_prompt_path": str(exp_dir / f"coder_prompt_round_{round_idx}.txt"),
+                                "coder_output_path": str(exp_dir / f"coder_output_round_{round_idx}.txt"),
+                                "diff_path": str(exp_dir / f"diff_round_{round_idx}.diff"),
+                            },
+                        )
+                    except Exception:  # pylint: disable=broad-except
+                        pass
 
                 if not diff_text.strip():
                     lower_out = (coder_output or "").lower()
@@ -727,18 +837,52 @@ async def _main_async():
                     baseline_issues=(baseline_review_issues or "(none)"),
                 )
                 _write_text(exp_dir / f"reviewer_prompt_round_{round_idx}.txt", review_prompt)
-                if args.dry_run_llm:
-                    review_text = "VERDICT: REJECT\nISSUES:\n- dry-run\nNOTES:\n- dry-run\n"
-                else:
-                    _ensure_trace_processor_registered()
-                    with _tracing_scope(exp_dir=exp_dir, run_id=run_id, step="reviewer", round_idx=round_idx):
-                        review_text = await _agents_sdk_generate_text(
-                            config.get("agents", {}).get("reviewer", {}),
-                            system_prompt=reviewer_system,
-                            user_prompt=review_prompt,
-                            max_turns=max_turns,
-                        )
+
+                reviewer_span_cm = contextlib.nullcontext()
+                if phoenix_tracer is not None:
+                    reviewer_span_cm = phoenix_tracer.start_as_current_span(
+                        "agentic.reviewer",
+                        attributes={
+                            "run_id": run_id,
+                            "step": "reviewer",
+                            "round_idx": round_idx,
+                            "reviewer_prompt_path": str(exp_dir / f"reviewer_prompt_round_{round_idx}.txt"),
+                        },
+                    )
+                with reviewer_span_cm as reviewer_span:
+                    if phoenix_obs is not None and reviewer_span is not None:
+                        phoenix_obs.set_openinference_kind(reviewer_span, "CHAIN")
+                        phoenix_obs.set_text(reviewer_span, "system_prompt", reviewer_system or "")
+                        phoenix_obs.set_io(reviewer_span, input_text=review_prompt)
+
+                    if args.dry_run_llm:
+                        review_text = "VERDICT: REJECT\nISSUES:\n- dry-run\nNOTES:\n- dry-run\n"
+                    else:
+                        _ensure_trace_processor_registered()
+                        with _tracing_scope(exp_dir=exp_dir, run_id=run_id, step="reviewer", round_idx=round_idx):
+                            review_text = await _agents_sdk_generate_text(
+                                config.get("agents", {}).get("reviewer", {}),
+                                system_prompt=reviewer_system,
+                                user_prompt=review_prompt,
+                                max_turns=max_turns,
+                            )
+
+                    if phoenix_obs is not None and reviewer_span is not None:
+                        phoenix_obs.set_io(reviewer_span, output_text=review_text)
                 _write_text(exp_dir / f"review_round_{round_idx}.md", review_text)
+
+                if run_span is not None:
+                    try:
+                        run_span.add_event(
+                            "agentic.reviewer_artifacts",
+                            {
+                                "round_idx": round_idx,
+                                "reviewer_prompt_path": str(exp_dir / f"reviewer_prompt_round_{round_idx}.txt"),
+                                "review_path": str(exp_dir / f"review_round_{round_idx}.md"),
+                            },
+                        )
+                    except Exception:  # pylint: disable=broad-except
+                        pass
                 verdict = _parse_reviewer_verdict(review_text)
                 extracted_issues = _extract_reviewer_issues(review_text)
                 dropped_new = []
@@ -796,7 +940,28 @@ async def _main_async():
                     final_cmd = f"{test_cmd} {test_pattern}"
                 elif test_pattern and isinstance(test_cmd, list):
                     final_cmd = test_cmd + [test_pattern]
-                tests_exit = _run_command(final_cmd, test_cwd, tests_log)
+
+                tests_span_cm = contextlib.nullcontext()
+                if phoenix_tracer is not None:
+                    tests_span_cm = phoenix_tracer.start_as_current_span(
+                        "agentic.tests",
+                        attributes={
+                            "run_id": run_id,
+                            "step": "tests",
+                            "cwd": str(test_cwd),
+                            "tests_log": str(tests_log),
+                            "command": " ".join(final_cmd) if isinstance(final_cmd, list) else str(final_cmd),
+                        },
+                    )
+                with tests_span_cm as tests_span:
+                    if phoenix_obs is not None and tests_span is not None:
+                        phoenix_obs.set_openinference_kind(tests_span, "TOOL")
+                        phoenix_obs.set_attrs(tests_span, {"tool.name": "tests"})
+
+                    tests_exit = _run_command(final_cmd, test_cwd, tests_log)
+
+                    if phoenix_obs is not None and tests_span is not None:
+                        phoenix_obs.set_attrs(tests_span, {"exit_code": int(tests_exit)})
                 proceed = proceed and tests_exit == 0
 
             # Sweep
@@ -813,20 +978,69 @@ async def _main_async():
                         "AGENTIC_OUTPUT_DIR": str(run_output_dir),
                         "AGENTIC_RESULTS_CSV": str(run_results_csv),
                     }
-                sweep_exit = _run_sweep(config, config_path, worktree_path, sweep_log, env_extra=env_extra)
+                sweep_span_cm = contextlib.nullcontext()
+                if phoenix_tracer is not None:
+                    sweep_span_cm = phoenix_tracer.start_as_current_span(
+                        "agentic.sweep",
+                        attributes={
+                            "run_id": run_id,
+                            "step": "sweep",
+                            "sweep_log": str(sweep_log),
+                            "worktree_path": str(worktree_path),
+                            "agentic_results_csv": str(run_results_csv),
+                        },
+                    )
+                with sweep_span_cm as sweep_span:
+                    if phoenix_obs is not None and sweep_span is not None:
+                        phoenix_obs.set_openinference_kind(sweep_span, "TOOL")
+                        phoenix_obs.set_attrs(sweep_span, {"tool.name": "sweep"})
+
+                    sweep_exit = _run_sweep(config, config_path, worktree_path, sweep_log, env_extra=env_extra)
+
+                    if phoenix_obs is not None and sweep_span is not None and sweep_exit is not None:
+                        phoenix_obs.set_attrs(sweep_span, {"exit_code": int(sweep_exit)})
 
                 if run_results_csv.exists():
                     shutil.copy2(run_results_csv, candidate_csv)
 
                 if candidate_csv.exists():
                     score_cfg = config.get("scoring", {})
-                    score_result = compute_score(
-                        baseline_csv,
-                        candidate_csv,
-                        score_cfg.get("score_column"),
-                        score_cfg.get("higher_is_better", True),
-                        config.get("sweep_config_limit"),
-                    )
+                    score_span_cm = contextlib.nullcontext()
+                    if phoenix_tracer is not None:
+                        score_span_cm = phoenix_tracer.start_as_current_span(
+                            "agentic.score",
+                            attributes={
+                                "run_id": run_id,
+                                "step": "score",
+                                "baseline_csv": str(baseline_csv),
+                                "candidate_csv": str(candidate_csv),
+                                "score_column": str(score_cfg.get("score_column") or ""),
+                            },
+                        )
+                    with score_span_cm as score_span:
+                        if phoenix_obs is not None and score_span is not None:
+                            phoenix_obs.set_openinference_kind(score_span, "TOOL")
+                            phoenix_obs.set_attrs(score_span, {"tool.name": "score"})
+
+                        score_result = compute_score(
+                            baseline_csv,
+                            candidate_csv,
+                            score_cfg.get("score_column"),
+                            score_cfg.get("higher_is_better", True),
+                            config.get("sweep_config_limit"),
+                        )
+
+                        if phoenix_obs is not None and score_span is not None and isinstance(score_result, dict):
+                            try:
+                                phoenix_obs.set_attrs(
+                                    score_span,
+                                    {
+                                        "score_value": score_result.get("score"),
+                                        "score_metric": score_result.get("score_column"),
+                                    },
+                                )
+                            except Exception:  # pylint: disable=broad-except
+                                pass
 
             if codex_session_id:
                 _write_text(exp_dir / "codex_session_id.txt", str(codex_session_id).strip() + "\n")
@@ -862,9 +1076,13 @@ async def _main_async():
                     completed_dir = Path(ideas_path) / "completed"
                 dest = _archive_idea_file(idea_path=idea_entry["path"], completed_dir=completed_dir, run_id=run_id)
                 _write_text(exp_dir / "idea_archived_to.txt", str(dest) + "\n")
+        except BaseException:  # noqa: BLE001
+            exc_info = sys.exc_info()
+            raise
         finally:
-            if not config.get("keep_worktrees", False) and not args.keep_worktrees:
+            if worktree_path is not None and (not config.get("keep_worktrees", False)) and (not args.keep_worktrees):
                 remove_worktree(repo_root, worktree_path)
+            run_stack.__exit__(*exc_info)
 
 
 def _parse_args():
