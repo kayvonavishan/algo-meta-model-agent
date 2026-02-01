@@ -2,8 +2,9 @@ You are a quantitative trading researcher proposing ONE self-contained improveme
 
 Context:
 - The meta model selects top-performing base strategies for the next period using training-free signals (see adaptive_vol_momentum.py).
-- Ideas must be implementable as a single coding change (idea → implement).
-- No multi-step experiments inside one idea. If you think multiple variants could help, emit them as separate ideas, not “try A then B”.
+- You will be given additional read-only repo context below (META_MODEL_GUIDE.md, adaptive_vol_momentum.py, and prior idea files) to help you avoid duplicating past ideas.
+- Ideas must be implementable as a single coding change (idea -> implement).
+- No multi-step experiments inside one idea. If you think multiple variants could help, emit them as separate ideas, not "try A then B".
 - Each idea must include all context needed for a quant developer to implement it, even if that means repeating information across ideas.
 - Provide specific details on what needs to change in the context of the current meta model implementation
 - Exact code changes are not necessary, but helpful toy examples are fine
