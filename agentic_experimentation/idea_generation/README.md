@@ -10,14 +10,10 @@ This folder contains a small script to generate new meta-model improvement ideas
 ## Usage
 
 ```powershell
-python agentic_experimentation/idea_generation/generate_ideas.py --count 3
+python agentic_experimentation/idea_generation/generate_ideas.py
 ```
 
-Optional:
-
-```powershell
-python agentic_experimentation/idea_generation/generate_ideas.py --count 1 --model claude-3-7-sonnet
-```
+Edit `agentic_experimentation/idea_generation/config.json` to change `count`, `model`, and `max_context_chars`.
 
 ## Requirements
 

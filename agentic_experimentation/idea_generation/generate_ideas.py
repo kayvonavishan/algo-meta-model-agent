@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import argparse
 import asyncio
+import json
 import os
 import re
 import sys
@@ -184,6 +184,44 @@ def _bundle_context(
     return ("\n".join(base_parts_trunc).strip() + "\n")
 
 
+@dataclass(frozen=True)
+class IdeaGenConfig:
+    count: int
+    model: Optional[str]
+    max_context_chars: int
+
+
+def _load_config(config_path: Path) -> IdeaGenConfig:
+    try:
+        raw = json.loads(_read_text(config_path))
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Missing config file at {config_path}. Create it (example: agentic_experimentation/idea_generation/config.json)."
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in {config_path}: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"Config must be a JSON object: {config_path}")
+
+    count = raw.get("count", 1)
+    model = raw.get("model", None)
+    max_context_chars = raw.get("max_context_chars", 200_000)
+
+    if not isinstance(count, int) or count <= 0:
+        raise ValueError("config.count must be a positive integer.")
+    if model is not None and (not isinstance(model, str) or not model.strip()):
+        raise ValueError("config.model must be a non-empty string or null.")
+    if not isinstance(max_context_chars, int) or max_context_chars <= 0:
+        raise ValueError("config.max_context_chars must be a positive integer.")
+
+    return IdeaGenConfig(
+        count=count,
+        model=(model.strip() if isinstance(model, str) else None),
+        max_context_chars=max_context_chars,
+    )
+
+
 def _extract_final_text(messages: List[object]) -> str:
     """
     The Agent SDK yields a stream of message objects; in examples, the final response is available on `.result`.
@@ -234,18 +272,10 @@ async def _run_claude_agent_sdk_once(*, prompt: str, model: Optional[str], cwd: 
     return _extract_final_text(messages).strip()
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Generate meta-model improvement ideas via Claude Code.")
-    parser.add_argument("--count", "-n", type=int, default=1, help="Number of ideas to generate (one Claude call per idea).")
-    parser.add_argument("--model", type=str, default=None, help="Claude model name (optional).")
-    parser.add_argument("--max-context-chars", type=int, default=200_000, help="Hard cap on prompt size sent to Claude Code.")
-    args = parser.parse_args(argv)
-
-    if args.count <= 0:
-        raise ValueError("--count must be positive.")
-
+def main() -> int:
     repo_root = _resolve_repo_root(Path(__file__).resolve())
     agentic_root = repo_root / "agentic_experimentation"
+    cfg = _load_config(Path(__file__).with_name("config.json"))
 
     # Load .env from agentic_experimentation and repo root (if present).
     _load_env_files([agentic_root / ".env", repo_root / ".env"])
@@ -268,7 +298,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     created: List[Path] = []
     next_num = _next_idea_number(ideas_dir, completed_dir)
 
-    for _ in range(args.count):
+    for _ in range(cfg.count):
         # Re-scan each loop so the newly written idea becomes context for the next call.
         prior_idea_files = _collect_idea_files(ideas_dir, completed_dir)
 
@@ -277,11 +307,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             meta_model_guide=meta_model_guide,
             driver_code=driver_code,
             idea_files=prior_idea_files,
-            max_context_chars=int(args.max_context_chars),
+            max_context_chars=int(cfg.max_context_chars),
         )
 
         idea_md = asyncio.run(
-            _run_claude_agent_sdk_once(prompt=prompt, model=args.model, cwd=repo_root)
+            _run_claude_agent_sdk_once(prompt=prompt, model=cfg.model, cwd=repo_root)
         )
         _validate_idea_output(idea_md)
 
