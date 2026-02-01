@@ -69,3 +69,33 @@ config_id,metric
     assert result["delta"] == 1.0
     assert result["score"] == 1.0
 
+
+def test_compute_score_filters_by_config_id_limit(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline.csv"
+    candidate = tmp_path / "candidate.csv"
+    _write_csv(
+        baseline,
+        """
+config_id,metric
+0,0
+1,10
+2,20
+""",
+    )
+    _write_csv(
+        candidate,
+        """
+config_id,metric
+0,1
+1,11
+2,999
+""",
+    )
+
+    # Only compare config_id 0..1
+    result = compute_score(baseline, candidate, score_column="metric", higher_is_better=True, config_id_limit=2)
+    assert result["baseline_rows_used"] == 2
+    assert result["candidate_rows_used"] == 2
+    assert result["baseline_mean"] == 5.0
+    assert result["candidate_mean"] == 6.0
+    assert result["delta"] == 1.0

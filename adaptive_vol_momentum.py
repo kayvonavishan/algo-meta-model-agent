@@ -110,6 +110,12 @@ def parse_args():
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--results-csv", default=None)
     parser.add_argument("--per-symbol-outer-trial-cap", type=int, default=None)
+    parser.add_argument(
+        "--sweep-config-limit",
+        type=int,
+        default=None,
+        help="If set, only run the first N config_id rows from the standard 100-config grid (deterministic).",
+    )
     return parser.parse_args()
 
 
@@ -170,12 +176,21 @@ def main():
     if not out_path:
         out_path = os.path.join(run_dir, "meta_config_sweep_results.csv")
 
+    env_limit = os.environ.get("AGENTIC_SWEEP_CONFIG_LIMIT")
+    sweep_config_limit = args.sweep_config_limit
+    if sweep_config_limit is None and env_limit:
+        try:
+            sweep_config_limit = int(env_limit)
+        except ValueError:
+            sweep_config_limit = None
+
     run_config_sweep(
         aligned_returns,
         long_df,
         cfg,
         out_path,
         n_configs=100,
+        config_limit=sweep_config_limit,
         seed=42,
         warmup_periods=20,
         oos_start_date="2024-11-09",

@@ -23,5 +23,9 @@ Quick start
 Notes
 - Worktrees keep your main repo clean; each iteration runs in its own temp worktree.
 - `adaptive_vol_momentum.py` is used as the sweep entry point in the sample config.
+- To speed up sweeps deterministically, run only the first N configs from the standard 100-config grid:
+  - Standalone: `python adaptive_vol_momentum.py --sweep-config-limit 25`
+  - Agent runners: set `sweep_config_limit` in `agentic_experimentation/agent_config.json` (or pass `--sweep-config-limit 25`).
+  - Scoring automatically compares baseline vs candidate on `config_id < N` when this is set.
 - The scoring hook is intentionally minimal; update `scoring_hooks.py` once you decide on the metric.
 - Idea generation is file-driven only; the LLM is used for planning/review and to drive Codex MCP edits.

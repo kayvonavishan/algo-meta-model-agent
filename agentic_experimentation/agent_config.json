@@ -15,6 +15,7 @@
   "test_cwd": ".",
   "test_pattern": "tests/test_smoke_invariants.py tests/test_statistical_sanity.py",
   "max_review_rounds": 2,
+  "sweep_config_limit": null,
   "proceed_on_max_review_rounds": true,
   "prompts": {
     "planner": "agentic_experimentation\\prompts\\planner\\planner_prompt.txt",

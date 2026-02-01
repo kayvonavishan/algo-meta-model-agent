@@ -113,6 +113,7 @@ def run_config_sweep(
     base_cfg: MetaConfig,
     out_path: str,
     n_configs: int = 100,
+    config_limit: Optional[int] = None,
     seed: int = 42,
     warmup_periods: int = 20,
     oos_start_date: Optional[Union[str, pd.Timestamp]] = None,
@@ -122,6 +123,11 @@ def run_config_sweep(
     if scorecard_every is None and hasattr(base_cfg, "scorecard_every"):
         scorecard_every = base_cfg.scorecard_every
     configs = build_config_grid_v1(n_configs=n_configs, seed=seed)
+    if config_limit is not None:
+        limit = int(config_limit)
+        if limit < 0:
+            raise ValueError(f"config_limit must be >= 0 (got {config_limit})")
+        configs = configs[:limit]
     images_dir = os.path.join(os.path.dirname(out_path), "avg_trade_return_plots")
     selections_dir = os.path.join(os.path.dirname(out_path), "selections")
     os.makedirs(images_dir, exist_ok=True)

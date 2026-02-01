@@ -3,12 +3,26 @@ import math
 from statistics import mean
 
 
-def compute_score(baseline_csv, candidate_csv, score_column, higher_is_better=True):
+def compute_score(baseline_csv, candidate_csv, score_column, higher_is_better=True, config_id_limit=None):
     baseline_data = _load_csv(baseline_csv)
     candidate_data = _load_csv(candidate_csv)
 
-    baseline_means = _numeric_means(baseline_data["rows"], baseline_data["columns"])
-    candidate_means = _numeric_means(candidate_data["rows"], candidate_data["columns"])
+    baseline_rows = baseline_data["rows"]
+    candidate_rows = candidate_data["rows"]
+    applied_limit = None
+    if config_id_limit is not None:
+        try:
+            applied_limit = int(config_id_limit)
+        except (TypeError, ValueError):
+            applied_limit = None
+    if applied_limit is not None:
+        if applied_limit < 0:
+            raise ValueError(f"config_id_limit must be >= 0 (got {config_id_limit})")
+        baseline_rows = _filter_rows_by_config_id_limit(baseline_rows, baseline_data["columns"], applied_limit)
+        candidate_rows = _filter_rows_by_config_id_limit(candidate_rows, candidate_data["columns"], applied_limit)
+
+    baseline_means = _numeric_means(baseline_rows, baseline_data["columns"])
+    candidate_means = _numeric_means(candidate_rows, candidate_data["columns"])
 
     common_cols = sorted(set(baseline_means.keys()) & set(candidate_means.keys()))
     column_deltas = {
@@ -57,6 +71,9 @@ def compute_score(baseline_csv, candidate_csv, score_column, higher_is_better=Tr
         "baseline_mean": base_mean,
         "candidate_mean": cand_mean,
         "delta": delta,
+        "config_id_limit": applied_limit,
+        "baseline_rows_used": len(baseline_rows),
+        "candidate_rows_used": len(candidate_rows),
         "n_numeric_columns_compared": len(common_cols),
         "column_deltas": column_deltas,
         "top_positive_deltas": top_positive,
@@ -102,3 +119,35 @@ def _numeric_means(rows, columns):
         if vals:
             means[col] = mean(vals)
     return means
+
+
+def _filter_rows_by_config_id_limit(rows, columns, limit):
+    """
+    Keep only rows whose `config_id` is < limit.
+    Falls back to taking the first N rows if `config_id` is missing or non-parseable.
+    """
+    if limit is None:
+        return rows
+    try:
+        idx = columns.index("config_id")
+    except ValueError:
+        return rows[:limit]
+
+    kept = []
+    for row in rows:
+        if idx >= len(row):
+            continue
+        raw = (row[idx] or "").strip()
+        if not raw:
+            continue
+        try:
+            cid = int(raw)
+        except ValueError:
+            try:
+                cid = int(float(raw))
+            except ValueError:
+                continue
+        if cid < limit:
+            kept.append(row)
+    # If parsing failed and we kept nothing, fall back to deterministic "first N rows".
+    return kept if kept else rows[:limit]

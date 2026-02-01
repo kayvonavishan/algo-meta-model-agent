@@ -20,6 +20,8 @@ def main():
     args = _parse_args()
     config_path = Path(args.config).resolve()
     config = _load_json(config_path)
+    if getattr(args, "sweep_config_limit", None) is not None:
+        config["sweep_config_limit"] = args.sweep_config_limit
 
     # Load .env files (config directory first, then repo root)
     _load_env_files([config_path.parent / ".env"])
@@ -116,6 +118,7 @@ def main():
                     candidate_csv,
                     score_cfg.get("score_column"),
                     score_cfg.get("higher_is_better", True),
+                    config.get("sweep_config_limit"),
                 )
 
             summary = {
@@ -126,6 +129,7 @@ def main():
                 "sweep_exit_code": sweep_code,
                 "results_csv": str(candidate_csv) if candidate_csv.exists() else None,
                 "score": score_result,
+                "sweep_config_limit": config.get("sweep_config_limit"),
             }
             _write_json(exp_dir / "summary.json", summary)
             print(f"Finished iteration {i + 1}/{iterations}: {run_id}")
@@ -154,6 +158,12 @@ def _parse_args():
     parser.add_argument("--refresh-baseline", action="store_true")
     parser.add_argument("--dry-run-llm", action="store_true")
     parser.add_argument("--keep-worktrees", action="store_true")
+    parser.add_argument(
+        "--sweep-config-limit",
+        type=int,
+        default=None,
+        help="If set, only evaluate config_id < N for the sweep and scoring (deterministic subset).",
+    )
     return parser.parse_args()
 
 
@@ -175,6 +185,9 @@ def _run_sweep(config, config_path, worktree_path, log_path, env_extra=None):
     sweep_cwd = sweep_cwd_path
     with open(log_path, "w", encoding="utf-8") as f:
         env = os.environ.copy()
+        sweep_limit = config.get("sweep_config_limit")
+        if sweep_limit is not None and str(sweep_limit).strip():
+            env["AGENTIC_SWEEP_CONFIG_LIMIT"] = str(sweep_limit).strip()
         if env_extra:
             env.update(env_extra)
         if isinstance(sweep_command, list):
