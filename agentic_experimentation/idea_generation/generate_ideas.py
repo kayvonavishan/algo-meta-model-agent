@@ -4,7 +4,9 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
@@ -20,6 +22,33 @@ def _read_text(path: Path) -> str:
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8", errors="replace")
+
+
+def _now_tag() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def _write_debug_log(*, resolved_cli_path: str, cwd: Path, model: Optional[str], prompt_len: int, stderr_lines: List[str], exc: Exception) -> Path:
+    log_dir = Path(__file__).resolve().parent / ".idea_generation_logs"
+    log_path = log_dir / f"claude_debug_{_now_tag()}.log"
+    body = "\n".join(
+        [
+            "Claude Agent SDK debug log",
+            f"time: {_now_tag()}",
+            f"cli_path: {resolved_cli_path}",
+            f"cwd: {cwd}",
+            f"model: {model!r}",
+            f"prompt_len: {prompt_len}",
+            "",
+            f"exception: {type(exc).__name__}: {exc}",
+            "",
+            "stderr (captured):",
+            *(stderr_lines if stderr_lines else ["<empty>"]),
+            "",
+        ]
+    )
+    _write_text(log_path, body)
+    return log_path
 
 
 def _load_env_files(paths: Iterable[Path]) -> None:
@@ -52,13 +81,13 @@ def _collect_idea_files(ideas_dir: Path, completed_dir: Path) -> List[Path]:
 
     if ideas_dir.exists():
         for p in ideas_dir.glob("*.md"):
-            if _IDEA_FILE_RE.match(p.name):
-                paths.append(p)
+            # Include all idea markdowns in ideas/ (tested or not), even if they don't follow
+            # the ddd_name.md naming convention yet.
+            paths.append(p)
 
     if completed_dir.exists():
         for p in completed_dir.glob("*.md"):
-            if _IDEA_FILE_RE.match(p.name):
-                paths.append(p)
+            paths.append(p)
 
     def _sort_key(p: Path) -> Tuple[int, str]:
         m = _IDEA_FILE_RE.match(p.name)
@@ -66,7 +95,9 @@ def _collect_idea_files(ideas_dir: Path, completed_dir: Path) -> List[Path]:
             return (10**9, p.name.lower())
         return (int(m.group("num")), p.name.lower())
 
-    return sorted(paths, key=_sort_key)
+    # De-dupe (in case a file is reachable via both dirs in weird setups).
+    uniq = sorted(set(paths), key=_sort_key)
+    return uniq
 
 
 def _next_idea_number(ideas_dir: Path, completed_dir: Path) -> int:
@@ -189,6 +220,7 @@ class IdeaGenConfig:
     count: int
     model: Optional[str]
     max_context_chars: int
+    cli_path: Optional[str]
 
 
 def _load_config(config_path: Path) -> IdeaGenConfig:
@@ -207,6 +239,7 @@ def _load_config(config_path: Path) -> IdeaGenConfig:
     count = raw.get("count", 1)
     model = raw.get("model", None)
     max_context_chars = raw.get("max_context_chars", 200_000)
+    cli_path = raw.get("cli_path", None)
 
     if not isinstance(count, int) or count <= 0:
         raise ValueError("config.count must be a positive integer.")
@@ -214,11 +247,19 @@ def _load_config(config_path: Path) -> IdeaGenConfig:
         raise ValueError("config.model must be a non-empty string or null.")
     if not isinstance(max_context_chars, int) or max_context_chars <= 0:
         raise ValueError("config.max_context_chars must be a positive integer.")
+    if cli_path is not None and (not isinstance(cli_path, str) or not cli_path.strip()):
+        raise ValueError("config.cli_path must be a non-empty string or null.")
+    if isinstance(cli_path, str) and Path(cli_path).suffix.lower() in (".cmd", ".bat", ".ps1"):
+        raise ValueError(
+            "config.cli_path must point to an executable (e.g., claude.exe), not a shell script (.cmd/.bat/.ps1). "
+            "Set it to null to use the SDK-bundled claude.exe copy."
+        )
 
     return IdeaGenConfig(
         count=count,
         model=(model.strip() if isinstance(model, str) else None),
         max_context_chars=max_context_chars,
+        cli_path=(cli_path.strip() if isinstance(cli_path, str) else None),
     )
 
 
@@ -246,7 +287,13 @@ def _extract_final_text(messages: List[object]) -> str:
     return ""
 
 
-async def _run_claude_agent_sdk_once(*, prompt: str, model: Optional[str], cwd: Path) -> str:
+async def _run_claude_agent_sdk_once(
+    *,
+    prompt: str,
+    model: Optional[str],
+    cwd: Path,
+    cli_path: Optional[str],
+) -> str:
     try:
         from claude_agent_sdk import ClaudeAgentOptions, query  # type: ignore
     except Exception as exc:  # noqa: BLE001
@@ -254,20 +301,89 @@ async def _run_claude_agent_sdk_once(*, prompt: str, model: Optional[str], cwd: 
             "Claude Agent SDK is not installed. Install it with: pip install claude-agent-sdk"
         ) from exc
 
+    def _is_shell_script(p: str) -> bool:
+        return Path(p).suffix.lower() in (".cmd", ".bat", ".ps1")
+
+    def _maybe_copy_bundled_cli() -> str:
+        """
+        The SDK can bundle `claude.exe`, but its path may exceed Windows CreateProcess limits.
+        Copy it into this repo (short path) and use that copy.
+        """
+        import platform
+        import claude_agent_sdk  # type: ignore
+
+        cli_name = "claude.exe" if platform.system() == "Windows" else "claude"
+        bundled = (Path(claude_agent_sdk.__file__).resolve().parent / "_bundled" / cli_name)
+        if not bundled.exists():
+            raise RuntimeError(f"Claude Agent SDK bundled CLI not found at: {bundled}")
+
+        dest_dir = Path(__file__).resolve().parent / ".claude_bin"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / cli_name
+
+        # If we already copied it once, reuse it. (The bundled path can be locked by an in-flight process on Windows.)
+        if dest.exists() and dest.is_file():
+            return str(dest)
+
+        # Best-effort copy. Avoid shutil.copy2 -> CopyFile2, which can fail on Windows if the file is in use.
+        with open(bundled, "rb") as src, open(dest, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+
+        return str(dest)
+
+    resolved_cli_path = cli_path
+    if resolved_cli_path is None:
+        # Prefer a real executable. On Windows, `shutil.which("claude")` often returns `claude.cmd`,
+        # which cannot be launched by CreateProcess (and the SDK transport uses CreateProcess).
+        resolved_cli_path = shutil.which("claude.exe") or shutil.which("claude")
+        if resolved_cli_path and _is_shell_script(resolved_cli_path):
+            resolved_cli_path = None
+
+    if resolved_cli_path is None:
+        resolved_cli_path = _maybe_copy_bundled_cli()
+
+    stderr_lines: List[str] = []
+
+    def _on_stderr(line: str) -> None:
+        if line:
+            stderr_lines.append(line.rstrip())
+
     options = ClaudeAgentOptions(
         model=model,
         cwd=str(cwd),
         max_turns=1,
+        cli_path=resolved_cli_path,
+        stderr=_on_stderr,
         # For this use-case, we want pure text generation (no filesystem/shell/web tools).
         tools=[],
         allowed_tools=[],
-        # Mirror CLI behavior: plain text output.
-        extra_args={"output-format": "text"},
+        # Ensure we never block on interactive permission prompts.
+        permission_mode="bypassPermissions",
+        # Force CLI debug logs to stderr so we can capture root-cause when it exits early.
+        extra_args={"debug-to-stderr": None},
     )
 
+    async def _prompt_stream():
+        # Use streaming mode so the prompt is sent over stdin (avoids Windows command-line length limits).
+        yield {"type": "user", "message": {"role": "user", "content": prompt}}
+
     messages: List[object] = []
-    async for message in query(prompt=prompt, options=options):
-        messages.append(message)
+    try:
+        async for message in query(prompt=_prompt_stream(), options=options):
+            messages.append(message)
+    except Exception as exc:  # noqa: BLE001
+        log_path = _write_debug_log(
+            resolved_cli_path=resolved_cli_path,
+            cwd=cwd,
+            model=model,
+            prompt_len=len(prompt),
+            stderr_lines=stderr_lines,
+            exc=exc,
+        )
+        raise RuntimeError(
+            "Claude Agent SDK run failed. "
+            f"Debug log saved to: {log_path}"
+        ) from exc
 
     return _extract_final_text(messages).strip()
 
@@ -276,6 +392,7 @@ def main() -> int:
     repo_root = _resolve_repo_root(Path(__file__).resolve())
     agentic_root = repo_root / "agentic_experimentation"
     cfg = _load_config(Path(__file__).with_name("config.json"))
+    run_cwd = Path(__file__).resolve().parent
 
     # Load .env from agentic_experimentation and repo root (if present).
     _load_env_files([agentic_root / ".env", repo_root / ".env"])
@@ -310,9 +427,28 @@ def main() -> int:
             max_context_chars=int(cfg.max_context_chars),
         )
 
-        idea_md = asyncio.run(
-            _run_claude_agent_sdk_once(prompt=prompt, model=cfg.model, cwd=repo_root)
-        )
+        try:
+            idea_md = asyncio.run(
+                _run_claude_agent_sdk_once(
+                    prompt=prompt,
+                    model=cfg.model,
+                    cwd=run_cwd,
+                    cli_path=cfg.cli_path,
+                )
+            )
+        except RuntimeError:
+            # Common failure mode: unsupported/invalid model string for Claude Code.
+            # If a model was specified, retry once with default model to reduce friction.
+            if cfg.model is None:
+                raise
+            idea_md = asyncio.run(
+                _run_claude_agent_sdk_once(
+                    prompt=prompt,
+                    model=None,
+                    cwd=run_cwd,
+                    cli_path=cfg.cli_path,
+                )
+            )
         _validate_idea_output(idea_md)
 
         title = _parse_idea_title(idea_md)

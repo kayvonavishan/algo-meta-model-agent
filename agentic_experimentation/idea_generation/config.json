@@ -1,6 +1,6 @@
 {
   "count": 1,
-  "model": "claude-4-5-opus",
-  "max_context_chars": 200000
+  "model": "claude-opus-4-5",
+  "max_context_chars": 200000,
+  "cli_path": null
 }
-
