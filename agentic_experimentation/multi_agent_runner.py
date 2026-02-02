@@ -61,6 +61,92 @@ def _truncate_for_phoenix(text: str) -> str:
     return s[:max_chars] + "\n... [truncated]\n"
 
 
+def _read_jsonl_objects(path):  # noqa: ANN001
+    items = []
+    if not path:
+        return items
+    p = Path(path)
+    if not p.exists():
+        return items
+    try:
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = (line or "").strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except Exception:  # pylint: disable=broad-except
+                continue
+            if isinstance(obj, dict):
+                items.append(obj)
+    except Exception:  # pylint: disable=broad-except
+        return items
+    return items
+
+
+def _normalize_round_idx(val):  # noqa: ANN001
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    s = str(val).strip()
+    if s == "":
+        return None
+    try:
+        return int(s)
+    except Exception:
+        return s
+
+
+def _write_codex_run_details(*, exp_dir, run_id, round_idx, backend, worktree_path):  # noqa: ANN001
+    exp_dir = Path(exp_dir)
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    out_path = exp_dir / f"codex_run_details_round_{round_idx}.json"
+
+    details = {
+        "run_id": str(run_id),
+        "round_idx": round_idx,
+        "backend": str(backend),
+        "worktree_path": str(worktree_path),
+        "coder_prompt_path": str(exp_dir / f"coder_prompt_round_{round_idx}.txt"),
+        "coder_output_path": str(exp_dir / f"coder_output_round_{round_idx}.txt"),
+        "diff_path": str(exp_dir / f"diff_round_{round_idx}.diff"),
+        "codex_mcp_transcript_path": str(exp_dir / "codex_mcp_transcript.jsonl"),
+        "codex_cli_events_path": str(exp_dir / f"codex_cli_events_round_{round_idx}.jsonl"),
+        "codex_cli_stderr_path": str(exp_dir / f"codex_cli_stderr_round_{round_idx}.log"),
+        "codex_cli_cmd_path": str(exp_dir / f"codex_cli_cmd_round_{round_idx}.txt"),
+        "codex_cli_last_message_path": str(exp_dir / f"codex_cli_last_message_round_{round_idx}.txt"),
+        "codex_session_id_path": str(exp_dir / "codex_session_id.txt"),
+    }
+
+    # Best-effort: include transcript events for this run/round for quick inspection.
+    events = []
+    mcp_path = exp_dir / "codex_mcp_transcript.jsonl"
+    if mcp_path.exists():
+        for obj in _read_jsonl_objects(mcp_path):
+            if str(obj.get("run_id") or "") != str(run_id):
+                continue
+            if str(obj.get("step") or "") != "coder":
+                continue
+            if _normalize_round_idx(obj.get("round_idx")) != _normalize_round_idx(round_idx):
+                continue
+            events.append(obj)
+    details["codex_mcp_events"] = events
+
+    cli_events = []
+    cli_path = exp_dir / f"codex_cli_events_round_{round_idx}.jsonl"
+    if cli_path.exists():
+        cli_events = _read_jsonl_objects(cli_path)
+    details["codex_cli_events"] = cli_events
+
+    try:
+        _write_json(out_path, details)
+        preview = _truncate_for_phoenix(json.dumps(details, ensure_ascii=False))
+        return str(out_path), preview
+    except Exception:  # pylint: disable=broad-except
+        return None, None
+
+
 def _summarize_agents_run_result(result):  # noqa: ANN001
     raw_responses = []
     response_ids = []
@@ -836,6 +922,26 @@ async def _main_async():
                                     {"codex_session_id": str(codex_session_id) if codex_session_id else None},
                                 )
                                 phoenix_obs.set_io(codex_span, output_text=coder_output)
+
+                            codex_details_path, codex_details_preview = _write_codex_run_details(
+                                exp_dir=exp_dir,
+                                run_id=run_id,
+                                round_idx=round_idx,
+                                backend=coder_backend,
+                                worktree_path=worktree_path,
+                            )
+                            if phoenix_obs is not None and codex_span is not None and codex_details_path:
+                                try:
+                                    phoenix_obs.set_attrs(
+                                        codex_span,
+                                        {
+                                            "codex.run_details_path": codex_details_path,
+                                        },
+                                    )
+                                    if codex_details_preview:
+                                        phoenix_obs.set_text(codex_span, "codex.run_details_json", codex_details_preview)
+                                except Exception:  # pylint: disable=broad-except
+                                    pass
                 _write_text(exp_dir / f"coder_output_round_{round_idx}.txt", coder_output)
 
                 diff_text = _git_diff_with_untracked(worktree_path)
