@@ -129,6 +129,15 @@ def init_phoenix_tracing(*, project_name: Optional[str] = None, endpoint: Option
         # Optional dependency or incompatible versions; keep manual spans working.
         pass
 
+    # Best-effort: instrument OpenAI Python SDK (useful if anything calls `openai` directly or if the
+    # Agents SDK delegates to the OpenAI client in a way that can be intercepted).
+    try:
+        from openinference.instrumentation.openai import OpenAIInstrumentor  # type: ignore
+
+        OpenAIInstrumentor().instrument(tracer_provider=_TRACER_PROVIDER)
+    except Exception:
+        pass
+
     return _TRACER
 
 
@@ -136,6 +145,21 @@ def get_tracer() -> Tracer:
     if _TRACER is None:
         return init_phoenix_tracing()
     return _TRACER
+
+
+def force_flush(timeout_ms: int = 10000) -> None:
+    """
+    Best-effort flush for OTEL exporters. Useful for short-lived scripts so traces show up before exit.
+    """
+    provider = _TRACER_PROVIDER
+    if provider is None:
+        return
+    try:
+        flush = getattr(provider, "force_flush", None)
+        if callable(flush):
+            flush(timeout_millis=int(timeout_ms))
+    except Exception:
+        return
 
 
 def phoenix_log_content_enabled(default: bool = True) -> bool:

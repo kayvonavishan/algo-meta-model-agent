@@ -157,8 +157,12 @@ def _summarize_agents_run_result(result):  # noqa: ANN001
         raw_responses.append(
             {
                 "response_id": rid,
+                # Keep a convenient subset for quick scanning...
                 "usage": _to_jsonable(getattr(mr, "usage", None)),
                 "output": _to_jsonable(getattr(mr, "output", None)),
+                # ...but also persist the full model response object so we don't lose
+                # any provider-specific fields (e.g., reasoning metadata, safety, etc.).
+                "raw_response": _to_jsonable(mr),
             }
         )
 
@@ -1275,6 +1279,11 @@ async def _main_async():
             if worktree_path is not None and (not config.get("keep_worktrees", False)) and (not args.keep_worktrees):
                 remove_worktree(repo_root, worktree_path)
             run_stack.__exit__(*exc_info)
+            if phoenix_obs is not None:
+                try:
+                    phoenix_obs.force_flush()
+                except Exception:  # pylint: disable=broad-except
+                    pass
 
 
 def _parse_args():
@@ -1431,6 +1440,9 @@ async def _agents_sdk_generate_text(agent_cfg, *, system_prompt, user_prompt, ma
                     "step": step,
                     "round_idx": round_idx,
                     "model": model,
+                    "provided_system_prompt": system_prompt,
+                    "provided_user_prompt": user_prompt,
+                    "agent_cfg": _to_jsonable(agent_cfg),
                 }
             )
             suffix = ""

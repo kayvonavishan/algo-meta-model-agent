@@ -550,6 +550,11 @@ def main() -> int:
 
     for p in created:
         print(str(p))
+    if phoenix_obs is not None:
+        try:
+            phoenix_obs.force_flush()
+        except Exception:  # noqa: BLE001
+            pass
     return 0
 
 
