@@ -40,6 +40,58 @@ _TRACE_PROCESSOR_REGISTERED = False
 
 
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+@dataclasses.dataclass
+class _AgentsSDKCallResult:
+    text: str
+    run_details_path: str | None = None
+    run_details_preview: str | None = None
+    response_ids: list[str] | None = None
+
+
+def _truncate_for_phoenix(text: str) -> str:
+    try:
+        max_chars = int(os.getenv("PHOENIX_MAX_TEXT_CHARS", "200000"))
+    except Exception:
+        max_chars = 200000
+    s = str(text or "")
+    if max_chars <= 0 or len(s) <= max_chars:
+        return s
+    return s[:max_chars] + "\n... [truncated]\n"
+
+
+def _summarize_agents_run_result(result):  # noqa: ANN001
+    raw_responses = []
+    response_ids = []
+    for mr in (getattr(result, "raw_responses", None) or []):
+        rid = getattr(mr, "response_id", None)
+        if rid:
+            response_ids.append(str(rid))
+        raw_responses.append(
+            {
+                "response_id": rid,
+                "usage": _to_jsonable(getattr(mr, "usage", None)),
+                "output": _to_jsonable(getattr(mr, "output", None)),
+            }
+        )
+
+    new_items_summary = []
+    for item in (getattr(result, "new_items", None) or []):
+        new_items_summary.append(
+            {
+                "item_type": type(item).__name__,
+                "raw_item": _to_jsonable(getattr(item, "raw_item", None)),
+            }
+        )
+
+    return {
+        "input": _to_jsonable(getattr(result, "input", None)),
+        "final_output": _to_jsonable(getattr(result, "final_output", None)),
+        "raw_responses": raw_responses,
+        "new_items": new_items_summary,
+        "response_ids": response_ids,
+    }, response_ids
 _AGENTIC_OUTPUT_TS_RE = re.compile(r"^(?P<base>.+)_(\d{8})_(\d{6})(_\d{3,6})?$")
 
 
@@ -658,20 +710,35 @@ async def _main_async():
                     phoenix_obs.set_text(planner_span, "system_prompt", planner_system or "")
                     phoenix_obs.set_io(planner_span, input_text=planner_prompt)
 
+                plan_call = None
                 if args.dry_run_llm:
                     plan_text = "PLAN:\n1. (dry-run) No-op.\nRISKS:\n- dry-run\n"
                 else:
                     _ensure_trace_processor_registered()
                     with _tracing_scope(exp_dir=exp_dir, run_id=run_id, step="planner"):
-                        plan_text = await _agents_sdk_generate_text(
+                        plan_call = await _agents_sdk_generate_text(
                             config.get("agents", {}).get("planner", {}),
                             system_prompt=planner_system,
                             user_prompt=planner_prompt,
                             max_turns=max_turns,
                         )
+                        plan_text = plan_call.text
 
                 if phoenix_obs is not None and planner_span is not None:
                     phoenix_obs.set_io(planner_span, output_text=plan_text)
+                    if plan_call is not None:
+                        try:
+                            phoenix_obs.set_attrs(
+                                planner_span,
+                                {
+                                    "agents.run_details_path": plan_call.run_details_path,
+                                    "agents.response_ids": ",".join(plan_call.response_ids or []),
+                                },
+                            )
+                            if plan_call.run_details_preview:
+                                phoenix_obs.set_text(planner_span, "agents.run_details_json", plan_call.run_details_preview)
+                        except Exception:  # pylint: disable=broad-except
+                            pass
             _write_text(exp_dir / "plan.md", plan_text)
 
             # Coder <-> Reviewer repair loop (in-place edits in the same worktree via Codex MCP)
@@ -855,20 +922,39 @@ async def _main_async():
                         phoenix_obs.set_text(reviewer_span, "system_prompt", reviewer_system or "")
                         phoenix_obs.set_io(reviewer_span, input_text=review_prompt)
 
+                    review_call = None
                     if args.dry_run_llm:
                         review_text = "VERDICT: REJECT\nISSUES:\n- dry-run\nNOTES:\n- dry-run\n"
                     else:
                         _ensure_trace_processor_registered()
                         with _tracing_scope(exp_dir=exp_dir, run_id=run_id, step="reviewer", round_idx=round_idx):
-                            review_text = await _agents_sdk_generate_text(
+                            review_call = await _agents_sdk_generate_text(
                                 config.get("agents", {}).get("reviewer", {}),
                                 system_prompt=reviewer_system,
                                 user_prompt=review_prompt,
                                 max_turns=max_turns,
                             )
+                            review_text = review_call.text
 
                     if phoenix_obs is not None and reviewer_span is not None:
                         phoenix_obs.set_io(reviewer_span, output_text=review_text)
+                        if review_call is not None:
+                            try:
+                                phoenix_obs.set_attrs(
+                                    reviewer_span,
+                                    {
+                                        "agents.run_details_path": review_call.run_details_path,
+                                        "agents.response_ids": ",".join(review_call.response_ids or []),
+                                    },
+                                )
+                                if review_call.run_details_preview:
+                                    phoenix_obs.set_text(
+                                        reviewer_span,
+                                        "agents.run_details_json",
+                                        review_call.run_details_preview,
+                                    )
+                            except Exception:  # pylint: disable=broad-except
+                                pass
                 _write_text(exp_dir / f"review_round_{round_idx}.md", review_text)
 
                 if run_span is not None:
@@ -1214,7 +1300,51 @@ async def _agents_sdk_generate_text(agent_cfg, *, system_prompt, user_prompt, ma
     model_settings = _build_model_settings(ModelSettings, agent_cfg or {}, model)
     agent = _create_agent(Agent, name="Text Agent", model=model, instructions=system_prompt, model_settings=model_settings)
     result = await Runner.run(agent, user_prompt, max_turns=max_turns, run_config=_build_run_config(RunConfig))
-    return (getattr(result, "final_output", None) or "").strip() + "\n"
+
+    text = (getattr(result, "final_output", None) or "").strip() + "\n"
+
+    ctx = _TRACE_CONTEXT.get() or {}
+    exp_dir_value = ctx.get("exp_dir") or os.environ.get("AGENTIC_TRACE_DIR")
+    step = ctx.get("step") or os.environ.get("AGENTIC_TRACE_STEP") or "unknown"
+    round_idx = ctx.get("round_idx")
+    if round_idx is None:
+        round_idx = os.environ.get("AGENTIC_TRACE_ROUND") or None
+
+    details_path = None
+    details_preview = None
+    response_ids = None
+
+    if exp_dir_value:
+        try:
+            exp_dir = Path(str(exp_dir_value))
+            exp_dir.mkdir(parents=True, exist_ok=True)
+            payload, response_ids = _summarize_agents_run_result(result)
+            payload.update(
+                {
+                    "run_id": ctx.get("run_id") or os.environ.get("AGENTIC_TRACE_RUN_ID"),
+                    "step": step,
+                    "round_idx": round_idx,
+                    "model": model,
+                }
+            )
+            suffix = ""
+            if round_idx is not None and str(round_idx) != "":
+                suffix = f"_round_{round_idx}"
+            details_path_obj = exp_dir / f"agents_run_details_{step}{suffix}.json"
+            _write_json(details_path_obj, payload)
+            details_path = str(details_path_obj)
+            details_preview = _truncate_for_phoenix(json.dumps(payload, ensure_ascii=False))
+        except Exception:  # pylint: disable=broad-except
+            details_path = None
+            details_preview = None
+            response_ids = None
+
+    return _AgentsSDKCallResult(
+        text=text,
+        run_details_path=details_path,
+        run_details_preview=details_preview,
+        response_ids=response_ids,
+    )
 
 
 def _codex_cli_edit_repo_sync(  # noqa: PLR0913
