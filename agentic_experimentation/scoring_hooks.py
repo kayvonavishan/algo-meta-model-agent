@@ -164,24 +164,17 @@ def _recommend_follow_up(column_deltas):
     """
     # (column, direction, weight)
     # direction: "higher" means higher is better; "lower" means lower is better.
+    primary_metric = "core_topN_sharpe"
     metrics = [
-        ("mean_topN_avg_return_per_trade_pct_oos", "higher", 3.0),
-        ("core_topN_cagr", "higher", 2.0),
+        # Primary metric (used for primary_ok gating).
         ("core_topN_sharpe", "higher", 1.5),
-        ("core_topN_sortino", "higher", 1.5),
-        ("core_topN_calmar", "higher", 1.5),
-        ("rel_equity_ratio_end", "higher", 1.5),
-        ("rel_equity_ratio_cagr", "higher", 1.0),
-        ("rel_pct_outperform", "higher", 1.0),
-        ("rel_pct_underperform", "lower", 1.0),
-        ("core_topN_volatility", "lower", 0.75),
-        # These are usually negative; "higher" means less negative tail/drawdown.
+        # Supporting return metrics.
+        ("mean_topN_avg_return_per_trade_pct_oos", "higher", 1.0),
+        ("mean_topN_avg_return_per_trade_pct", "higher", 1.0),
+        ("core_topN_sortino", "higher", 1.0),
+        ("core_topN_calmar", "higher", 1.0),
+        # Risk (these are usually negative; "higher" means less negative).
         ("core_topN_max_drawdown", "higher", 1.0),
-        ("core_topN_cvar_05", "higher", 0.75),
-        # Significance (optional; can be noisy in this framework)
-        ("sig_t_stat", "higher", 0.5),
-        ("sig_t_p_value", "lower", 0.5),
-        ("sig_bootstrap_prob_mean_gt0", "higher", 0.5),
     ]
 
     eps = 1e-12
@@ -238,7 +231,6 @@ def _recommend_follow_up(column_deltas):
     risk_regressions = []
     for col, max_rel_drop in [
         ("core_topN_max_drawdown", 0.10),
-        ("core_topN_cvar_05", 0.10),
     ]:
         m = per_metric.get(col)
         if not m:
@@ -251,7 +243,7 @@ def _recommend_follow_up(column_deltas):
             risk_regressions.append(col)
 
     # Primary metric must not be meaningfully worse.
-    primary = per_metric.get("mean_topN_avg_return_per_trade_pct_oos")
+    primary = per_metric.get(primary_metric)
     primary_ok = True
     if primary:
         base = abs(primary["baseline_mean"])
@@ -287,6 +279,7 @@ def _recommend_follow_up(column_deltas):
         "should_explore": bool(should_explore),
         "grade": grade,
         "score": score_norm,
+        "primary_metric": primary_metric,
         "positive_signals": positive_signals,
         "negative_signals": negative_signals,
         "metrics_used": per_metric,

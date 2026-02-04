@@ -10,7 +10,7 @@ This is built on top of the existing multi-agent loop in `agentic_experimentatio
 
 - **Node**: a meta-model code state (git commit) + a baseline sweep CSV for that state.
 - **Expansion**: generate `K = --ideas-per-node` ideas for each node in the current frontier, then evaluate them.
-- **Gate** (parent-relative): a candidate can be promoted only if it does **not regress** the primary metric and is recommended to explore (or is `grade=="mixed"` with no primary regression).
+- **Gate** (parent-relative): a candidate can be promoted only if it does **not regress** the primary metric (`core_topN_sharpe`) and is recommended to explore (or is `grade=="mixed"` with no primary regression).
 - **Rank** (root-relative): promoted candidates are ranked globally using root-relative scoring, then the **top `B = --beam-width`** become the next frontier (global beam search).
 - **Depth**: repeat until `--max-depth` or other stop conditions.
 
@@ -122,6 +122,80 @@ Inside `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/`:
 
 ---
 
+## Logs and Traces (Where To Debug)
+
+There is no single "app.log" for `tree_runner.py`. Instead, debugging information is spread across a few locations.
+
+### 1) Tree-run level state + reports
+
+Check these first to understand what the tree thinks happened:
+
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/manifest.json`: full state, eval records, promotions, errors, and events
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/TREE_SUMMARY.md`: high-level status + best path
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/VALIDATION_REPORT.md`: integrity checks (missing paths, sha256 mismatches, frontier/expanded consistency, etc.)
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/run.lock.json`: lock + heartbeat metadata (useful if you hit a stale/active lock error)
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/tree_runner.log`: append-only orchestration log for `tree_runner.py` itself
+
+Tip: `tree_runner.py` prints a small JSON summary to stdout at the end of each invocation. If you want a persistent record of that, capture stdout/stderr when you run it.
+
+### 2) Per-evaluation multi-agent logs (most useful)
+
+Each evaluated idea gets its own experiment folder at:
+
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/eval/<eval_id>/experiment/<eval_id>/`
+
+Common files to inspect:
+
+- `summary.json`: approved status, exit codes, result paths, scoring summary
+- `planner_prompt.txt`, `plan.md`
+- `review_round_*.md` (and optionally `_sanitized.md`, `_dropped_new_issues.txt`)
+- `tests.log` (if tests are enabled)
+- `sweep.log` (sweep stdout/stderr)
+- `meta_config_sweep_results.csv` (candidate sweep results copied into the experiment folder)
+
+Additionally, `tree_runner.py` tees the stdout/stderr of the multi-agent subprocess into:
+
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/eval/<eval_id>/multi_agent_runner.subprocess.log`
+
+If the coder backend uses Codex / MCP, also check:
+
+- `codex_mcp_transcript.jsonl`
+- `codex_cli_events_round_*.jsonl`, `codex_cli_stderr_round_*.log`, `codex_cli_cmd_round_*.txt`
+- `coder_prompt_round_*.txt`, `coder_output_round_*.txt`, `diff_round_*.diff`
+
+If Agents SDK tracing is enabled, a local JSONL trace is also written:
+
+- `agents_trace.jsonl`
+
+### 3) Idea generation logs (when ideas look low-quality or duplicated)
+
+The ideas generated for each node are stored under:
+
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/node_ideas/<node_id>/`
+
+If `tree_runner.py` had to generate missing ideas for a node, it also tees the stdout/stderr of the idea generation subprocess into:
+
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/node_ideas/<node_id>/generate_ideas.subprocess.log`
+
+If you want to inspect the raw prompt/context used during idea generation, check:
+
+- `agentic_experimentation/idea_generation/.idea_generation_logs/` (e.g. `prompt_*.txt`, `claude_debug_*.log`)
+
+### 4) Sweep output outside the tree run (optional)
+
+If `agent_config.json` sets `agentic_output_root`, sweeps may also write to an external per-run directory (in addition to what is copied into the tree run's `eval/...` folders). Use `summary.json` to locate the exact output path.
+
+### 5) Phoenix / Arize traces (external)
+
+If Phoenix tracing is enabled (via `PHOENIX_*` env vars and/or agent config), LLM/tool spans are emitted by:
+
+- `agentic_experimentation/multi_agent_runner.py` (planner/reviewer and tool steps; coder depends on backend)
+- `agentic_experimentation/idea_generation/generate_ideas.py` (idea generation calls)
+
+These traces appear in Phoenix/Arize, not as local log files.
+
+---
+
 ## Idea Management (Storage, Tracking, and Branch Membership)
 
 ### Where ideas are stored (per node)
@@ -226,4 +300,3 @@ Open `VALIDATION_REPORT.md` in the run folder. It can flag:
 - artifacts not under `artifacts/`
 - sha256 mismatches for copied artifacts
 - frontier/expanded inconsistencies in the manifest state
-

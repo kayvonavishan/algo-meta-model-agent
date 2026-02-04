@@ -9,6 +9,7 @@ import json
 import math
 import os
 import platform
+import queue
 import re
 import shutil
 import socket
@@ -342,8 +343,126 @@ def _git_commit_all(*, worktree_path: Path, message: str) -> str:
 
 
 def _run_python(*, repo_root: Path, args: list[str], env: dict[str, str]) -> int:
-    cp = subprocess.run([sys.executable, *args], cwd=str(repo_root), env=env)
+    cp = subprocess.run([sys.executable, *args], cwd=str(repo_root), env=env, check=False)
     return int(cp.returncode)
+
+
+def _append_tree_log(run_root: Path, message: str) -> None:
+    """
+    Best-effort append-only log for `tree_runner.py` itself.
+
+    This is intentionally simple (no global logging configuration) so tests/imports
+    have no side-effects.
+    """
+    try:
+        ts = _utc_now_iso()
+        p = run_root / "tree_runner.log"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8", errors="replace") as f:
+            f.write(f"[{ts}] {message.rstrip()}\n")
+    except Exception:
+        return
+
+
+def _run_python_logged(
+    *,
+    repo_root: Path,
+    args: list[str],
+    env: dict[str, str],
+    log_path: Path,
+    echo: bool = True,
+) -> int:
+    """
+    Run a Python subprocess and tee stdout/stderr into a log file.
+
+    `tree_runner.py` orchestrates other scripts (idea generation + multi-agent loop). Those
+    scripts print useful diagnostics to stdout/stderr; without teeing, those logs are lost
+    unless the user manually redirects output.
+    """
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, *args]
+    started = time.time()
+    write_lock = threading.Lock()
+
+    def _write(line: str) -> None:
+        with write_lock:
+            with log_path.open("a", encoding="utf-8", errors="replace") as f:
+                f.write(line)
+
+    _write(
+        "\n".join(
+            [
+                "==============================",
+                f"ts: {_utc_now_iso()}",
+                f"cwd: {str(repo_root)}",
+                f"cmd: {' '.join(str(c) for c in cmd)}",
+                "==============================",
+                "",
+            ]
+        )
+        + "\n"
+    )
+
+    cp = subprocess.Popen(  # noqa: S603
+        cmd,
+        cwd=str(repo_root),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    done_q: queue.Queue[tuple[str, Optional[BaseException]]] = queue.Queue()
+
+    def _pump(stream, label: str, console_stream) -> None:  # noqa: ANN001
+        exc = None
+        try:
+            for line in iter(stream.readline, ""):
+                if line == "":
+                    break
+                _write(f"[{label}] {line}")
+                if echo:
+                    try:
+                        console_stream.write(line)
+                        console_stream.flush()
+                    except Exception:
+                        pass
+        except BaseException as e:  # noqa: BLE001
+            exc = e
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+            done_q.put((label, exc))
+
+    threads = []
+    if cp.stdout is not None:
+        threads.append(threading.Thread(target=_pump, args=(cp.stdout, "stdout", sys.stdout), daemon=True))
+    if cp.stderr is not None:
+        threads.append(threading.Thread(target=_pump, args=(cp.stderr, "stderr", sys.stderr), daemon=True))
+    for t in threads:
+        t.start()
+
+    rc = int(cp.wait())
+
+    # Wait for pump threads to finish (short timeout avoids rare hangs).
+    for _ in threads:
+        try:
+            done_q.get(timeout=5)
+        except Exception:
+            continue
+    for t in threads:
+        try:
+            t.join(timeout=0.1)
+        except Exception:
+            pass
+
+    dur = time.time() - started
+    _write(f"\n[exit] code={rc} duration_s={dur:.3f}\n")
+    return rc
 
 
 def _dry_run_write_idea_file(*, node_ideas_dir: Path, node_id: str, idx: int) -> Path:
@@ -544,7 +663,7 @@ def _recommendation_summary(score_obj: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _primary_delta(score_obj: dict[str, Any], *, primary_col: str = "mean_topN_avg_return_per_trade_pct_oos") -> Optional[float]:
+def _primary_delta(score_obj: dict[str, Any], *, primary_col: str = "core_topN_sharpe") -> Optional[float]:
     deltas = (score_obj or {}).get("column_deltas") or {}
     rec = deltas.get(primary_col)
     if not isinstance(rec, dict):
@@ -1329,6 +1448,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         lock_info = lock.acquire()
         manifest = _init_or_resume_manifest(run_root=run_root, repo_root=repo_root, agentic_root=agentic_root, args=args)
+        _append_tree_log(
+            run_root,
+            "start"
+            + f" tree_run_id={tree_run_id}"
+            + f" pid={os.getpid()}"
+            + f" resume={bool(args.resume)}"
+            + f" force={bool(args.force)}"
+            + f" validate_only={bool(args.validate_only)}"
+            + f" report_only={bool(args.report_only)}",
+        )
 
         # Record lock takeover events in the manifest for auditability.
         if lock_info and lock_info.get("takeover"):
@@ -1378,6 +1507,7 @@ def main(argv: list[str] | None = None) -> int:
         state = manifest.get("state") or {}
         current_depth = int(state.get("current_depth") or 0)
         frontier = list(state.get("frontier_node_ids") or [])
+        _append_tree_log(run_root, f"depth_start depth={current_depth} frontier={frontier}")
 
         if current_depth >= max_depth:
             state["stop_reason"] = "max_depth_reached"
@@ -1409,6 +1539,8 @@ def main(argv: list[str] | None = None) -> int:
 
         expanded_by_depth = state.setdefault("expanded_node_ids_by_depth", {})
         expanded_set = set(expanded_by_depth.get(str(current_depth)) or [])
+        if expanded_set:
+            _append_tree_log(run_root, f"depth_resume depth={current_depth} already_expanded={sorted(expanded_set)}")
 
         # Count eval records for max_total_idea_evals enforcement.
         evals = manifest.setdefault("evaluations", {})
@@ -1448,6 +1580,8 @@ def main(argv: list[str] | None = None) -> int:
                     if bool(args.dry_run):
                         _dry_run_ensure_ideas(node_ideas_dir=node_ideas_dir, node_id=str(node_id), desired_k=desired_k)
                     else:
+                        gen_log_path = node_ideas_dir / "generate_ideas.subprocess.log"
+                        _append_tree_log(run_root, f"generate_ideas node_id={node_id} missing={missing} log={gen_log_path}")
                         gen_args = [
                             "agentic_experimentation/idea_generation/generate_ideas.py",
                             "--ideas-dir",
@@ -1458,7 +1592,7 @@ def main(argv: list[str] | None = None) -> int:
                         for d in context_dirs:
                             gen_args.extend(["--context-ideas-dir", str(d)])
                         env = dict(os.environ)
-                        rc = _run_python(repo_root=repo_root, args=gen_args, env=env)
+                        rc = _run_python_logged(repo_root=repo_root, args=gen_args, env=env, log_path=gen_log_path, echo=True)
                         if rc != 0:
                             raise RuntimeError(f"generate_ideas.py failed for node {node_id} (exit {rc})")
                 existing_ideas = _list_markdown_files(node_ideas_dir)
@@ -1696,7 +1830,9 @@ def main(argv: list[str] | None = None) -> int:
                     if sweep_config_limit is not None:
                         mar_args.extend(["--sweep-config-limit", str(int(sweep_config_limit))])
 
-                    rc = _run_python(repo_root=repo_root, args=mar_args, env=env)
+                    mar_log_path = eval_output_root / "multi_agent_runner.subprocess.log"
+                    _append_tree_log(run_root, f"multi_agent_runner eval_id={eval_id} log={mar_log_path}")
+                    rc = _run_python_logged(repo_root=repo_root, args=mar_args, env=env, log_path=mar_log_path, echo=True)
                     if rc != 0:
                         raise RuntimeError(f"multi_agent_runner failed (exit {rc})")
 

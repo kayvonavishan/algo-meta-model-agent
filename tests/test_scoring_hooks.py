@@ -107,15 +107,15 @@ def test_compute_score_recommendation_should_explore_true_on_clear_improvement(t
     _write_csv(
         baseline,
         """
-config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_cagr,core_topN_sharpe,core_topN_max_drawdown,core_topN_cvar_05
-0,0.02,0.60,1.50,-0.25,-0.09
+config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_sharpe,core_topN_max_drawdown,mean_topN_avg_return_per_trade_pct,core_topN_sortino,core_topN_calmar
+0,0.02,1.50,-0.25,0.12,3.70,2.20
 """,
     )
     _write_csv(
         candidate,
         """
-config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_cagr,core_topN_sharpe,core_topN_max_drawdown,core_topN_cvar_05
-0,0.022,0.63,1.55,-0.24,-0.088
+config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_sharpe,core_topN_max_drawdown,mean_topN_avg_return_per_trade_pct,core_topN_sortino,core_topN_calmar
+0,0.022,1.60,-0.24,0.125,3.90,2.35
 """,
     )
 
@@ -132,15 +132,15 @@ def test_compute_score_recommendation_blocks_on_primary_metric_regression(tmp_pa
     _write_csv(
         baseline,
         """
-config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_cagr,core_topN_sharpe,core_topN_max_drawdown,core_topN_cvar_05
-0,0.02,0.60,1.50,-0.25,-0.09
+config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_sharpe,core_topN_max_drawdown,mean_topN_avg_return_per_trade_pct,core_topN_sortino,core_topN_calmar
+0,0.02,1.50,-0.25,0.12,3.70,2.20
 """,
     )
     _write_csv(
         candidate,
         """
-config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_cagr,core_topN_sharpe,core_topN_max_drawdown,core_topN_cvar_05
-0,0.018,0.62,1.55,-0.25,-0.09
+config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_sharpe,core_topN_max_drawdown,mean_topN_avg_return_per_trade_pct,core_topN_sortino,core_topN_calmar
+0,0.022,1.40,-0.24,0.125,3.90,2.35
 """,
     )
 
@@ -156,15 +156,15 @@ def test_compute_score_recommendation_blocks_on_risk_regression(tmp_path: Path) 
     _write_csv(
         baseline,
         """
-config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_max_drawdown,core_topN_cvar_05
-0,0.02,-0.25,-0.09
+config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_sharpe,core_topN_max_drawdown,mean_topN_avg_return_per_trade_pct,core_topN_sortino,core_topN_calmar
+0,0.02,1.50,-0.25,0.12,3.70,2.20
 """,
     )
     _write_csv(
         candidate,
         """
-config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_max_drawdown,core_topN_cvar_05
-0,0.022,-0.35,-0.12
+config_id,mean_topN_avg_return_per_trade_pct_oos,core_topN_sharpe,core_topN_max_drawdown,mean_topN_avg_return_per_trade_pct,core_topN_sortino,core_topN_calmar
+0,0.022,1.60,-0.35,0.125,3.90,2.35
 """,
     )
 
