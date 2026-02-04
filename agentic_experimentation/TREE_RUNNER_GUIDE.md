@@ -113,6 +113,7 @@ Inside `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/`:
 
 - `manifest.json`: source-of-truth state for resume/audit
 - `TREE_SUMMARY.md`: human-readable summary (best path + per-node table)
+- `TREE_GRAPH.md`: Mermaid graph of nodes/edges + frontier (for Markdown viewers with Mermaid support)
 - `VALIDATION_REPORT.md`: integrity checks (paths, sha256, state consistency)
 - `artifacts/`: copied sweep CSV artifacts (baseline + candidates), with sha256 provenance
 - `node_ideas/`: per-node idea files (see "Idea Management" below)

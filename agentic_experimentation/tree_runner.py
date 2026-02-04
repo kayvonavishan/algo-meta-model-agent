@@ -969,6 +969,145 @@ def _tree_summary_markdown(*, run_root: Path, manifest: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _escape_mermaid_label(text: str) -> str:
+    # Mermaid labels are quoted; keep it simple and predictable.
+    s = str(text or "")
+    s = s.replace("\\", "\\\\")
+    s = s.replace('"', '\\"')
+    return s
+
+
+def _fmt_float(v: Any, *, digits: int = 4) -> str:
+    try:
+        f = float(v)
+    except Exception:
+        return "na"
+    if not math.isfinite(f):
+        return "na"
+    return f"{f:.{digits}g}"
+
+
+def _tree_graph_markdown(*, run_root: Path, manifest: dict[str, Any]) -> str:
+    """
+    Mermaid graph of the full tree state.
+
+    Useful for quickly visualizing nodes/edges and which nodes are currently in the frontier.
+    """
+    state = manifest.get("state") or {}
+    nodes = manifest.get("nodes") or {}
+    evals = manifest.get("evaluations") or {}
+
+    if not isinstance(nodes, dict):
+        nodes = {}
+    if not isinstance(evals, dict):
+        evals = {}
+
+    frontier = set(str(x) for x in (state.get("frontier_node_ids") or []))
+
+    def _eval_for_node(n: dict[str, Any]) -> Optional[dict[str, Any]]:
+        art = n.get("artifacts") or {}
+        if not isinstance(art, dict):
+            return None
+        ev_id = art.get("promoted_from_eval_id")
+        if not ev_id:
+            return None
+        ev = evals.get(str(ev_id))
+        return ev if isinstance(ev, dict) else None
+
+    # Best node selection (root-relative).
+    best_node_id: Optional[str] = None
+    best_key: tuple[float, float, str] | None = None
+    for nid, nrec in nodes.items():
+        if str(nid) == "0000":
+            continue
+        if not isinstance(nrec, dict):
+            continue
+        ev = _eval_for_node(nrec)
+        if not ev:
+            continue
+        key = (_rank_score(ev), _root_primary_delta(ev), str(nid))
+        if best_key is None or key > best_key:
+            best_key = key
+            best_node_id = str(nid)
+
+    # Path to best.
+    best_path: list[str] = []
+    if best_node_id and isinstance(nodes.get(best_node_id), dict):
+        cur = best_node_id
+        while cur:
+            best_path.append(cur)
+            parent = (nodes.get(cur) or {}).get("parent_node_id")
+            cur = str(parent) if parent else ""
+        best_path = list(reversed(best_path))
+
+    lines: list[str] = []
+    lines.append(f"# TREE_GRAPH ({manifest.get('tree_run_id')})")
+    lines.append("")
+    lines.append("```mermaid")
+    lines.append("flowchart TD")
+
+    # Nodes (stable order).
+    for nid in sorted(nodes.keys(), key=lambda x: str(x)):
+        nrec = nodes.get(nid)
+        if not isinstance(nrec, dict):
+            continue
+        node_ident = f"N{str(nid)}"
+        depth = nrec.get("depth")
+        label_lines = [f"{nid} (d={depth})"]
+        if str(nid) == "0000":
+            label_lines.append("root")
+        else:
+            ev = _eval_for_node(nrec)
+            if ev:
+                rr = ev.get("root_relative") or {}
+                if isinstance(rr, dict):
+                    rrs = rr.get("recommendation_summary") or {}
+                    if not isinstance(rrs, dict):
+                        rrs = {}
+                    label_lines.append(f"rank={_fmt_float(rrs.get('score'))} grade={rrs.get('grade')}")
+                    label_lines.append(f"root_primary={_fmt_float(rr.get('primary_delta'))}")
+        label = _escape_mermaid_label("\\n".join(label_lines))
+        lines.append(f'  {node_ident}["{label}"]')
+
+    # Edges.
+    for nid in sorted(nodes.keys(), key=lambda x: str(x)):
+        nrec = nodes.get(nid)
+        if not isinstance(nrec, dict):
+            continue
+        parent = str(nrec.get("parent_node_id") or "")
+        if not parent:
+            continue
+        ev = _eval_for_node(nrec)
+        ev_id = str(ev.get("eval_id") or "") if ev else ""
+        rank = _fmt_float(_rank_score(ev)) if ev else "na"
+        edge_label = _escape_mermaid_label(f"eval {ev_id}\\nrank {rank}".strip())
+        lines.append(f"  N{parent} -->|{edge_label}| N{nid}")
+
+    # Styling.
+    lines.append("")
+    lines.append("classDef frontier fill:#e3f2fd,stroke:#1e88e5,stroke-width:2px;")
+    lines.append("classDef best fill:#e8f5e9,stroke:#43a047,stroke-width:2px;")
+    if frontier:
+        lines.append("class " + ",".join([f"N{nid}" for nid in sorted(frontier)]) + " frontier;")
+    if best_path:
+        lines.append("class " + ",".join([f"N{nid}" for nid in best_path]) + " best;")
+
+    lines.append("```")
+    lines.append("")
+    lines.append("Legend:")
+    lines.append("- Green: best path so far (by root-relative rank)")
+    lines.append("- Blue: current frontier")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _write_tree_graph(*, run_root: Path, manifest: dict[str, Any]) -> Path:
+    md = _tree_graph_markdown(run_root=run_root, manifest=manifest)
+    out_path = run_root / "TREE_GRAPH.md"
+    out_path.write_text(md, encoding="utf-8")
+    return out_path
+
+
 def _write_tree_summary(*, run_root: Path, manifest: dict[str, Any]) -> Path:
     md = _tree_summary_markdown(run_root=run_root, manifest=manifest)
     out_path = run_root / "TREE_SUMMARY.md"
@@ -1474,8 +1613,10 @@ def main(argv: list[str] | None = None) -> int:
             issues = _validate_run(repo_root=repo_root, run_root=run_root, manifest=manifest)
             report_path = _write_validation_report(run_root=run_root, issues=issues)
             summary_path = None
+            graph_path = None
             if bool(args.report_only):
                 summary_path = _write_tree_summary(run_root=run_root, manifest=manifest)
+                graph_path = _write_tree_graph(run_root=run_root, manifest=manifest)
             print(
                 json.dumps(
                     {
@@ -1483,6 +1624,7 @@ def main(argv: list[str] | None = None) -> int:
                         "run_root": str(run_root),
                         "manifest_path": str(run_root / "manifest.json"),
                         "tree_summary_path": (str(summary_path) if summary_path else None),
+                        "tree_graph_path": (str(graph_path) if graph_path else None),
                         "validation_report_path": str(report_path),
                         "issues": len(issues),
                     },
@@ -1521,6 +1663,10 @@ def main(argv: list[str] | None = None) -> int:
                 _write_tree_summary(run_root=run_root, manifest=manifest)
             except Exception:
                 pass
+            try:
+                _write_tree_graph(run_root=run_root, manifest=manifest)
+            except Exception:
+                pass
             print(
                 json.dumps(
                     {
@@ -1541,6 +1687,54 @@ def main(argv: list[str] | None = None) -> int:
         expanded_set = set(expanded_by_depth.get(str(current_depth)) or [])
         if expanded_set:
             _append_tree_log(run_root, f"depth_resume depth={current_depth} already_expanded={sorted(expanded_set)}")
+
+        # Auto-repair: if a previous run ended with empty_frontier at this depth but left
+        # gate/rank decisions unset (common after a crash or a logic bug), reconstruct the
+        # frontier from expanded nodes and re-run promotion logic.
+        #
+        # This is intentionally narrow: it only triggers when `passed_gate` is still None.
+        if str(state.get("stop_reason") or "") == "empty_frontier" and not frontier and current_depth < max_depth and expanded_set:
+            candidate_frontier = sorted(str(x) for x in expanded_set)
+            cand_frontier_set = set(candidate_frontier)
+            needs_repair = False
+            for rec in (manifest.get("evaluations") or {}).values():
+                if not isinstance(rec, dict):
+                    continue
+                depth_val = rec.get("depth")
+                if depth_val is None:
+                    continue
+                try:
+                    rec_depth = int(depth_val)
+                except Exception:
+                    continue
+                if rec_depth != current_depth:
+                    continue
+                if str(rec.get("parent_node_id") or "") not in cand_frontier_set:
+                    continue
+                decision = rec.get("decision") or {}
+                if not isinstance(decision, dict) or decision.get("passed_gate") is None:
+                    needs_repair = True
+                    break
+
+            if needs_repair:
+                _append_tree_log(
+                    run_root,
+                    f"repair_empty_frontier depth={current_depth} restored_frontier={candidate_frontier}",
+                )
+                manifest.setdefault("events", []).append(
+                    {
+                        "ts": _utc_now_iso(),
+                        "type": "repair_empty_frontier",
+                        "details": {
+                            "depth": current_depth,
+                            "restored_frontier": candidate_frontier,
+                        },
+                    }
+                )
+                state.pop("stop_reason", None)
+                frontier = candidate_frontier
+                state["frontier_node_ids"] = list(candidate_frontier)
+                _manifest_write(run_root, manifest)
 
         # Count eval records for max_total_idea_evals enforcement.
         evals = manifest.setdefault("evaluations", {})
@@ -1940,17 +2134,27 @@ def main(argv: list[str] | None = None) -> int:
             nodes = manifest.setdefault("nodes", {})
 
             depth_eval_recs: list[dict[str, Any]] = []
+            frontier_set = set(str(x) for x in frontier)
             for rec in evals.values():
                 if not isinstance(rec, dict):
                     continue
+                depth_val = rec.get("depth")
+                if depth_val is None:
+                    continue
                 try:
-                    if int(rec.get("depth") or -1) != current_depth:
-                        continue
+                    rec_depth = int(depth_val)
                 except Exception:
                     continue
-                if str(rec.get("parent_node_id") or "") not in set(frontier):
+                if rec_depth != current_depth:
+                    continue
+                if str(rec.get("parent_node_id") or "") not in frontier_set:
                     continue
                 depth_eval_recs.append(rec)
+
+            _append_tree_log(
+                run_root,
+                f"phase4_candidates depth={current_depth} frontier={list(frontier)} depth_eval_recs={len(depth_eval_recs)}",
+            )
 
             # Compute gate + rank for all evals at this depth.
             for rec in depth_eval_recs:
@@ -2125,6 +2329,10 @@ def main(argv: list[str] | None = None) -> int:
             pass
         try:
             _write_tree_summary(run_root=run_root, manifest=manifest)
+        except Exception:
+            pass
+        try:
+            _write_tree_graph(run_root=run_root, manifest=manifest)
         except Exception:
             pass
 
