@@ -19,6 +19,9 @@ Quick start
    Use `--iterations N` to run only the first N ideas.
 7) Multi-agent option (planner -> coder (Codex MCP edits) -> reviewer -> tests -> sweep):
    `python agentic_experimentation/multi_agent_runner.py --config agentic_experimentation/agent_config.json`
+8) Tree / beam-search option (promote best code states over multiple depths):
+   - See `agentic_experimentation/TREE_RUNNER_GUIDE.md`
+   - Run: `python agentic_experimentation/tree_runner.py --tree-run-id <id> --sweep-config-limit 25`
 
 Notes
 - Worktrees keep your main repo clean; each iteration runs in its own temp worktree.

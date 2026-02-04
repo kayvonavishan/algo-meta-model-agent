@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import json
@@ -101,6 +102,25 @@ def _collect_idea_files(ideas_dir: Path, completed_dir: Path) -> List[Path]:
     return uniq
 
 
+def _collect_idea_files_from_dirs(idea_dirs: List[Path]) -> List[Path]:
+    paths: List[Path] = []
+    for d in idea_dirs:
+        d = Path(d)
+        if d.exists():
+            paths.extend(d.glob("*.md"))
+        completed = d / "completed"
+        if completed.exists():
+            paths.extend(completed.glob("*.md"))
+
+    def _sort_key(p: Path) -> Tuple[int, str]:
+        m = _IDEA_FILE_RE.match(p.name)
+        if not m:
+            return (10**9, p.name.lower())
+        return (int(m.group("num")), p.name.lower())
+
+    return sorted(set(paths), key=_sort_key)
+
+
 def _next_idea_number(ideas_dir: Path, completed_dir: Path) -> int:
     max_num = 0
     for p in _collect_idea_files(ideas_dir, completed_dir):
@@ -109,6 +129,61 @@ def _next_idea_number(ideas_dir: Path, completed_dir: Path) -> int:
             continue
         max_num = max(max_num, int(m.group("num")))
     return max_num + 1
+
+
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate idea markdowns for the meta model.")
+    parser.add_argument(
+        "--ideas-dir",
+        default=None,
+        help="Directory to write new idea markdowns to (default: agentic_experimentation/ideas).",
+    )
+    parser.add_argument(
+        "--completed-dir",
+        default=None,
+        help="Directory holding completed ideas for numbering (default: <ideas-dir>/completed).",
+    )
+    parser.add_argument(
+        "--context-ideas-dir",
+        action="append",
+        default=[],
+        help=(
+            "Directory to include as prior-ideas context (repeatable). "
+            "Each dir is scanned for *.md and <dir>/completed/*.md."
+        ),
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=None,
+        help="Override config.json count (number of ideas to generate).",
+    )
+    parser.add_argument(
+        "--max-context-chars",
+        type=int,
+        default=None,
+        help="Override config.json max_context_chars.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Override config.json model (Claude Code model string).",
+    )
+    parser.add_argument(
+        "--cli-path",
+        default=None,
+        help="Override config.json cli_path (path to Claude Code CLI).",
+    )
+    return parser.parse_args(argv)
+
+
+def _resolve_cli_path(repo_root: Path, value: Optional[str]) -> Optional[Path]:
+    if value is None:
+        return None
+    p = Path(str(value)).expanduser()
+    if p.is_absolute():
+        return p
+    return (repo_root / p).resolve()
 
 
 def _slugify(title: str, *, max_len: int = 60) -> str:
@@ -390,6 +465,7 @@ async def _run_claude_agent_sdk_once(
 
 
 def main() -> int:
+    args = _parse_args(sys.argv[1:])
     repo_root = _resolve_repo_root(Path(__file__).resolve())
     agentic_root = repo_root / "agentic_experimentation"
     cfg = _load_config(Path(__file__).with_name("config.json"))
@@ -426,8 +502,17 @@ def main() -> int:
     prompt_path = agentic_root / "prompts" / "idea_generator" / "idea_generator_prompt.txt"
     guide_path = repo_root / "META_MODEL_GUIDE.md"
     driver_path = repo_root / "adaptive_vol_momentum.py"
-    ideas_dir = agentic_root / "ideas"
-    completed_dir = ideas_dir / "completed"
+    ideas_dir = _resolve_cli_path(repo_root, args.ideas_dir) or (agentic_root / "ideas")
+    completed_dir = _resolve_cli_path(repo_root, args.completed_dir) or (ideas_dir / "completed")
+
+    # Context dirs: by default, match legacy behavior (ideas_dir + completed_dir).
+    # If context dirs are provided, always include the output ideas_dir first so newly
+    # generated ideas become context within the same run.
+    context_dirs: List[Path] = [ideas_dir]
+    for raw in (args.context_ideas_dir or []):
+        p = _resolve_cli_path(repo_root, raw)
+        if p is not None and p not in context_dirs:
+            context_dirs.append(p)
 
     prompt_template = _read_text(prompt_path)
     meta_model_guide = _read_text(guide_path)
@@ -436,14 +521,20 @@ def main() -> int:
     created: List[Path] = []
     next_num = _next_idea_number(ideas_dir, completed_dir)
 
+    count = int(args.count) if args.count is not None else int(cfg.count)
+    max_context_chars = int(args.max_context_chars) if args.max_context_chars is not None else int(cfg.max_context_chars)
+    model = args.model if args.model is not None else cfg.model
+    cli_path = args.cli_path if args.cli_path is not None else cfg.cli_path
+
     run_span_cm = contextlib.nullcontext()
     if phoenix_tracer is not None:
         run_span_cm = phoenix_tracer.start_as_current_span(
             "idea_generation.run",
             attributes={
-                "count": int(cfg.count),
-                "max_context_chars": int(cfg.max_context_chars),
+                "count": int(count),
+                "max_context_chars": int(max_context_chars),
                 "ideas_dir": str(ideas_dir),
+                "context_ideas_dirs": json.dumps([str(p) for p in context_dirs], ensure_ascii=False),
                 "repo_root": str(repo_root),
             },
         )
@@ -451,16 +542,16 @@ def main() -> int:
         if phoenix_obs is not None and run_span is not None:
             phoenix_obs.set_openinference_kind(run_span, "CHAIN")
 
-        for _ in range(cfg.count):
+        for _ in range(count):
             # Re-scan each loop so the newly written idea becomes context for the next call.
-            prior_idea_files = _collect_idea_files(ideas_dir, completed_dir)
+            prior_idea_files = _collect_idea_files_from_dirs(context_dirs)
 
             prompt = _bundle_context(
                 prompt_template=prompt_template,
                 meta_model_guide=meta_model_guide,
                 driver_code=driver_code,
                 idea_files=prior_idea_files,
-                max_context_chars=int(cfg.max_context_chars),
+                max_context_chars=int(max_context_chars),
             )
 
             prompt_dump_dir = Path(__file__).resolve().parent / ".idea_generation_logs"
@@ -474,7 +565,7 @@ def main() -> int:
                     attributes={
                         "idea_number": int(next_num),
                         "prompt_path": str(prompt_dump_path),
-                        "model": str(cfg.model) if cfg.model else None,
+                        "model": str(model) if model else None,
                     },
                 )
             with idea_span_cm as idea_span:
@@ -488,7 +579,7 @@ def main() -> int:
                         "llm.claude_agent_sdk",
                         attributes={
                             "llm.provider": "anthropic",
-                            "llm.model_name": str(cfg.model) if cfg.model else None,
+                            "llm.model_name": str(model) if model else None,
                             "prompt_path": str(prompt_dump_path),
                         },
                     )
@@ -501,22 +592,22 @@ def main() -> int:
                         idea_md = asyncio.run(
                             _run_claude_agent_sdk_once(
                                 prompt=prompt,
-                                model=cfg.model,
+                                model=model,
                                 cwd=run_cwd,
-                                cli_path=cfg.cli_path,
+                                cli_path=cli_path,
                             )
                         )
                     except RuntimeError:
                         # Common failure mode: unsupported/invalid model string for Claude Code.
                         # If a model was specified, retry once with default model to reduce friction.
-                        if cfg.model is None:
+                        if model is None:
                             raise
                         idea_md = asyncio.run(
                             _run_claude_agent_sdk_once(
                                 prompt=prompt,
                                 model=None,
                                 cwd=run_cwd,
-                                cli_path=cfg.cli_path,
+                                cli_path=cli_path,
                             )
                         )
 

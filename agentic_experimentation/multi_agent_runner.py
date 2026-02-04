@@ -632,14 +632,32 @@ async def _main_async():
     config = _load_json(config_path)
     if getattr(args, "sweep_config_limit", None) is not None:
         config["sweep_config_limit"] = args.sweep_config_limit
+    if getattr(args, "baseline_csv", None):
+        config["baseline_csv"] = args.baseline_csv
+    if getattr(args, "results_csv", None):
+        config["results_csv"] = args.results_csv
+    if getattr(args, "agentic_output_root", None) is not None:
+        config["agentic_output_root"] = args.agentic_output_root
 
     # Load .env from config directory first, then repo root (if present)
     _load_env_files([config_path.parent / ".env"])
 
     repo_root = _resolve_repo_root(config, config_path)
-    experiments_root = _resolve_path(repo_root, config.get("experiments_root"))
+    in_place = bool(getattr(args, "in_place", False))
+    if in_place:
+        if not getattr(args, "worktree_path", None):
+            raise RuntimeError("--worktree-path is required when using --in-place.")
+        if not getattr(args, "idea_path", None):
+            raise RuntimeError("--idea-path is required when using --in-place (single-idea execution).")
+
+    # When running in-place, treat the provided worktree as the "repo root" for
+    # LLM context + execution (tests/sweep) so the planner/reviewer see the node's
+    # current code state.
+    context_repo_root = Path(args.worktree_path).resolve() if in_place else repo_root
+
+    experiments_root = _resolve_path(repo_root, getattr(args, "experiments_root", None) or config.get("experiments_root"))
     worktree_root = _resolve_path(repo_root, config.get("worktree_root"))
-    baseline_csv = _resolve_path(repo_root, config.get("baseline_csv"))
+    baseline_csv = _resolve_path(context_repo_root, config.get("baseline_csv"))
     results_csv = Path(config.get("results_csv")).expanduser()
     agentic_output_root = None
     agentic_output_root_cfg = config.get("agentic_output_root")
@@ -672,33 +690,42 @@ async def _main_async():
         phoenix_obs = None
         phoenix_tracer = None
 
-    meta_model_guide_path = repo_root / "META_MODEL_GUIDE.md"
+    meta_model_guide_path = context_repo_root / "META_MODEL_GUIDE.md"
     if not meta_model_guide_path.exists():
         raise RuntimeError(f"Missing required meta model guide at {meta_model_guide_path}")
     meta_model_guide = _read_text(meta_model_guide_path)
 
-    if not ideas_path:
-        raise RuntimeError("ideas_file must be set in the config.")
     if not baseline_csv.exists():
         raise RuntimeError(f"Baseline CSV not found at {baseline_csv}. Run with --refresh-baseline.")
 
-    idea_entries = _load_idea_entries(ideas_path)
-    ideas = [e.get("content", "") for e in idea_entries]
-    if not ideas or not any((s or "").strip() for s in ideas):
-        raise RuntimeError(f"ideas_file provided but no ideas found at {ideas_path}")
+    single_idea_path = None
+    if getattr(args, "idea_path", None):
+        single_idea_path = Path(args.idea_path).expanduser().resolve()
+        if not single_idea_path.exists():
+            raise RuntimeError(f"--idea-path not found: {single_idea_path}")
+        idea_text = _read_text(single_idea_path)
+        idea_entries = [{"content": idea_text, "path": str(single_idea_path)}]
+        ideas = [idea_text]
+    else:
+        if not ideas_path:
+            raise RuntimeError("ideas_file must be set in the config (or provide --idea-path).")
+        idea_entries = _load_idea_entries(ideas_path)
+        ideas = [e.get("content", "") for e in idea_entries]
+        if not ideas or not any((s or "").strip() for s in ideas):
+            raise RuntimeError(f"ideas_file provided but no ideas found at {ideas_path}")
 
     prompts_cfg = config.get("prompts", {})
-    planner_prompt_path = _resolve_path(repo_root, prompts_cfg.get("planner"))
-    planner_system_path = _resolve_path(repo_root, prompts_cfg.get("planner_system"))
-    planner_files_path = _resolve_path(repo_root, prompts_cfg.get("planner_repo_files"))
-    coder_prompt_path = _resolve_path(repo_root, prompts_cfg.get("coder"))
-    coder_fix_prompt_path = _resolve_path(repo_root, prompts_cfg.get("coder_fix")) or coder_prompt_path
-    coder_system_path = _resolve_path(repo_root, prompts_cfg.get("coder_system"))
-    coder_files_path = _resolve_path(repo_root, prompts_cfg.get("coder_repo_files"))
-    reviewer_prompt_path = _resolve_path(repo_root, prompts_cfg.get("reviewer"))
-    reviewer_fix_prompt_path = _resolve_path(repo_root, prompts_cfg.get("reviewer_fix")) or reviewer_prompt_path
-    reviewer_system_path = _resolve_path(repo_root, prompts_cfg.get("reviewer_system"))
-    reviewer_files_path = _resolve_path(repo_root, prompts_cfg.get("reviewer_repo_files"))
+    planner_prompt_path = _resolve_path(context_repo_root, prompts_cfg.get("planner"))
+    planner_system_path = _resolve_path(context_repo_root, prompts_cfg.get("planner_system"))
+    planner_files_path = _resolve_path(context_repo_root, prompts_cfg.get("planner_repo_files"))
+    coder_prompt_path = _resolve_path(context_repo_root, prompts_cfg.get("coder"))
+    coder_fix_prompt_path = _resolve_path(context_repo_root, prompts_cfg.get("coder_fix")) or coder_prompt_path
+    coder_system_path = _resolve_path(context_repo_root, prompts_cfg.get("coder_system"))
+    coder_files_path = _resolve_path(context_repo_root, prompts_cfg.get("coder_repo_files"))
+    reviewer_prompt_path = _resolve_path(context_repo_root, prompts_cfg.get("reviewer"))
+    reviewer_fix_prompt_path = _resolve_path(context_repo_root, prompts_cfg.get("reviewer_fix")) or reviewer_prompt_path
+    reviewer_system_path = _resolve_path(context_repo_root, prompts_cfg.get("reviewer_system"))
+    reviewer_files_path = _resolve_path(context_repo_root, prompts_cfg.get("reviewer_repo_files"))
     if not (planner_prompt_path and coder_prompt_path and reviewer_prompt_path):
         raise RuntimeError("Planner, coder, and reviewer prompts must be set in config['prompts'].")
 
@@ -706,6 +733,8 @@ async def _main_async():
     if iterations_requested is None:
         iterations_requested = config.get("iterations", len(ideas))
     iterations = int(iterations_requested)
+    if single_idea_path is not None and iterations != 1:
+        raise RuntimeError("--idea-path runs exactly one iteration; omit --iterations or set it to 1.")
     if iterations > len(ideas):
         raise RuntimeError(
             f"Requested {iterations} iterations but only {len(ideas)} ideas in {ideas_path}"
@@ -720,9 +749,21 @@ async def _main_async():
     proceed_on_max_review_rounds = bool(config.get("proceed_on_max_review_rounds", False))
     archive_completed_ideas = bool(config.get("archive_completed_ideas", False))
     completed_ideas_dir_cfg = config.get("completed_ideas_dir")
+    if single_idea_path is not None:
+        # Single-idea executions are typically controlled by an external orchestrator (e.g. tree runner).
+        # Do not mutate/relocate the source idea file unless explicitly desired.
+        archive_completed_ideas = False
+    if getattr(args, "no_archive_ideas", False):
+        archive_completed_ideas = False
 
     for i in range(iterations):
-        run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{i:02d}"
+        base_run_id = getattr(args, "run_id", None) or time.strftime("%Y%m%d_%H%M%S")
+        if getattr(args, "run_id", None) and iterations == 1:
+            run_id = str(args.run_id)
+        elif getattr(args, "run_id", None) and iterations > 1:
+            run_id = f"{base_run_id}_{i:02d}"
+        else:
+            run_id = f"{base_run_id}_{i:02d}"
         exp_dir = experiments_root / run_id
         exp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -748,15 +789,18 @@ async def _main_async():
         exc_info = (None, None, None)
         worktree_path = None
         try:
-            worktree_path = create_worktree(repo_root, worktree_root, run_id)
-            if config.get("base_on_working_tree", False):
-                sync_working_tree(repo_root, worktree_path)
+            if in_place:
+                worktree_path = context_repo_root
+            else:
+                worktree_path = create_worktree(repo_root, worktree_root, run_id)
+                if config.get("base_on_working_tree", False):
+                    sync_working_tree(repo_root, worktree_path)
 
-            planner_context = _build_repo_context_for_role(repo_root, "planner", planner_files_path)
+            planner_context = _build_repo_context_for_role(worktree_path, "planner", planner_files_path)
             # The coder edits files inside the worktree; point "repo root" at the worktree to avoid
             # generating absolute paths into the original repo (which may be outside Codex's workspace).
             coder_context = _build_repo_context_for_role(worktree_path, "coder", coder_files_path)
-            reviewer_context = _build_repo_context_for_role(repo_root, "reviewer", reviewer_files_path)
+            reviewer_context = _build_repo_context_for_role(worktree_path, "reviewer", reviewer_files_path)
             idea_entry = idea_entries[i] if 0 <= i < len(idea_entries) else {"content": ideas[i], "path": None}
             idea_text = idea_entry.get("content") or ""
             _write_text(exp_dir / "idea.md", idea_text)
@@ -1174,6 +1218,18 @@ async def _main_async():
                         "AGENTIC_OUTPUT_DIR": str(run_output_dir),
                         "AGENTIC_RESULTS_CSV": str(run_results_csv),
                     }
+                elif os.environ.get("AGENTIC_RESULTS_CSV"):
+                    run_results_csv = Path(os.environ["AGENTIC_RESULTS_CSV"]).expanduser()
+                    agentic_run_results_csv = str(run_results_csv)
+                    run_output_dir = (
+                        Path(os.environ.get("AGENTIC_OUTPUT_DIR") or "").expanduser()
+                        if os.environ.get("AGENTIC_OUTPUT_DIR")
+                        else run_results_csv.parent
+                    )
+                    env_extra = {
+                        "AGENTIC_OUTPUT_DIR": str(run_output_dir),
+                        "AGENTIC_RESULTS_CSV": str(run_results_csv),
+                    }
                 sweep_span_cm = contextlib.nullcontext()
                 if phoenix_tracer is not None:
                     sweep_span_cm = phoenix_tracer.start_as_current_span(
@@ -1276,7 +1332,12 @@ async def _main_async():
             exc_info = sys.exc_info()
             raise
         finally:
-            if worktree_path is not None and (not config.get("keep_worktrees", False)) and (not args.keep_worktrees):
+            if (
+                (not in_place)
+                and worktree_path is not None
+                and (not config.get("keep_worktrees", False))
+                and (not args.keep_worktrees)
+            ):
                 remove_worktree(repo_root, worktree_path)
             run_stack.__exit__(*exc_info)
             if phoenix_obs is not None:
@@ -1297,6 +1358,51 @@ def _parse_args():
     parser.add_argument("--dry-run-llm", action="store_true")
     parser.add_argument("--keep-worktrees", action="store_true")
     parser.add_argument("--max-review-rounds", type=int, default=None)
+    parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Run without creating/removing a git worktree; --worktree-path must point at an existing worktree.",
+    )
+    parser.add_argument(
+        "--worktree-path",
+        default=None,
+        help="Path to an existing worktree to operate in when using --in-place.",
+    )
+    parser.add_argument(
+        "--idea-path",
+        default=None,
+        help="Run a single idea from a markdown file (bypasses config['ideas_file']).",
+    )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Override the run_id (also used as the experiments subdirectory name).",
+    )
+    parser.add_argument(
+        "--experiments-root",
+        default=None,
+        help="Override config['experiments_root'] output directory.",
+    )
+    parser.add_argument(
+        "--baseline-csv",
+        default=None,
+        help="Override config['baseline_csv'] path (used for scoring).",
+    )
+    parser.add_argument(
+        "--results-csv",
+        default=None,
+        help="Override config['results_csv'] path (default sweep results location).",
+    )
+    parser.add_argument(
+        "--agentic-output-root",
+        default=None,
+        help="Override config['agentic_output_root'] (use empty string to disable).",
+    )
+    parser.add_argument(
+        "--no-archive-ideas",
+        action="store_true",
+        help="Disable archiving idea markdowns into completed/ after an iteration.",
+    )
     parser.add_argument(
         "--sweep-config-limit",
         type=int,
