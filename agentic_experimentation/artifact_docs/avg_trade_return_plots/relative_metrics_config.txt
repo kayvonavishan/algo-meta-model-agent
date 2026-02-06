@@ -1,0 +1,37 @@
+relative_metrics_config_XXX.csv - Schema & row-key meanings
+
+Source:
+- Generated in `sweep.run_config_sweep()` via `reporting.compute_relative_edge_metrics(curves)`.
+
+File pattern:
+- `<agentic_output_root>/run_0/avg_trade_return_plots/relative_metrics_config_000.csv`
+- `<agentic_output_root>/run_0/avg_trade_return_plots/relative_metrics_config_001.csv`
+- ...
+
+Shape:
+- A "row-metric table" with a single value column:
+  - Index (first column) is the row key (metric name).
+  - The `relative` column holds the metric values.
+
+Columns:
+- (index): metric row key (string)
+- relative: metrics describing Top-N relative to All-models
+
+Row keys:
+- n_periods: number of evaluation periods used
+- mean_return_delta: mean(topN_return - all_models_return)
+- median_return_delta: median(topN_return - all_models_return)
+- volatility_delta: stdev(topN_return - all_models_return)
+- pct_outperform: fraction of periods where topN_return > all_models_return
+- pct_underperform: fraction of periods where topN_return < all_models_return
+- mean_delta_win: mean(topN - all_models) conditional on outperform periods
+- mean_delta_loss: mean(topN - all_models) conditional on underperform periods (typically negative)
+- win_loss_ratio: mean_delta_win / abs(mean_delta_loss) (higher is better)
+- pct_baseline_negative: fraction of periods where all_models_return < 0
+- pct_baseline_positive: fraction of periods where all_models_return > 0
+- pct_baseline_negative_meta_positive: fraction where baseline < 0 and topN > 0 (good)
+- pct_baseline_positive_meta_negative: fraction where baseline > 0 and topN < 0 (bad)
+- downside_capture: mean(topN_return | baseline<0) / mean(all_models_return | baseline<0); lower is better (<1 is good)
+- upside_capture: mean(topN_return | baseline>0) / mean(all_models_return | baseline>0); higher is better (>1 is good)
+- equity_ratio_end: ending equity(topN) / equity(all_models) over the evaluation horizon
+- equity_ratio_cagr: CAGR of the equity ratio (how quickly Top-N pulls ahead vs baseline)

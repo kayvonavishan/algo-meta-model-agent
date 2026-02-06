@@ -675,6 +675,338 @@ def _primary_delta(score_obj: dict[str, Any], *, primary_col: str = "core_topN_s
     return v
 
 
+_IDEA_GEN_BASELINE_METRICS: tuple[str, ...] = (
+    "core_topN_sharpe",
+    "mean_topN_avg_return_per_trade_pct_oos",
+    "mean_topN_avg_return_per_trade_pct",
+    "core_topN_sortino",
+    "core_topN_calmar",
+    "core_topN_max_drawdown",
+)
+
+
+def _extract_baseline_metrics_from_summary(summary: dict[str, Any]) -> dict[str, float]:
+    score = summary.get("score") or {}
+    if not isinstance(score, dict):
+        return {}
+    col_deltas = score.get("column_deltas") or {}
+    if not isinstance(col_deltas, dict):
+        return {}
+
+    out: dict[str, float] = {}
+    for name in _IDEA_GEN_BASELINE_METRICS:
+        rec = col_deltas.get(name)
+        if not isinstance(rec, dict):
+            continue
+        v = _coerce_float(rec.get("candidate_mean"))
+        if v is None:
+            continue
+        out[name] = v
+    return out
+
+
+def _baseline_metrics_from_csv_self(
+    *,
+    compute_score: Any,
+    csv_path: Path,
+    sweep_config_limit: Optional[int],
+    score_column: str = "core_topN_sharpe",
+) -> dict[str, float]:
+    score_obj = compute_score(csv_path, csv_path, score_column, config_id_limit=sweep_config_limit)
+    if not isinstance(score_obj, dict):
+        return {}
+    col_deltas = score_obj.get("column_deltas") or {}
+    if not isinstance(col_deltas, dict):
+        return {}
+    out: dict[str, float] = {}
+    for name in _IDEA_GEN_BASELINE_METRICS:
+        rec = col_deltas.get(name)
+        if not isinstance(rec, dict):
+            continue
+        v = _coerce_float(rec.get("candidate_mean"))
+        if v is None:
+            continue
+        out[name] = v
+    return out
+
+
+def _find_node_promotion_summary_path(*, run_root: Path, manifest: dict[str, Any], node_rec: dict[str, Any]) -> Optional[Path]:
+    direct = node_rec.get("baseline_summary_json_path")
+    if direct:
+        p = Path(str(direct)).expanduser()
+        return p if p.exists() else p
+
+    art = node_rec.get("artifacts") or {}
+    if not isinstance(art, dict):
+        art = {}
+    ev_id = art.get("promoted_from_eval_id")
+    if not ev_id:
+        return None
+
+    evals = manifest.get("evaluations") or {}
+    ev = evals.get(str(ev_id)) if isinstance(evals, dict) else None
+    if isinstance(ev, dict):
+        parent_rel = ev.get("parent_relative") or {}
+        if isinstance(parent_rel, dict) and parent_rel.get("summary_json_path"):
+            return Path(str(parent_rel["summary_json_path"])).expanduser()
+        if ev.get("eval_output_root"):
+            # Default layout: <eval_output_root>/experiment/<eval_id>/summary.json
+            base = Path(str(ev.get("eval_output_root"))).expanduser()
+            return base / "experiment" / str(ev_id) / "summary.json"
+
+    # Fallback to standard location.
+    return run_root / "eval" / str(ev_id) / "experiment" / str(ev_id) / "summary.json"
+
+
+def _build_baseline_context_for_node(
+    *,
+    run_root: Path,
+    repo_root: Path,
+    manifest: dict[str, Any],
+    node_id: str,
+    node_rec: dict[str, Any],
+    compute_score: Any,
+    sweep_config_limit: Optional[int],
+) -> dict[str, Any]:
+    baseline_csv = str(node_rec.get("baseline_results_csv_path") or "").strip()
+    baseline_csv_path = Path(baseline_csv).expanduser() if baseline_csv else None
+
+    summary_path = _find_node_promotion_summary_path(run_root=run_root, manifest=manifest, node_rec=node_rec)
+    summary = None
+    if summary_path is not None and summary_path.exists():
+        try:
+            raw = _read_json(summary_path)
+            if isinstance(raw, dict):
+                summary = raw
+        except Exception:
+            summary = None
+
+    def _summary_to_artifact_paths(summary_obj: dict[str, Any]) -> tuple[str, str, str]:
+        sweep_csv = str(summary_obj.get("agentic_run_results_csv") or summary_obj.get("results_csv") or "").strip()
+        agentic_root = str(summary_obj.get("agentic_output_root") or "").strip()
+        plots_dir = ""
+        if sweep_csv:
+            try:
+                run_dir = Path(sweep_csv).expanduser().resolve().parent
+                plots_dir = str(run_dir / "avg_trade_return_plots")
+            except Exception:
+                plots_dir = ""
+        elif agentic_root:
+            plots_dir = str(Path(agentic_root).expanduser() / "run_0" / "avg_trade_return_plots")
+        return sweep_csv, agentic_root, plots_dir
+
+    baseline_metrics: dict[str, float] = {}
+    sweep_results_csv = ""
+    agentic_output_root = ""
+    avg_trade_return_plots_dir = ""
+    source = "unknown"
+
+    if summary is not None:
+        baseline_metrics = _extract_baseline_metrics_from_summary(summary)
+        sweep_results_csv, agentic_output_root, avg_trade_return_plots_dir = _summary_to_artifact_paths(summary)
+        source = "promoted_eval_summary_json"
+
+    if not baseline_metrics and baseline_csv_path is not None and baseline_csv_path.exists():
+        baseline_metrics = _baseline_metrics_from_csv_self(
+            compute_score=compute_score,
+            csv_path=baseline_csv_path,
+            sweep_config_limit=sweep_config_limit,
+        )
+        if not sweep_results_csv and baseline_csv_path is not None:
+            sweep_results_csv = str(baseline_csv_path)
+        source = "csv_self_score"
+
+    nodes = manifest.get("nodes") or {}
+    chain = _collect_ancestor_node_ids(manifest, str(node_id))
+
+    # Build a compact, chronological branch timeline with major metrics and per-step deltas.
+    timeline: list[dict[str, Any]] = []
+    prev_metrics: Optional[dict[str, float]] = None
+    for nid in chain:
+        nrec = (nodes.get(nid) or {}) if isinstance(nodes, dict) else {}
+        if not isinstance(nrec, dict):
+            continue
+
+        n_depth = nrec.get("depth")
+        n_parent = nrec.get("parent_node_id")
+        n_baseline_csv = str(nrec.get("baseline_results_csv_path") or "").strip()
+        n_baseline_csv_path = Path(n_baseline_csv).expanduser() if n_baseline_csv else None
+        n_idea_chain = list(nrec.get("idea_chain") or []) if isinstance(nrec.get("idea_chain"), list) else []
+        applied_idea_path = n_idea_chain[-1] if n_idea_chain else None
+
+        n_summary_path = _find_node_promotion_summary_path(run_root=run_root, manifest=manifest, node_rec=nrec)
+        n_summary = None
+        if n_summary_path is not None and n_summary_path.exists():
+            try:
+                raw = _read_json(n_summary_path)
+                if isinstance(raw, dict):
+                    n_summary = raw
+            except Exception:
+                n_summary = None
+
+        n_metrics: dict[str, float] = {}
+        n_deltas: dict[str, float] = {}
+        n_sweep_csv = ""
+        n_agentic_root = ""
+        n_plots_dir = ""
+        n_source = "unknown"
+
+        if n_summary is not None:
+            n_metrics = _extract_baseline_metrics_from_summary(n_summary)
+            n_sweep_csv, n_agentic_root, n_plots_dir = _summary_to_artifact_paths(n_summary)
+            # Prefer deltas from the promotion summary (parent -> this node).
+            col_deltas = ((n_summary.get("score") or {}) if isinstance(n_summary.get("score"), dict) else {}).get("column_deltas") or {}
+            if isinstance(col_deltas, dict):
+                for k in _IDEA_GEN_BASELINE_METRICS:
+                    rec = col_deltas.get(k)
+                    if isinstance(rec, dict):
+                        dv = _coerce_float(rec.get("delta"))
+                        if dv is not None:
+                            n_deltas[k] = dv
+            n_source = "promoted_eval_summary_json"
+
+        if not n_metrics and n_baseline_csv_path is not None and n_baseline_csv_path.exists():
+            n_metrics = _baseline_metrics_from_csv_self(
+                compute_score=compute_score,
+                csv_path=n_baseline_csv_path,
+                sweep_config_limit=sweep_config_limit,
+            )
+            n_source = "csv_self_score"
+
+        # Fallback delta: current - previous (if summary delta missing).
+        if prev_metrics is not None:
+            for k in _IDEA_GEN_BASELINE_METRICS:
+                if k in n_deltas:
+                    continue
+                if k in n_metrics and k in prev_metrics:
+                    try:
+                        n_deltas[k] = float(n_metrics[k]) - float(prev_metrics[k])
+                    except Exception:
+                        continue
+
+        timeline.append(
+            {
+                "node_id": nid,
+                "depth": n_depth,
+                "parent_node_id": n_parent,
+                "applied_idea_path": applied_idea_path,
+                "idea_chain_len": len(n_idea_chain),
+                "baseline_results_csv_path": n_baseline_csv,
+                "promotion_summary_json_path": (str(n_summary_path) if n_summary_path is not None else ""),
+                "metrics": n_metrics,
+                "metric_deltas_vs_parent": n_deltas,
+                "agentic_output_root": n_agentic_root,
+                "sweep_results_csv": n_sweep_csv,
+                "avg_trade_return_plots_dir": n_plots_dir,
+                "source": n_source,
+            }
+        )
+        prev_metrics = n_metrics if n_metrics else prev_metrics
+
+    # Collect rejected (non-selected) evals along this branch.
+    rejected: list[dict[str, Any]] = []
+    evals = manifest.get("evaluations") or {}
+    if isinstance(nodes, dict) and isinstance(evals, dict) and len(chain) >= 2:
+        chain_set = set(chain)
+        # For each parent node in the chain, exclude the one eval that produced the next node.
+        selected_eval_ids: set[str] = set()
+        for idx in range(len(chain) - 1):
+            child_id = chain[idx + 1]
+            child_rec = nodes.get(child_id) or {}
+            if not isinstance(child_rec, dict):
+                continue
+            art = child_rec.get("artifacts") or {}
+            if isinstance(art, dict) and art.get("promoted_from_eval_id"):
+                selected_eval_ids.add(str(art.get("promoted_from_eval_id")))
+
+        for ev in evals.values():
+            if not isinstance(ev, dict):
+                continue
+            parent_id = str(ev.get("parent_node_id") or "")
+            if parent_id not in chain_set:
+                continue
+            ev_id = str(ev.get("eval_id") or "")
+            if not ev_id or ev_id in selected_eval_ids:
+                continue
+            if str(ev.get("status") or "").lower() != "completed":
+                continue
+
+            summary_path = ""
+            pr = ev.get("parent_relative") or {}
+            if isinstance(pr, dict) and pr.get("summary_json_path"):
+                summary_path = str(pr.get("summary_json_path") or "")
+
+            summary = None
+            if summary_path:
+                sp = Path(summary_path).expanduser()
+                if sp.exists():
+                    try:
+                        raw = _read_json(sp)
+                        if isinstance(raw, dict):
+                            summary = raw
+                    except Exception:
+                        summary = None
+
+            ev_metrics: dict[str, float] = {}
+            ev_deltas: dict[str, float] = {}
+            ev_sweep_csv = ""
+            ev_agentic_root = ""
+            ev_plots_dir = ""
+            ev_source = "unknown"
+
+            if summary is not None:
+                ev_metrics = _extract_baseline_metrics_from_summary(summary)
+                ev_sweep_csv, ev_agentic_root, ev_plots_dir = _summary_to_artifact_paths(summary)
+                col_deltas = ((summary.get("score") or {}) if isinstance(summary.get("score"), dict) else {}).get("column_deltas") or {}
+                if isinstance(col_deltas, dict):
+                    for k in _IDEA_GEN_BASELINE_METRICS:
+                        rec = col_deltas.get(k)
+                        if isinstance(rec, dict):
+                            dv = _coerce_float(rec.get("delta"))
+                            if dv is not None:
+                                ev_deltas[k] = dv
+                ev_source = "summary_json"
+
+            # Candidate results CSV copy (kept under run_root/artifacts) is the canonical local reference.
+            candidate_csv = str(ev.get("candidate_results_csv_path") or "").strip()
+
+            rejected.append(
+                {
+                    "eval_id": ev_id,
+                    "parent_node_id": parent_id,
+                    "depth": ev.get("depth"),
+                    "idea_path": str(ev.get("idea_path") or "").strip(),
+                    "promotion_summary_json_path": summary_path,
+                    "baseline_results_csv_path": candidate_csv,
+                    "metrics": ev_metrics,
+                    "metric_deltas_vs_parent": ev_deltas,
+                    "agentic_output_root": ev_agentic_root,
+                    "sweep_results_csv": ev_sweep_csv,
+                    "avg_trade_return_plots_dir": ev_plots_dir,
+                    "source": ev_source,
+                }
+            )
+
+    return {
+        "tree_run_id": str(manifest.get("tree_run_id") or ""),
+        "node_id": str(node_id),
+        "parent_node_id": node_rec.get("parent_node_id"),
+        "depth": node_rec.get("depth"),
+        "idea_chain": list(node_rec.get("idea_chain") or []) if isinstance(node_rec.get("idea_chain"), list) else [],
+        "changes_applied_count": len(list(node_rec.get("idea_chain") or [])) if isinstance(node_rec.get("idea_chain"), list) else 0,
+        "sweep_config_limit": sweep_config_limit,
+        "baseline_context_source": source,
+        "baseline_summary_json_path": (str(summary_path) if summary_path is not None else ""),
+        "baseline_metrics": baseline_metrics,
+        "agentic_output_root": agentic_output_root,
+        "sweep_results_csv": sweep_results_csv,
+        "avg_trade_return_plots_dir": avg_trade_return_plots_dir,
+        "branch_timeline": timeline,
+        "rejected_branch_evals": rejected,
+        "artifact_docs_root": str((repo_root / "agentic_experimentation" / "artifact_docs").resolve()),
+    }
+
+
 def _coerce_float(value: Any) -> Optional[float]:
     if value is None:
         return None
@@ -1765,6 +2097,20 @@ def main(argv: list[str] | None = None) -> int:
             context_dirs = _collect_context_idea_dirs(manifest, node_id)
             node["context_ideas_dirs"] = context_dirs
 
+            # Build baseline artifact context for the idea generator (small JSON + prompt block).
+            baseline_ctx_path = node_ideas_dir / "baseline_context.json"
+            baseline_ctx = _build_baseline_context_for_node(
+                run_root=run_root,
+                repo_root=repo_root,
+                manifest=manifest,
+                node_id=str(node_id),
+                node_rec=node,
+                compute_score=compute_score,
+                sweep_config_limit=(int(sweep_config_limit) if sweep_config_limit is not None else None),
+            )
+            _atomic_write_json(baseline_ctx_path, baseline_ctx)
+            node["baseline_context_json_path"] = str(baseline_ctx_path)
+
             # Generate missing ideas (if needed).
             desired_k = int(run_config.get("ideas_per_node") or int(args.ideas_per_node))
             existing_ideas = _list_markdown_files(node_ideas_dir)
@@ -1783,6 +2129,7 @@ def main(argv: list[str] | None = None) -> int:
                             "--count",
                             str(missing),
                         ]
+                        gen_args.extend(["--baseline-context-json", str(baseline_ctx_path)])
                         for d in context_dirs:
                             gen_args.extend(["--context-ideas-dir", str(d)])
                         env = dict(os.environ)
@@ -2215,6 +2562,11 @@ def main(argv: list[str] | None = None) -> int:
                     idea_chain = list(parent_node.get("idea_chain") or [])
                     idea_chain.append(str(rec.get("idea_path") or ""))
 
+                    promotion_summary_path = ""
+                    parent_rel = rec.get("parent_relative") or {}
+                    if isinstance(parent_rel, dict) and parent_rel.get("summary_json_path"):
+                        promotion_summary_path = str(parent_rel["summary_json_path"])
+
                     node_record = {
                         "node_id": new_node_id,
                         "parent_node_id": parent_node_id,
@@ -2223,6 +2575,7 @@ def main(argv: list[str] | None = None) -> int:
                         "ref_name": str(node_wt["ref_name"]),
                         "worktree_path": str(node_wt["worktree_path"]),
                         "baseline_results_csv_path": str(rec.get("candidate_results_csv_path") or ""),
+                        "baseline_summary_json_path": promotion_summary_path,
                         "node_ideas_dir": str(node_ideas_dir),
                         "idea_chain": idea_chain,
                         "created_at": _utc_now_iso(),

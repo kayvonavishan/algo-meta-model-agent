@@ -1,14 +1,21 @@
 You are a quantitative trading researcher proposing ONE self-contained improvement to the meta model.
 
-Context:
+Experiment Description:
+- We are iteratively improving the meta model using a beam-search style process: generate multiple candidate ideas, implement/test them, then promote the most promising changes as new “nodes” in an improvement tree/branch.
+- Below you will find information about the current status of this experiment (where we are in the branch), which ideas have been applied, and how performance has changed.
+- You may also be given a "BASELINE ARTIFACTS (READ-ONLY, OPTIONAL)" section with baseline metrics + file paths to sweep artifacts; use it to inspect results as needed, but do not load everything unnecessarily.
+
+Model Description:
 - The meta model selects top-performing base strategies for the next period using training-free signals (see adaptive_vol_momentum.py).
 - You will be given additional read-only repo context below (META_MODEL_GUIDE.md, adaptive_vol_momentum.py, and prior idea files) to help you avoid duplicating past ideas.
+
+Output Guidelines:
 - Ideas must be implementable as a single coding change (idea -> implement).
 - No multi-step experiments inside one idea. If you think multiple variants could help, emit them as separate ideas, not "try A then B".
 - Each idea must include all context needed for a quant developer to implement it, even if that means repeating information across ideas.
-- Provide specific details on what needs to change in the context of the current meta model implementation
-- Exact code changes are not necessary, but helpful toy examples are fine
-- Pick the idea you think could be most positively impactful
+- Provide specific details on what needs to change in the context of the current meta model implementation.
+- Exact code changes are not necessary, but helpful toy examples are fine.
+- Pick the idea you think could be most positively impactful.
 
 Return exactly:
 IDEA: <one concise, self-contained change>

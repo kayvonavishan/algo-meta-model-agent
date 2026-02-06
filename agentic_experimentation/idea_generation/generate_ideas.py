@@ -11,7 +11,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 
 _IDEA_FILE_RE = re.compile(r"^(?P<num>\d{3})_(?P<name>.+)\.md$", re.IGNORECASE)
@@ -24,6 +24,14 @@ def _read_text(path: Path) -> str:
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8", errors="replace")
+
+
+def _read_json_file(path: Path) -> Any:
+    raw = _read_text(path)
+    # Be tolerant of UTF-8 BOM (common when files are edited on Windows).
+    if raw.startswith("\ufeff"):
+        raw = raw.lstrip("\ufeff")
+    return json.loads(raw)
 
 
 def _now_tag() -> str:
@@ -153,6 +161,15 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--baseline-context-json",
+        default=None,
+        help=(
+            "Optional JSON file describing baseline metrics + artifact paths for the current node. "
+            "If provided, a short 'BASELINE ARTIFACTS' block is appended to the prompt so the LLM "
+            "can explore artifacts as needed without loading everything into context."
+        ),
+    )
+    parser.add_argument(
         "--count",
         type=int,
         default=None,
@@ -184,6 +201,314 @@ def _resolve_cli_path(repo_root: Path, value: Optional[str]) -> Optional[Path]:
     if p.is_absolute():
         return p
     return (repo_root / p).resolve()
+
+
+def _render_baseline_context_block(*, baseline_ctx: dict[str, Any], repo_root: Path) -> str:
+    agentic_root = repo_root / "agentic_experimentation"
+    docs_root = agentic_root / "artifact_docs"
+    docs_root_exists = docs_root.exists()
+
+    sweep_limit = baseline_ctx.get("sweep_config_limit")
+    try:
+        sweep_limit_i = int(sweep_limit) if sweep_limit is not None else None
+    except Exception:
+        sweep_limit_i = None
+
+    baseline_metrics = baseline_ctx.get("baseline_metrics") or {}
+    if not isinstance(baseline_metrics, dict):
+        baseline_metrics = {}
+
+    sweep_results_csv = str(baseline_ctx.get("sweep_results_csv") or "").strip()
+    avg_plots_dir = str(baseline_ctx.get("avg_trade_return_plots_dir") or "").strip()
+
+    lines: list[str] = []
+    lines.append("-----------------------")
+    lines.append("")
+
+    tree_run_id = str(baseline_ctx.get("tree_run_id") or "").strip()
+    node_id = str(baseline_ctx.get("node_id") or "").strip()
+    parent_node_id = str(baseline_ctx.get("parent_node_id") or "").strip()
+    depth = baseline_ctx.get("depth")
+    try:
+        depth_i = int(depth) if depth is not None else None
+    except Exception:
+        depth_i = None
+
+    changes_applied = baseline_ctx.get("changes_applied_count")
+    try:
+        changes_applied_i = int(changes_applied) if changes_applied is not None else None
+    except Exception:
+        changes_applied_i = None
+
+    lines.append("Current Status:")
+    hdr = []
+    if tree_run_id:
+        hdr.append(f"tree_run_id={tree_run_id}")
+    if node_id:
+        hdr.append(f"node_id={node_id}")
+    if depth_i is not None:
+        hdr.append(f"depth={depth_i}")
+    if parent_node_id:
+        hdr.append(f"parent_node_id={parent_node_id}")
+    if changes_applied_i is not None:
+        hdr.append(f"changes_applied_to_original={changes_applied_i}")
+    if hdr:
+        lines.append("- " + " ".join(hdr))
+    idea_chain = baseline_ctx.get("idea_chain") or []
+    if isinstance(idea_chain, list) and idea_chain:
+        lines.append("- applied_ideas (chronological file pointers):")
+        for p in idea_chain:
+            lines.append(f"  - {p}")
+    else:
+        lines.append("- applied_ideas: (none; original/root model)")
+    lines.append("")
+
+    lines.append("Artifacts & How To Interpret Them:")
+    lines.append(f"- Static docs root: {docs_root} (exists={str(bool(docs_root_exists)).lower()})")
+    lines.append("")
+
+    col_defs = docs_root / "meta_config_sweep_results_columns.txt"
+    overview_doc = docs_root / "avg_trade_return_plots" / "README.txt"
+    schema_files = [
+        docs_root / "avg_trade_return_plots" / "core_metrics_config.txt",
+        docs_root / "avg_trade_return_plots" / "relative_metrics_config.txt",
+        docs_root / "avg_trade_return_plots" / "trade_metrics_config.txt",
+        docs_root / "avg_trade_return_plots" / "stability_metrics_config.txt",
+        docs_root / "avg_trade_return_plots" / "significance_metrics_config.txt",
+    ]
+
+    # 1) Sweep results table (per node).
+    agentic_output_root = str(baseline_ctx.get("agentic_output_root") or "").strip()
+    sweep_exists = Path(sweep_results_csv).expanduser().exists() if sweep_results_csv else False
+    lines.append("Output: meta_config_sweep_results.csv")
+    lines.append("- What it stores: Per-config sweep results; each row is one meta-model backtest for a single parameter set (`config_id`).")
+    lines.append("- Used for: Comparing parameter sets and computing the averaged metrics/deltas used to judge/promote ideas.")
+    lines.append("- Location (current node): " + (sweep_results_csv if sweep_results_csv else "(unknown / not available)"))
+    if agentic_output_root:
+        lines.append(f"- Location (pattern): {Path(agentic_output_root) / 'run_0' / 'meta_config_sweep_results.csv'}")
+    else:
+        lines.append("- Location (pattern): <agentic_output_root>/run_0/meta_config_sweep_results.csv")
+    lines.append(f"- Exists (current node path): {str(bool(sweep_exists)).lower()}")
+    lines.append(f"- Column definitions: {col_defs} (exists={str(bool(col_defs.exists())).lower()})")
+    lines.append("  - Format: `column_name: description` (search by column name).")
+    lines.append("  - Note: metrics families include `core_*`, `rel_*`, `stab_*`, `trade_*`, `sig_*`.")
+    lines.append("- Granularity: 1 CSV per node/run; rows are per parameter set tested (`config_id`).")
+    lines.append("")
+
+    # 2) Per-config diagnostics (per node, per config_id).
+    avg_exists = Path(avg_plots_dir).expanduser().exists() if avg_plots_dir else False
+    lines.append("Output: avg_trade_return_plots/")
+    lines.append("- What it stores: Per-parameter-set diagnostics (plots + row-metric CSVs) for a node/run.")
+    lines.append("- Used for: Deep-diving into *why* a specific config improved/regressed (distributions, drawdowns, stability, significance, trade quality).")
+    lines.append("- Location (current node): " + (avg_plots_dir if avg_plots_dir else "(unknown / not available)"))
+    if agentic_output_root:
+        lines.append(f"- Location (pattern): {Path(agentic_output_root) / 'run_0' / 'avg_trade_return_plots'}")
+    else:
+        lines.append("- Location (pattern): <agentic_output_root>/run_0/avg_trade_return_plots/")
+    lines.append(f"- Exists (current node path): {str(bool(avg_exists)).lower()}")
+    lines.append(f"- Overview doc: {overview_doc} (exists={str(bool(overview_doc.exists())).lower()})")
+    lines.append("- Naming convention: Files are per `config_id` and suffixed `_config_000`, `_config_001`, ... matching `meta_config_sweep_results.csv` rows.")
+    lines.append("- Per-config artifacts (each is one file per `config_id`):")
+
+    schema_by_prefix: Dict[str, Path] = {
+        "core_metrics_config": docs_root / "avg_trade_return_plots" / "core_metrics_config.txt",
+        "relative_metrics_config": docs_root / "avg_trade_return_plots" / "relative_metrics_config.txt",
+        "trade_metrics_config": docs_root / "avg_trade_return_plots" / "trade_metrics_config.txt",
+        "stability_metrics_config": docs_root / "avg_trade_return_plots" / "stability_metrics_config.txt",
+        "significance_metrics_config": docs_root / "avg_trade_return_plots" / "significance_metrics_config.txt",
+    }
+
+    lines.append("  Artifact: avg_trade_return_config_XXX.png (PNG)")
+    lines.append("  - Shows: average return per trade over time (all_models vs topN).")
+    lines.append("  - Use it to: check whether improvements are consistent across periods or concentrated in a few regimes.")
+
+    lines.append("  Artifact: trade_quality_hist_config_XXX.png (PNG)")
+    lines.append("  - Shows: histogram of average return per trade across periods (all_models vs topN).")
+    lines.append("  - Use it to: see distribution shifts and whether downside tail risk worsened.")
+
+    lines.append("  Artifact: trade_quality_rollmean_config_XXX.png (PNG)")
+    lines.append("  - Shows: rolling mean of average return per trade (all_models vs topN).")
+    lines.append("  - Use it to: see stability of trade-quality improvements through time.")
+
+    lines.append("  Artifact: equity_ratio_config_XXX.png (PNG)")
+    lines.append("  - Shows: equity ratio over time (equity_topN / equity_all).")
+    lines.append("  - Use it to: see whether topN compounds faster than the baseline universe.")
+
+    lines.append("  Artifact: rolling_sharpe_sortino_config_XXX.png (PNG)")
+    lines.append("  - Shows: rolling Sharpe and Sortino for period returns (all_models vs topN).")
+    lines.append("  - Use it to: verify risk-adjusted improvements are not just point-estimate noise.")
+
+    lines.append("  Artifact: rolling_outperformance_config_XXX.png (PNG)")
+    lines.append("  - Shows: rolling outperformance rate (fraction of periods topN_return > all_models_return).")
+    lines.append("  - Use it to: distinguish frequent small wins vs rare big wins.")
+
+    lines.append("  Artifact: drawdown_curves_config_XXX.png (PNG)")
+    lines.append("  - Shows: drawdown curves from equity peaks (all_models vs topN).")
+    lines.append("  - Use it to: inspect max drawdown depth and duration behavior.")
+
+    lines.append("  Artifact: return_hist_config_XXX.png (PNG)")
+    lines.append("  - Shows: histogram (and optional KDE) of period returns (all_models vs topN).")
+    lines.append("  - Use it to: compare central tendency and tails of per-period returns.")
+
+    lines.append("  Artifact: return_delta_hist_config_XXX.png (PNG)")
+    lines.append("  - Shows: histogram of deltas (topN_return - all_models_return).")
+    lines.append("  - Use it to: see whether outperformance is broad-based vs driven by a few periods.")
+
+    lines.append("  Artifact: return_scatter_config_XXX.png (PNG)")
+    lines.append("  - Shows: scatter of (all_models_return, topN_return) with y=x line and quadrant axes.")
+    lines.append("  - Use it to: identify regimes where meta-selection helps or hurts (e.g., baseline<0 while topN>0).")
+
+    lines.append("  Artifact: core_metrics_config_XXX.csv (CSV)")
+    lines.append("  - Stores: core performance metrics for all_models and topN (Sharpe/Sortino/Calmar/drawdowns/etc).")
+    schema = schema_by_prefix["core_metrics_config"]
+    lines.append(f"  - Column definitions: {schema} (exists={str(bool(schema.exists())).lower()})")
+    lines.append("  - Use it to: get a compact numeric summary for one config_id.")
+
+    lines.append("  Artifact: relative_metrics_config_XXX.csv (CSV)")
+    lines.append("  - Stores: relative edge metrics (deltas, capture ratios, equity ratio) for topN vs all_models.")
+    schema = schema_by_prefix["relative_metrics_config"]
+    lines.append(f"  - Column definitions: {schema} (exists={str(bool(schema.exists())).lower()})")
+    lines.append("  - Use it to: diagnose how the edge is achieved (frequency vs magnitude, capture, etc).")
+
+    lines.append("  Artifact: stability_metrics_config_XXX.csv (CSV)")
+    lines.append("  - Stores: rolling-window stability metrics for all_models, topN, and the delta series.")
+    schema = schema_by_prefix["stability_metrics_config"]
+    lines.append(f"  - Column definitions: {schema} (exists={str(bool(schema.exists())).lower()})")
+    lines.append("  - Use it to: find weak stability (bad rolling mins, long losing streaks, etc).")
+
+    lines.append("  Artifact: trade_metrics_config_XXX.csv (CSV)")
+    lines.append("  - Stores: trade-quality metrics computed from avg-return-per-trade series (plus relative deltas).")
+    schema = schema_by_prefix["trade_metrics_config"]
+    lines.append(f"  - Column definitions: {schema} (exists={str(bool(schema.exists())).lower()})")
+    lines.append("  - Use it to: check if improvements come from better per-period trade outcomes and consistency.")
+
+    lines.append("  Artifact: significance_metrics_config_XXX.csv (CSV)")
+    lines.append("  - Stores: t-test, sign test, and bootstrap metrics for the delta series (topN_return - all_models_return).")
+    schema = schema_by_prefix["significance_metrics_config"]
+    lines.append(f"  - Column definitions: {schema} (exists={str(bool(schema.exists())).lower()})")
+    lines.append("  - Use it to: sanity-check whether deltas look statistically meaningful.")
+    lines.append("- Granularity: 1 directory per node/run; inside it, many files per parameter set tested (`config_id`).")
+    lines.append("")
+
+    lines.append("- Guidance: consult docs first; open only the minimum files needed.")
+    lines.append("")
+
+    lines.append("Branch Timeline (chronological):")
+    timeline = baseline_ctx.get("branch_timeline") or []
+    if not isinstance(timeline, list) or not timeline:
+        lines.append("- (no timeline available)")
+        return "\n".join(lines).rstrip() + "\n"
+
+    metrics_order = [
+        "core_topN_sharpe",
+        "mean_topN_avg_return_per_trade_pct_oos",
+        "mean_topN_avg_return_per_trade_pct",
+        "core_topN_sortino",
+        "core_topN_calmar",
+        "core_topN_max_drawdown",
+    ]
+
+    for step_idx, step in enumerate(timeline):
+        if not isinstance(step, dict):
+            continue
+
+        sid = str(step.get("node_id") or "").strip()
+        sdepth = step.get("depth")
+        try:
+            sdepth_i = int(sdepth) if sdepth is not None else None
+        except Exception:
+            sdepth_i = None
+
+        applied = str(step.get("applied_idea_path") or "").strip()
+        metrics = step.get("metrics") or {}
+        deltas = step.get("metric_deltas_vs_parent") or {}
+        if not isinstance(metrics, dict):
+            metrics = {}
+        if not isinstance(deltas, dict):
+            deltas = {}
+
+        lines.append(f"{step_idx}. node_id={sid}" + (f" depth={sdepth_i}" if sdepth_i is not None else ""))
+        lines.append(f"   applied_idea: {applied}" if applied else "   applied_idea: (root/original)")
+
+        if sweep_limit_i is not None:
+            lines.append(f"   sweep_config_limit: {sweep_limit_i} (uses config_id < {sweep_limit_i})")
+
+        for k in metrics_order:
+            if k not in metrics:
+                continue
+            v = metrics.get(k)
+            if k in deltas:
+                lines.append(f"   {k}: {v}   (delta_vs_parent={deltas.get(k)})")
+            else:
+                lines.append(f"   {k}: {v}")
+
+        base_csv = str(step.get("baseline_results_csv_path") or "").strip()
+        sweep_csv = str(step.get("sweep_results_csv") or "").strip()
+        plots_dir = str(step.get("avg_trade_return_plots_dir") or "").strip()
+
+        if base_csv:
+            lines.append(f"   baseline_results_csv_path: {base_csv}")
+        if sweep_csv:
+            lines.append(f"   sweep_results_csv: {sweep_csv}")
+        if plots_dir:
+            lines.append(f"   avg_trade_return_plots_dir: {plots_dir}")
+
+        lines.append("")
+
+    rejected = baseline_ctx.get("rejected_branch_evals") or []
+    if isinstance(rejected, list) and rejected:
+        lines.append("Rejected Ideas (evaluated but not selected for this branch):")
+        rej_idx = 0
+        for ev in rejected:
+            if not isinstance(ev, dict):
+                continue
+            eid = str(ev.get("eval_id") or "").strip()
+            pid = str(ev.get("parent_node_id") or "").strip()
+            edepth = ev.get("depth")
+            try:
+                edepth_i = int(edepth) if edepth is not None else None
+            except Exception:
+                edepth_i = None
+
+            idea_path = str(ev.get("idea_path") or "").strip()
+            metrics = ev.get("metrics") or {}
+            deltas = ev.get("metric_deltas_vs_parent") or {}
+            if not isinstance(metrics, dict):
+                metrics = {}
+            if not isinstance(deltas, dict):
+                deltas = {}
+
+            lines.append(
+                f"{rej_idx}. eval_id={eid} parent_node_id={pid}"
+                + (f" depth={edepth_i}" if edepth_i is not None else "")
+            )
+            lines.append(f"   applied_idea: {idea_path}" if idea_path else "   applied_idea: (unknown)")
+            if sweep_limit_i is not None:
+                lines.append(f"   sweep_config_limit: {sweep_limit_i} (uses config_id < {sweep_limit_i})")
+
+            for k in metrics_order:
+                if k not in metrics:
+                    continue
+                v = metrics.get(k)
+                if k in deltas:
+                    lines.append(f"   {k}: {v}   (delta_vs_parent={deltas.get(k)})")
+                else:
+                    lines.append(f"   {k}: {v}")
+
+            base_csv = str(ev.get("baseline_results_csv_path") or "").strip()
+            sweep_csv = str(ev.get("sweep_results_csv") or "").strip()
+            plots_dir = str(ev.get("avg_trade_return_plots_dir") or "").strip()
+            if base_csv:
+                lines.append(f"   baseline_results_csv_path: {base_csv}")
+            if sweep_csv:
+                lines.append(f"   sweep_results_csv: {sweep_csv}")
+            if plots_dir:
+                lines.append(f"   avg_trade_return_plots_dir: {plots_dir}")
+
+            lines.append("")
+            rej_idx += 1
+
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _slugify(title: str, *, max_len: int = 60) -> str:
@@ -518,6 +843,14 @@ def main() -> int:
     meta_model_guide = _read_text(guide_path)
     driver_code = _read_text(driver_path)
 
+    if args.baseline_context_json:
+        baseline_path = _resolve_cli_path(repo_root, args.baseline_context_json) or Path(str(args.baseline_context_json)).expanduser().resolve()
+        baseline_raw = _read_json_file(baseline_path)
+        if not isinstance(baseline_raw, dict):
+            raise ValueError(f"--baseline-context-json must contain a JSON object: {baseline_path}")
+        baseline_block = _render_baseline_context_block(baseline_ctx=baseline_raw, repo_root=repo_root)
+        prompt_template = prompt_template.rstrip() + "\n\n" + baseline_block
+
     created: List[Path] = []
     next_num = _next_idea_number(ideas_dir, completed_dir)
 
@@ -528,16 +861,17 @@ def main() -> int:
 
     run_span_cm = contextlib.nullcontext()
     if phoenix_tracer is not None:
-        run_span_cm = phoenix_tracer.start_as_current_span(
-            "idea_generation.run",
-            attributes={
-                "count": int(count),
-                "max_context_chars": int(max_context_chars),
-                "ideas_dir": str(ideas_dir),
-                "context_ideas_dirs": json.dumps([str(p) for p in context_dirs], ensure_ascii=False),
-                "repo_root": str(repo_root),
-            },
-        )
+                run_span_cm = phoenix_tracer.start_as_current_span(
+                    "idea_generation.run",
+                    attributes={
+                        "count": int(count),
+                        "max_context_chars": int(max_context_chars),
+                        "ideas_dir": str(ideas_dir),
+                        "context_ideas_dirs": json.dumps([str(p) for p in context_dirs], ensure_ascii=False),
+                        "baseline_context_json": (str(args.baseline_context_json) if args.baseline_context_json else ""),
+                        "repo_root": str(repo_root),
+                    },
+                )
     with run_span_cm as run_span:
         if phoenix_obs is not None and run_span is not None:
             phoenix_obs.set_openinference_kind(run_span, "CHAIN")

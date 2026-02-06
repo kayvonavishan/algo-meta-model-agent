@@ -1,0 +1,48 @@
+trade_metrics_config_XXX.csv - Schema & row-key meanings
+
+Source:
+- Generated in `sweep.run_config_sweep()` via `reporting.compute_trade_quality_metrics(curves)`.
+
+Important note:
+- These are "trade quality" metrics computed from the per-period series:
+  - `all_avg_return_per_trade`
+  - `topN_avg_return_per_trade`
+- They are not raw per-trade return distributions; they summarize the distribution of *per-period average*
+  return-per-trade values.
+
+File pattern:
+- `<agentic_output_root>/run_0/avg_trade_return_plots/trade_metrics_config_000.csv`
+- `<agentic_output_root>/run_0/avg_trade_return_plots/trade_metrics_config_001.csv`
+- ...
+
+Shape:
+- A "row-metric table":
+  - Index (first column) is the row key (metric name).
+  - Columns represent different portfolios/universes.
+
+Columns:
+- (index): metric row key (string)
+- all_models: metrics for the baseline universe (computed from `all_avg_return_per_trade`)
+- topN: metrics for the meta-selected universe (computed from `topN_avg_return_per_trade`)
+- relative: relative metrics computed from the delta series (topN - all_models)
+
+Row keys:
+- n_periods: number of evaluation periods used (length of the per-period series)
+
+Per-universe distribution metrics (all_models / topN):
+- mean_avg_return_per_trade: mean of the per-period avg-return-per-trade series
+- median_avg_return_per_trade: median of the per-period avg-return-per-trade series
+- volatility_avg_return_per_trade: stdev of the per-period avg-return-per-trade series
+- hit_rate_avg_return_per_trade: fraction of periods with avg return per trade > 0
+- neg_rate_avg_return_per_trade: fraction of periods with avg return per trade < 0
+- p05_avg_return_per_trade: 5th percentile of per-period avg return per trade
+- cvar_05_avg_return_per_trade: mean of worst 5% tail (per-period avg return per trade)
+- max_negative_streak: longest streak of consecutive negative periods in the series
+
+Relative comparisons (relative):
+- mean_delta_avg_return_per_trade: mean(topN_avg_return_per_trade - all_avg_return_per_trade)
+- median_delta_avg_return_per_trade: median(topN_avg_return_per_trade - all_avg_return_per_trade)
+- pct_outperform_avg_return_per_trade: fraction of periods where delta > 0
+- pct_underperform_avg_return_per_trade: fraction of periods where delta < 0
+- max_outperformance_streak: longest streak of consecutive periods with delta > 0
+- max_underperformance_streak: longest streak of consecutive periods with delta < 0

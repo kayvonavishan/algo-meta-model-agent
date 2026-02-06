@@ -1,0 +1,206 @@
+meta_config_sweep_results.csv — Column definitions
+
+Format:
+- `column_name: description`
+
+Notes:
+- Each row in `meta_config_sweep_results.csv` is one sweep configuration / parameter set.
+- Many metrics come in families:
+  - `core_all_models_*` vs `core_topN_*` : absolute performance for baseline universe vs meta-selected universe.
+  - `rel_*` : relative performance of `topN` vs `all_models` (deltas, capture ratios, equity ratios).
+  - `stab_*` : rolling-window stability metrics (mean/min/max summaries over windows).
+  - `trade_*` : trade-level metrics for `all_models`, `topN`, and `relative`.
+  - `sig_*` : statistical significance metrics for the delta series.
+
+config_id: Integer id for this sweep configuration (0-based).
+vol_window: Volatility lookback window used by the meta model.
+alpha_low: Lower bound for an adaptive weighting/alpha parameter.
+alpha_high: Upper bound for an adaptive weighting/alpha parameter.
+alpha_smooth: Smoothing factor for the adaptive alpha/weighting.
+momentum_lookback: Momentum lookback window used by the meta model.
+delta_weight: Weight applied to a delta/relative component in scoring.
+conf_lookback: Lookback window for a confidence/consensus component.
+risk_lookback: Lookback window for risk estimation.
+cvar_alpha: Tail probability (alpha) used for CVaR-style risk calculations.
+cvar_risk_aversion: Risk aversion strength used when penalizing tail risk.
+seed: RNG seed used for any stochastic sampling components.
+top_n_global: Number of global selections (top-N) made by the meta model.
+include_n_top_tickers: Optional override for limiting number of tickers included (blank/None if unused).
+per_ticker_cap: Cap on how many models/strategies can be selected per ticker/symbol.
+per_symbol_outer_trial_cap: Cap on trials/selections per symbol in the outer selection loop.
+min_ticker_score: Minimum score threshold to include a ticker/symbol (blank/None if unused).
+oos_start_date: Out-of-sample start date used for evaluation.
+status: Status of this config run (e.g. ok/failed).
+error: Error message if status indicates failure.
+selections_path: Path to the saved selections for this config (if produced).
+
+core_all_models_n_periods: Number of evaluation periods for the `all_models` universe.
+core_all_models_mean_return: Mean period return for `all_models`.
+core_all_models_median_return: Median period return for `all_models`.
+core_all_models_volatility: Volatility (stdev of returns) for `all_models`.
+core_all_models_sharpe: Sharpe ratio for `all_models`.
+core_all_models_sortino: Sortino ratio for `all_models`.
+core_all_models_hit_rate: Fraction of periods with positive return for `all_models`.
+core_all_models_cagr: CAGR for `all_models`.
+core_all_models_calmar: Calmar ratio for `all_models`.
+core_all_models_p05_return: 5th percentile return for `all_models`.
+core_all_models_cvar_05: CVaR (5%) for `all_models`.
+core_all_models_max_drawdown: Max drawdown for `all_models` (typically negative; closer to 0 is better).
+core_all_models_avg_drawdown_depth: Average drawdown depth for `all_models` (negative; closer to 0 is better).
+core_all_models_avg_drawdown_duration: Average drawdown duration (periods) for `all_models`.
+core_all_models_max_drawdown_duration: Max drawdown duration (periods) for `all_models`.
+
+core_topN_n_periods: Number of evaluation periods for the `topN` universe.
+core_topN_mean_return: Mean period return for `topN`.
+core_topN_median_return: Median period return for `topN`.
+core_topN_volatility: Volatility (stdev of returns) for `topN`.
+core_topN_sharpe: Sharpe ratio for `topN` (primary metric by default).
+core_topN_sortino: Sortino ratio for `topN`.
+core_topN_hit_rate: Fraction of periods with positive return for `topN`.
+core_topN_cagr: CAGR for `topN`.
+core_topN_calmar: Calmar ratio for `topN`.
+core_topN_p05_return: 5th percentile return for `topN`.
+core_topN_cvar_05: CVaR (5%) for `topN`.
+core_topN_max_drawdown: Max drawdown for `topN` (negative; closer to 0 is better).
+core_topN_avg_drawdown_depth: Average drawdown depth for `topN` (negative; closer to 0 is better).
+core_topN_avg_drawdown_duration: Average drawdown duration (periods) for `topN`.
+core_topN_max_drawdown_duration: Max drawdown duration (periods) for `topN`.
+
+rel_n_periods: Number of evaluation periods used for relative metrics.
+rel_mean_return_delta: Mean(topN_return - all_models_return).
+rel_median_return_delta: Median(topN_return - all_models_return).
+rel_volatility_delta: Volatility (stdev) of (topN_return - all_models_return).
+rel_pct_outperform: Fraction of periods where topN_return > all_models_return.
+rel_pct_underperform: Fraction of periods where topN_return < all_models_return.
+rel_mean_delta_win: Mean(topN-all_models) conditional on outperform periods.
+rel_mean_delta_loss: Mean(topN-all_models) conditional on underperform periods (typically negative).
+rel_win_loss_ratio: Mean delta win divided by absolute mean delta loss.
+rel_pct_baseline_negative: Fraction of periods where baseline (all_models) return < 0.
+rel_pct_baseline_positive: Fraction of periods where baseline (all_models) return > 0.
+rel_pct_baseline_negative_meta_positive: Fraction where baseline < 0 and topN > 0.
+rel_pct_baseline_positive_meta_negative: Fraction where baseline > 0 and topN < 0.
+rel_downside_capture: Downside capture ratio (topN losses vs baseline losses; lower is better, <1 is good).
+rel_upside_capture: Upside capture ratio (topN gains vs baseline gains; higher is better, >1 is good).
+rel_equity_ratio_end: Ending equity(topN) / equity(all_models).
+rel_equity_ratio_cagr: CAGR of the equity ratio (how quickly topN pulls ahead vs baseline).
+
+stab_all_models_rolling_mean_return_mean: Mean of rolling mean returns for all_models.
+stab_all_models_rolling_mean_return_min: Minimum rolling mean return for all_models.
+stab_all_models_rolling_vol_mean: Mean rolling volatility for all_models.
+stab_all_models_rolling_vol_max: Maximum rolling volatility for all_models.
+stab_all_models_rolling_sharpe_mean: Mean rolling Sharpe for all_models.
+stab_all_models_rolling_sharpe_min: Minimum rolling Sharpe for all_models.
+stab_all_models_rolling_hit_rate_mean: Mean rolling hit rate for all_models.
+stab_all_models_rolling_hit_rate_min: Minimum rolling hit rate for all_models.
+stab_all_models_rolling_max_drawdown_mean: Mean rolling max drawdown for all_models.
+stab_all_models_rolling_max_drawdown_min: Worst rolling max drawdown for all_models.
+stab_all_models_max_losing_streak: Max losing streak for all_models.
+stab_all_models_rolling_outperformance_rate_mean: (Relative series) mean rolling outperformance rate (all_models bucket).
+stab_all_models_rolling_outperformance_rate_min: (Relative series) min rolling outperformance rate (all_models bucket).
+stab_all_models_rolling_delta_mean_mean: (Relative series) mean rolling mean delta (all_models bucket).
+stab_all_models_rolling_delta_mean_min: (Relative series) min rolling mean delta (all_models bucket).
+stab_all_models_max_outperformance_streak: (Relative series) max outperformance streak (all_models bucket).
+stab_all_models_max_underperformance_streak: (Relative series) max underperformance streak (all_models bucket).
+
+stab_topN_rolling_mean_return_mean: Mean of rolling mean returns for topN.
+stab_topN_rolling_mean_return_min: Minimum rolling mean return for topN.
+stab_topN_rolling_vol_mean: Mean rolling volatility for topN.
+stab_topN_rolling_vol_max: Maximum rolling volatility for topN.
+stab_topN_rolling_sharpe_mean: Mean rolling Sharpe for topN.
+stab_topN_rolling_sharpe_min: Minimum rolling Sharpe for topN.
+stab_topN_rolling_hit_rate_mean: Mean rolling hit rate for topN.
+stab_topN_rolling_hit_rate_min: Minimum rolling hit rate for topN.
+stab_topN_rolling_max_drawdown_mean: Mean rolling max drawdown for topN.
+stab_topN_rolling_max_drawdown_min: Worst rolling max drawdown for topN.
+stab_topN_max_losing_streak: Max losing streak for topN.
+stab_topN_rolling_outperformance_rate_mean: (Relative series) mean rolling outperformance rate (topN bucket).
+stab_topN_rolling_outperformance_rate_min: (Relative series) min rolling outperformance rate (topN bucket).
+stab_topN_rolling_delta_mean_mean: (Relative series) mean rolling mean delta (topN bucket).
+stab_topN_rolling_delta_mean_min: (Relative series) min rolling mean delta (topN bucket).
+stab_topN_max_outperformance_streak: (Relative series) max outperformance streak (topN bucket).
+stab_topN_max_underperformance_streak: (Relative series) max underperformance streak (topN bucket).
+
+stab_relative_rolling_mean_return_mean: Mean of rolling mean returns for the relative series (topN - all_models).
+stab_relative_rolling_mean_return_min: Minimum rolling mean return for the relative series.
+stab_relative_rolling_vol_mean: Mean rolling volatility for the relative series.
+stab_relative_rolling_vol_max: Maximum rolling volatility for the relative series.
+stab_relative_rolling_sharpe_mean: Mean rolling Sharpe for the relative series.
+stab_relative_rolling_sharpe_min: Minimum rolling Sharpe for the relative series.
+stab_relative_rolling_hit_rate_mean: Mean rolling hit rate (outperformance rate) for the relative series.
+stab_relative_rolling_hit_rate_min: Minimum rolling hit rate for the relative series.
+stab_relative_rolling_max_drawdown_mean: Mean rolling max drawdown for the relative series.
+stab_relative_rolling_max_drawdown_min: Worst rolling max drawdown for the relative series.
+stab_relative_max_losing_streak: Max losing streak for the relative series.
+stab_relative_rolling_outperformance_rate_mean: Mean rolling outperformance rate for the relative series.
+stab_relative_rolling_outperformance_rate_min: Min rolling outperformance rate for the relative series.
+stab_relative_rolling_delta_mean_mean: Mean rolling mean delta for the relative series.
+stab_relative_rolling_delta_mean_min: Min rolling mean delta for the relative series.
+stab_relative_max_outperformance_streak: Max outperformance streak for the relative series.
+stab_relative_max_underperformance_streak: Max underperformance streak for the relative series.
+
+trade_all_models_n_periods: Number of evaluation periods for trade metrics (all_models).
+trade_all_models_mean_avg_return_per_trade: Mean per-trade return (all_models).
+trade_all_models_median_avg_return_per_trade: Median per-trade return (all_models).
+trade_all_models_volatility_avg_return_per_trade: Stdev of per-trade returns (all_models).
+trade_all_models_hit_rate_avg_return_per_trade: Trade win-rate (all_models).
+trade_all_models_neg_rate_avg_return_per_trade: Trade loss-rate (all_models).
+trade_all_models_p05_avg_return_per_trade: 5th percentile per-trade return (all_models).
+trade_all_models_cvar_05_avg_return_per_trade: CVaR 5% of per-trade returns (all_models).
+trade_all_models_max_negative_streak: Max losing trade streak (all_models).
+trade_all_models_mean_delta_avg_return_per_trade: Mean per-trade delta (topN - all_models) computed in trade space.
+trade_all_models_median_delta_avg_return_per_trade: Median per-trade delta (topN - all_models) computed in trade space.
+trade_all_models_pct_outperform_avg_return_per_trade: Fraction of trades where topN trade return > baseline.
+trade_all_models_pct_underperform_avg_return_per_trade: Fraction of trades where topN trade return < baseline.
+trade_all_models_max_outperformance_streak: Max trade outperformance streak.
+trade_all_models_max_underperformance_streak: Max trade underperformance streak.
+
+trade_topN_n_periods: Number of evaluation periods for trade metrics (topN).
+trade_topN_mean_avg_return_per_trade: Mean per-trade return (topN).
+trade_topN_median_avg_return_per_trade: Median per-trade return (topN).
+trade_topN_volatility_avg_return_per_trade: Stdev of per-trade returns (topN).
+trade_topN_hit_rate_avg_return_per_trade: Trade win-rate (topN).
+trade_topN_neg_rate_avg_return_per_trade: Trade loss-rate (topN).
+trade_topN_p05_avg_return_per_trade: 5th percentile per-trade return (topN).
+trade_topN_cvar_05_avg_return_per_trade: CVaR 5% of per-trade returns (topN).
+trade_topN_max_negative_streak: Max losing trade streak (topN).
+trade_topN_mean_delta_avg_return_per_trade: Mean per-trade delta (topN - all_models), trade space.
+trade_topN_median_delta_avg_return_per_trade: Median per-trade delta (topN - all_models), trade space.
+trade_topN_pct_outperform_avg_return_per_trade: Fraction of trades where topN trade return > baseline.
+trade_topN_pct_underperform_avg_return_per_trade: Fraction of trades where topN trade return < baseline.
+trade_topN_max_outperformance_streak: Max trade outperformance streak.
+trade_topN_max_underperformance_streak: Max trade underperformance streak.
+
+trade_relative_n_periods: Number of evaluation periods for relative trade metrics.
+trade_relative_mean_avg_return_per_trade: Relative mean per-trade return (topN - baseline).
+trade_relative_median_avg_return_per_trade: Relative median per-trade return (topN - baseline).
+trade_relative_volatility_avg_return_per_trade: Volatility of per-trade deltas.
+trade_relative_hit_rate_avg_return_per_trade: Outperformance rate in trade space.
+trade_relative_neg_rate_avg_return_per_trade: Underperformance rate in trade space.
+trade_relative_p05_avg_return_per_trade: 5th percentile of per-trade deltas.
+trade_relative_cvar_05_avg_return_per_trade: CVaR 5% of per-trade deltas.
+trade_relative_max_negative_streak: Max streak of negative per-trade deltas.
+trade_relative_mean_delta_avg_return_per_trade: Mean delta per trade (same as mean_avg_return_per_trade for relative).
+trade_relative_median_delta_avg_return_per_trade: Median delta per trade (same as median_avg_return_per_trade for relative).
+trade_relative_pct_outperform_avg_return_per_trade: Fraction of trades where delta > 0.
+trade_relative_pct_underperform_avg_return_per_trade: Fraction of trades where delta < 0.
+trade_relative_max_outperformance_streak: Max streak of delta > 0.
+trade_relative_max_underperformance_streak: Max streak of delta < 0.
+
+sig_n_periods: Number of periods used for significance tests.
+sig_mean_delta: Mean delta (topN - all_models) used in significance tests.
+sig_std_delta: Std dev of delta used in significance tests.
+sig_t_stat: t-statistic for mean delta vs 0.
+sig_t_p_value: p-value for t-test (lower is stronger evidence of non-zero mean delta).
+sig_sign_test_p_value: p-value for sign test (outperformance rate vs 50%).
+sig_sign_test_pos_rate: Outperformance rate (fraction delta > 0).
+sig_bootstrap_mean_ci_low: Lower bound of bootstrap CI for mean delta.
+sig_bootstrap_mean_ci_high: Upper bound of bootstrap CI for mean delta.
+sig_bootstrap_prob_mean_gt0: Bootstrap-estimated probability that mean delta > 0.
+
+mean_all_avg_return_per_trade_pct: Mean per-trade return for all_models, expressed as a percent.
+mean_topN_avg_return_per_trade_pct: Mean per-trade return for topN, expressed as a percent.
+n_oos_periods: Number of out-of-sample periods used (if applicable).
+mean_all_avg_return_per_trade_pct_oos: OOS mean per-trade return for all_models, percent.
+mean_topN_avg_return_per_trade_pct_oos: OOS mean per-trade return for topN, percent.
+n_selections: Total number of selections made across the evaluation horizon (proxy for activity/coverage).
+

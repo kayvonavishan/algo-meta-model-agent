@@ -1,0 +1,56 @@
+stability_metrics_config_XXX.csv - Schema & row-key meanings
+
+Source:
+- Generated in `sweep.run_config_sweep()` via `reporting.compute_stability_robustness_metrics(curves)`.
+
+File pattern:
+- `<agentic_output_root>/run_0/avg_trade_return_plots/stability_metrics_config_000.csv`
+- `<agentic_output_root>/run_0/avg_trade_return_plots/stability_metrics_config_001.csv`
+- ...
+
+Shape:
+- A "row-metric table":
+  - Index (first column) is the row key (metric name).
+  - Columns represent different series:
+    - All-models return series
+    - Top-N return series
+    - Relative delta series (Top-N - All-models)
+
+Columns:
+- (index): metric row key (string)
+- all_models: rolling-window stability metrics computed from `all_models_return`
+- topN: rolling-window stability metrics computed from `topN_return`
+- relative: rolling-window stability metrics computed from `topN_return - all_models_return`
+
+Row keys:
+
+Rolling mean return:
+- rolling_mean_return_mean: average of rolling mean returns across windows
+- rolling_mean_return_min: minimum rolling mean return (worst rolling window)
+
+Rolling volatility:
+- rolling_vol_mean: average rolling volatility across windows
+- rolling_vol_max: maximum rolling volatility (worst rolling window)
+
+Rolling Sharpe:
+- rolling_sharpe_mean: average rolling Sharpe across windows
+- rolling_sharpe_min: minimum rolling Sharpe (worst rolling window)
+
+Rolling hit rate:
+- rolling_hit_rate_mean: average rolling hit rate across windows
+- rolling_hit_rate_min: minimum rolling hit rate (worst rolling window)
+
+Rolling drawdown:
+- rolling_max_drawdown_mean: average rolling max drawdown (typically negative)
+- rolling_max_drawdown_min: worst rolling max drawdown (most negative)
+
+Streaks:
+- max_losing_streak: longest streak of consecutive negative periods (computed per column series)
+
+Relative-only rolling metrics (present in the `relative` column):
+- rolling_outperformance_rate_mean: average rolling outperformance rate (fraction of periods with delta > 0)
+- rolling_outperformance_rate_min: minimum rolling outperformance rate
+- rolling_delta_mean_mean: average rolling mean of delta series
+- rolling_delta_mean_min: minimum rolling mean delta (worst window)
+- max_outperformance_streak: longest streak of consecutive periods with delta > 0
+- max_underperformance_streak: longest streak of consecutive periods with delta <= 0 (ties count as underperformance)

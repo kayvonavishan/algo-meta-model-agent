@@ -1,0 +1,36 @@
+core_metrics_config_XXX.csv - Schema & row-key meanings
+
+Source:
+- Generated in `sweep.run_config_sweep()` via `reporting.compute_core_performance_metrics(curves)`.
+
+File pattern:
+- `<agentic_output_root>/run_0/avg_trade_return_plots/core_metrics_config_000.csv`
+- `<agentic_output_root>/run_0/avg_trade_return_plots/core_metrics_config_001.csv`
+- ...
+
+Shape:
+- A "row-metric table":
+  - Index (first column) is the row key (metric name).
+  - Remaining columns are metric values for different portfolios/universes.
+
+Columns:
+- (index): metric row key (string)
+- all_models: metrics for the baseline universe ("all models/strategies")
+- topN: metrics for the meta-selected universe ("top N models/strategies")
+
+Row keys (metric definitions):
+- n_periods: number of evaluation periods used
+- mean_return: arithmetic mean period return
+- median_return: median period return
+- volatility: standard deviation of period returns
+- sharpe: (mean_return / volatility) * sqrt(periods_per_year); higher is better
+- sortino: (mean_return / downside_std) * sqrt(periods_per_year); higher is better
+- hit_rate: fraction of periods with positive return
+- cagr: compounded annual growth rate (computed from the equity curve); higher is better
+- calmar: cagr / abs(max_drawdown); higher is better (requires max_drawdown < 0)
+- p05_return: 5th percentile of period returns (more negative is worse)
+- cvar_05: mean of returns in the worst 5% tail (more negative is worse)
+- max_drawdown: worst drawdown from running equity peak (typically negative; closer to 0 is better)
+- avg_drawdown_depth: average drawdown depth during drawdown periods (typically negative; closer to 0 is better)
+- avg_drawdown_duration: average drawdown duration (in periods; lower is better)
+- max_drawdown_duration: max drawdown duration (in periods; lower is better)
