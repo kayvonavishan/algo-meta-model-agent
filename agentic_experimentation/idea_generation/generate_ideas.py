@@ -1254,6 +1254,46 @@ def _extract_provider_metadata(messages: List[object]) -> dict[str, Optional[str
     return {"response_id": response_id, "session_id": session_id}
 
 
+def _extract_provider_metadata_debug(messages: List[object]) -> dict[str, Any]:
+    response_id_candidates: List[str] = []
+    session_id_candidates: List[str] = []
+    message_types: List[str] = []
+
+    def _add_unique(target: List[str], value: Optional[str]) -> None:
+        if not value:
+            return
+        if value not in target:
+            target.append(value)
+
+    for msg in messages:
+        if isinstance(msg, dict):
+            message_types.append(str(msg.get("type") or "dict"))
+            _add_unique(response_id_candidates, str(msg.get("response_id") or msg.get("id") or "").strip() or None)
+            _add_unique(session_id_candidates, str(msg.get("session_id") or "").strip() or None)
+        else:
+            message_types.append(type(msg).__name__)
+            try:
+                _add_unique(
+                    response_id_candidates,
+                    str(getattr(msg, "response_id", None) or getattr(msg, "id", None) or "").strip() or None,
+                )
+            except Exception:
+                pass
+            try:
+                _add_unique(
+                    session_id_candidates,
+                    str(getattr(msg, "session_id", None) or "").strip() or None,
+                )
+            except Exception:
+                pass
+
+    return {
+        "response_id_candidates": response_id_candidates,
+        "session_id_candidates": session_id_candidates,
+        "message_types": message_types,
+    }
+
+
 async def _run_claude_agent_sdk_once(
     *,
     prompt: str,
@@ -1359,10 +1399,12 @@ async def _run_claude_agent_sdk_once(
         ) from exc
 
     meta = _extract_provider_metadata(messages)
+    meta_debug = _extract_provider_metadata_debug(messages)
     return {
         "text": _extract_final_text(messages).strip(),
         "provider_response_id": meta.get("response_id"),
         "provider_session_id": meta.get("session_id"),
+        "provider_metadata_debug": meta_debug,
     }
 
 
@@ -1573,6 +1615,7 @@ def main() -> int:
                             )
                         )
                     idea_md = str(llm_result.get("text") or "")
+                    provider_meta_debug = llm_result.get("provider_metadata_debug") or {}
 
                     if phoenix_obs is not None and llm_span is not None:
                         phoenix_obs.set_io(llm_span, output_text=idea_md)
@@ -1640,6 +1683,9 @@ def main() -> int:
                         "output_text": idea_md,
                         "provider_session_id": llm_result.get("provider_session_id"),
                         "provider_response_id": llm_result.get("provider_response_id"),
+                        "provider_response_id_candidates": provider_meta_debug.get("response_id_candidates") if isinstance(provider_meta_debug, dict) else None,
+                        "provider_session_id_candidates": provider_meta_debug.get("session_id_candidates") if isinstance(provider_meta_debug, dict) else None,
+                        "provider_message_types": provider_meta_debug.get("message_types") if isinstance(provider_meta_debug, dict) else None,
                     }
                     turn_action = "appended"
                     if existing_idx is not None:
@@ -1686,6 +1732,9 @@ def main() -> int:
                                 "output_hash": turn["output_hash"],
                                 "provider_session_id": llm_result.get("provider_session_id"),
                                 "provider_response_id": llm_result.get("provider_response_id"),
+                                "provider_response_id_candidates": provider_meta_debug.get("response_id_candidates") if isinstance(provider_meta_debug, dict) else None,
+                                "provider_session_id_candidates": provider_meta_debug.get("session_id_candidates") if isinstance(provider_meta_debug, dict) else None,
+                                "provider_message_types": provider_meta_debug.get("message_types") if isinstance(provider_meta_debug, dict) else None,
                                 "turn_action": turn_action,
                                 "operation_id": operation_id,
                             },
