@@ -363,6 +363,7 @@ Open `VALIDATION_REPORT.md` in the run folder. It can flag:
 - Recovery events are recorded in:
   - `manifest.json -> events[]` (`type=conversation_json_recovery`)
   - `conversations/conversation_debug.jsonl`
-- `--idea-conversation-mode auto` currently falls back to replay in most runs unless provider-native continuation capability is explicitly available in conversation state.
+- `--idea-conversation-mode auto` now uses provider-native continuation for Claude sessions when a resumable provider session is available; otherwise it falls back to replay.
+- In branch forks, the first child-node idea-generation call resumes the parent session and forks to a child session; subsequent calls continue on the child session.
 - If you need deterministic behavior, use `--idea-conversation-mode replay`.
 - If you need no history injection at all, use `--idea-conversation-mode off`.

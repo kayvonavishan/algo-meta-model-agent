@@ -1632,9 +1632,10 @@ def _conversation_state_template(
         "history_max_chars": int(history_max_chars),
         "provider": {
             "name": "claude_agent_sdk",
-            "supports_native_continuation": False,
+            "supports_native_continuation": True,
             "session_id": None,
             "last_response_id": None,
+            "branch_session_initialized": False,
         },
         "turns": [],
         "idea_file_turn_map": {},
@@ -1704,8 +1705,9 @@ def _fork_state_from_parent(
             provider = {}
         provider["session_id"] = parent_provider.get("session_id")
         provider["last_response_id"] = parent_provider.get("last_response_id")
-        provider["supports_native_continuation"] = bool(parent_provider.get("supports_native_continuation", False))
+        provider["supports_native_continuation"] = bool(parent_provider.get("supports_native_continuation", True))
         provider["name"] = str(parent_provider.get("name") or "claude_agent_sdk")
+        provider["branch_session_initialized"] = False
         child_state["provider"] = provider
 
     child_state["updated_at"] = _utc_now_iso()
@@ -1821,9 +1823,10 @@ def _ensure_node_conversation(
         if not isinstance(state.get("provider"), dict):
             state["provider"] = {}
         state["provider"].setdefault("name", "claude_agent_sdk")
-        state["provider"].setdefault("supports_native_continuation", False)
+        state["provider"].setdefault("supports_native_continuation", True)
         state["provider"].setdefault("session_id", None)
         state["provider"].setdefault("last_response_id", None)
+        state["provider"].setdefault("branch_session_initialized", False)
         state.setdefault("turns", [])
         if not isinstance(state.get("turns"), list):
             state["turns"] = []

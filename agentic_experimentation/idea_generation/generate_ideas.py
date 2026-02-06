@@ -84,6 +84,66 @@ def _state_history_max_chars(state: dict[str, Any], *, default: int = _DEFAULT_H
     return _normalize_history_max_chars(state.get("history_max_chars"), default=default)
 
 
+def _provider_supports_native_continuation(provider: Optional[dict[str, Any]]) -> bool:
+    if not isinstance(provider, dict):
+        return False
+    provider_name = str(provider.get("name") or "").strip().lower()
+    explicit = provider.get("supports_native_continuation")
+    explicit_bool = bool(explicit) if isinstance(explicit, bool) else False
+    inferred = provider_name in {"claude_agent_sdk", "claude", "openai_responses", "openai"}
+    return bool(explicit_bool or inferred)
+
+
+def _resolve_mode_used_for_turn(
+    *,
+    requested_mode: str,
+    conversation_state: Optional[dict[str, Any]],
+) -> str:
+    if requested_mode == "off":
+        return "off"
+    if requested_mode == "replay":
+        return "replay"
+    provider = (conversation_state or {}).get("provider") if isinstance(conversation_state, dict) else None
+    if _provider_supports_native_continuation(provider if isinstance(provider, dict) else None):
+        return "native"
+    return "replay"
+
+
+def _claude_native_continuation_params(
+    *,
+    mode_used: str,
+    conversation_state: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "continue_conversation": False,
+        "resume_session_id": None,
+        "fork_session": False,
+    }
+    if mode_used != "native" or not isinstance(conversation_state, dict):
+        return params
+
+    provider = conversation_state.get("provider")
+    if not _provider_supports_native_continuation(provider if isinstance(provider, dict) else None):
+        return params
+
+    provider_dict = provider if isinstance(provider, dict) else {}
+    session_id = str(provider_dict.get("session_id") or "").strip() or None
+    if not session_id:
+        return params
+
+    parent_conversation_id = str(conversation_state.get("parent_conversation_id") or "").strip() or None
+    branch_session_initialized = bool(provider_dict.get("branch_session_initialized", False))
+    fork_session = bool(parent_conversation_id and not branch_session_initialized)
+    params.update(
+        {
+            "continue_conversation": True,
+            "resume_session_id": session_id,
+            "fork_session": fork_session,
+        }
+    )
+    return params
+
+
 def _default_conversation_state(*, requested_mode: str) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -100,9 +160,10 @@ def _default_conversation_state(*, requested_mode: str) -> dict[str, Any]:
         "compact_summary_updated_at": None,
         "provider": {
             "name": "claude_agent_sdk",
-            "supports_native_continuation": False,
+            "supports_native_continuation": True,
             "session_id": None,
             "last_response_id": None,
+            "branch_session_initialized": False,
         },
         "turns": [],
         "idea_file_turn_map": {},
@@ -151,9 +212,10 @@ def _load_conversation_state(path: Path, *, requested_mode: str) -> dict[str, An
     if not isinstance(state["provider"], dict):
         state["provider"] = {}
     state["provider"].setdefault("name", "claude_agent_sdk")
-    state["provider"].setdefault("supports_native_continuation", False)
+    state["provider"]["supports_native_continuation"] = _provider_supports_native_continuation(state["provider"])
     state["provider"].setdefault("session_id", None)
     state["provider"].setdefault("last_response_id", None)
+    state["provider"].setdefault("branch_session_initialized", False)
     state.setdefault("turns", [])
     if not isinstance(state["turns"], list):
         state["turns"] = []
@@ -1198,6 +1260,9 @@ async def _run_claude_agent_sdk_once(
     model: Optional[str],
     cwd: Path,
     cli_path: Optional[str],
+    continue_conversation: bool = False,
+    resume_session_id: Optional[str] = None,
+    fork_session: bool = False,
 ) -> dict[str, Any]:
     try:
         from claude_agent_sdk import ClaudeAgentOptions, query  # type: ignore
@@ -1258,6 +1323,9 @@ async def _run_claude_agent_sdk_once(
         cwd=str(cwd),
         max_turns=1,
         cli_path=resolved_cli_path,
+        continue_conversation=bool(continue_conversation),
+        resume=(str(resume_session_id) if resume_session_id else None),
+        fork_session=bool(fork_session),
         stderr=_on_stderr,
         # For this use-case, we want pure text generation (no filesystem/shell/web tools).
         tools=[],
@@ -1424,10 +1492,10 @@ def main() -> int:
             )
             mode_used = "off"
             if conversation_enabled and isinstance(conversation_state, dict):
-                mode_used = requested_conv_mode
-                provider_supports_native = bool((conversation_state.get("provider") or {}).get("supports_native_continuation"))
-                if requested_conv_mode in {"auto", "native"} and not provider_supports_native:
-                    mode_used = "replay"
+                mode_used = _resolve_mode_used_for_turn(
+                    requested_mode=requested_conv_mode,
+                    conversation_state=conversation_state,
+                )
                 if mode_used == "replay":
                     replay_block = _render_conversation_replay_block(
                         conversation_state=conversation_state,
@@ -1437,6 +1505,10 @@ def main() -> int:
                     if replay_block:
                         prompt = prompt.rstrip() + "\n\n" + replay_block
             prompt_hash = _sha256_text(prompt)
+            native_params = _claude_native_continuation_params(
+                mode_used=mode_used,
+                conversation_state=conversation_state,
+            )
 
             prompt_dump_dir = Path(__file__).resolve().parent / ".idea_generation_logs"
             prompt_dump_path = prompt_dump_dir / f"prompt_{_now_tag()}_{next_num:03d}.txt"
@@ -1479,6 +1551,9 @@ def main() -> int:
                                 model=model,
                                 cwd=run_cwd,
                                 cli_path=cli_path,
+                                continue_conversation=bool(native_params.get("continue_conversation", False)),
+                                resume_session_id=native_params.get("resume_session_id"),
+                                fork_session=bool(native_params.get("fork_session", False)),
                             )
                         )
                     except RuntimeError:
@@ -1492,6 +1567,9 @@ def main() -> int:
                                 model=None,
                                 cwd=run_cwd,
                                 cli_path=cli_path,
+                                continue_conversation=bool(native_params.get("continue_conversation", False)),
+                                resume_session_id=native_params.get("resume_session_id"),
+                                fork_session=bool(native_params.get("fork_session", False)),
                             )
                         )
                     idea_md = str(llm_result.get("text") or "")
@@ -1582,9 +1660,12 @@ def main() -> int:
                         idea_file_turn_map[out_rel] = turn_id
                     provider = conversation_state.setdefault("provider", {})
                     if isinstance(provider, dict):
+                        provider["supports_native_continuation"] = _provider_supports_native_continuation(provider)
                         provider["last_response_id"] = llm_result.get("provider_response_id")
                         if llm_result.get("provider_session_id"):
                             provider["session_id"] = llm_result.get("provider_session_id")
+                        if bool(native_params.get("fork_session", False)):
+                            provider["branch_session_initialized"] = True
                     _compact_conversation_state(
                         state=conversation_state,
                         keep_recent_turns=max(1, int(conversation_state.get("history_window_turns") or 12)),

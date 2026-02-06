@@ -4,9 +4,11 @@ import json
 from pathlib import Path
 
 from agentic_experimentation.idea_generation.generate_ideas import (
+    _claude_native_continuation_params,
     _compact_conversation_state,
     _find_turn_index_by_operation_id,
     _load_conversation_state,
+    _resolve_mode_used_for_turn,
     _render_conversation_replay_block,
 )
 
@@ -112,3 +114,57 @@ def test_load_state_backfills_operation_map_and_lookup(tmp_path: Path) -> None:
     op_id = next(iter(op_map.keys()))
     assert op_map[op_id] == "turn_0001"
     assert _find_turn_index_by_operation_id(loaded, op_id) == 0
+
+
+def test_mode_resolution_prefers_native_for_supported_provider() -> None:
+    state = {
+        "provider": {
+            "name": "claude_agent_sdk",
+            "supports_native_continuation": True,
+        }
+    }
+    assert _resolve_mode_used_for_turn(requested_mode="auto", conversation_state=state) == "native"
+    assert _resolve_mode_used_for_turn(requested_mode="native", conversation_state=state) == "native"
+
+
+def test_mode_resolution_falls_back_to_replay_when_native_unsupported() -> None:
+    state = {
+        "provider": {
+            "name": "unknown_provider",
+            "supports_native_continuation": False,
+        }
+    }
+    assert _resolve_mode_used_for_turn(requested_mode="auto", conversation_state=state) == "replay"
+    assert _resolve_mode_used_for_turn(requested_mode="native", conversation_state=state) == "replay"
+
+
+def test_native_params_resume_and_branch_fork() -> None:
+    state = {
+        "parent_conversation_id": "node_0000",
+        "provider": {
+            "name": "claude_agent_sdk",
+            "supports_native_continuation": True,
+            "session_id": "sess_123",
+            "branch_session_initialized": False,
+        },
+    }
+    params = _claude_native_continuation_params(mode_used="native", conversation_state=state)
+    assert params["continue_conversation"] is True
+    assert params["resume_session_id"] == "sess_123"
+    assert params["fork_session"] is True
+
+
+def test_native_params_no_fork_after_branch_initialized() -> None:
+    state = {
+        "parent_conversation_id": "node_0000",
+        "provider": {
+            "name": "claude_agent_sdk",
+            "supports_native_continuation": True,
+            "session_id": "sess_123",
+            "branch_session_initialized": True,
+        },
+    }
+    params = _claude_native_continuation_params(mode_used="native", conversation_state=state)
+    assert params["continue_conversation"] is True
+    assert params["resume_session_id"] == "sess_123"
+    assert params["fork_session"] is False
