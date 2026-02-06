@@ -40,9 +40,10 @@ class DummyClient(LLMClient):
 
 class OpenAIClient(LLMClient):
     def __init__(self, config):
-        self.config = config
-        self.api_key = os.getenv(config.get("api_key_env", "OPENAI_API_KEY"), "")
-        self.base_url = config.get("base_url") or "https://api.openai.com/v1"
+        self.config = dict(config or {})
+        self.config.setdefault("debug_log", True)
+        self.api_key = os.getenv(self.config.get("api_key_env", "OPENAI_API_KEY"), "")
+        self.base_url = self.config.get("base_url") or "https://api.openai.com/v1"
 
     def generate(self, prompt, system_prompt=None):
         if not self.api_key:
@@ -68,6 +69,8 @@ class OpenAIClient(LLMClient):
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        if _should_log(self.config):
+            _ensure_default_debug_file("openai")
         result = _post_json_openai_with_fallback(
             url,
             payload,
@@ -267,6 +270,31 @@ def _log_target_file():
     return Path(path) if path else None
 
 
+def _log_target_files():
+    seen = set()
+    paths = []
+    for key in ("LLM_DEBUG_FILE", "LLM_DEBUG_FILE_SECONDARY"):
+        raw = os.getenv(key, "").strip()
+        if not raw:
+            continue
+        p = Path(raw)
+        ident = str(p)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        paths.append(p)
+    return paths
+
+
+def _ensure_default_debug_file(provider):
+    if os.getenv("LLM_DEBUG_FILE"):
+        return
+    if provider != "openai":
+        return
+    default_path = Path(__file__).resolve().parent / "logs" / "llm" / "openai_llm_debug.log"
+    os.environ["LLM_DEBUG_FILE"] = str(default_path)
+
+
 def _log_llm_call(provider, model, prompt, response):
     # Truncate to avoid huge logs
     max_len = 4000
@@ -281,11 +309,12 @@ def _log_llm_call(provider, model, prompt, response):
         "-" * 40,
     ]
     out = "\n".join(lines)
-    target = _log_target_file()
-    if target:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with open(target, "a", encoding="utf-8") as f:
-            f.write(out + "\n")
+    targets = _log_target_files()
+    if targets:
+        for target in targets:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open(target, "a", encoding="utf-8") as f:
+                f.write(out + "\n")
     else:
         print(out, file=sys.stderr)
 
@@ -313,10 +342,11 @@ def _maybe_log_http_response(debug_meta, url, status, body):
         "-" * 40,
     ]
     out = "\n".join(lines)
-    target = _log_target_file()
-    if target:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with open(target, "a", encoding="utf-8") as f:
-            f.write(out + "\n")
+    targets = _log_target_files()
+    if targets:
+        for target in targets:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open(target, "a", encoding="utf-8") as f:
+                f.write(out + "\n")
     else:
         print(out, file=sys.stderr)

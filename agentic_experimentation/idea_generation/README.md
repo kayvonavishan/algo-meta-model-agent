@@ -19,7 +19,9 @@ If you see Windows errors like `[WinError 206] The filename or extension is too 
 
 Note: the script uses Agent SDK "streaming mode" so large prompts are sent over stdin (avoids Windows command-line length limits).
 
-If runs still fail with "Command failed with exit code 1", check `agentic_experimentation/idea_generation/.idea_generation_logs/` for a `claude_debug_*.log` file.
+If runs still fail with "Command failed with exit code 1", check:
+- standalone usage: `agentic_experimentation/logs/idea_generation/claude_debug/`
+- tree runner usage: `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/logs/idea_generation/claude_debug/`
 
 ## Requirements
 

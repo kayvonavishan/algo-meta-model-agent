@@ -123,11 +123,11 @@ Conversation lineage model:
 
 Where conversation artifacts live:
 
-- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/conversations/<conversation_id>.json`
-- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/conversations/<conversation_id>.jsonl`
-- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/conversations/<conversation_id>_summary.md`
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/conversations/<conversation_id>.json` (state snapshot)
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/conversations/<conversation_id>_summary.md` (compact summary)
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/logs/conversations/<conversation_id>.jsonl` (turn log)
 - Optional debug event log:
-  - `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/conversations/conversation_debug.jsonl`
+  - `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/logs/conversations/conversation_debug.jsonl`
   - path also recorded in `manifest.json` at `conversation_config.debug_log_jsonl_path`.
 
 ### Locking / crash safety
@@ -171,7 +171,8 @@ Inside `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/`:
 - `VALIDATION_REPORT.md`: integrity checks (paths, sha256, state consistency)
 - `artifacts/`: copied sweep CSV artifacts (baseline + candidates), with sha256 provenance
 - `node_ideas/`: per-node idea files (see "Idea Management" below)
-- `eval/<eval_id>/experiment/`: per-eval multi-agent logs and outputs
+- `eval/<eval_id>/experiment/`: per-eval *outputs* (summary.json, sweep CSVs, etc.)
+- `logs/`: consolidated logs (tree, conversations, evals, idea generation, LLM)
 - `wt/<node_id>/`: worktrees for promoted nodes (the beam)
 - `cand/<eval_id>/`: temporary candidate worktrees (usually pruned)
 
@@ -181,6 +182,8 @@ Inside `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/`:
 
 There is no single "app.log" for `tree_runner.py`. Instead, debugging information is spread across a few locations.
 
+All logs are written under the consolidated `logs/` directory in each tree run.
+
 ### 1) Tree-run level state + reports
 
 Check these first to understand what the tree thinks happened:
@@ -189,59 +192,58 @@ Check these first to understand what the tree thinks happened:
 - `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/TREE_SUMMARY.md`: high-level status + best path
 - `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/VALIDATION_REPORT.md`: integrity checks (missing paths, sha256 mismatches, frontier/expanded consistency, etc.)
 - `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/run.lock.json`: lock + heartbeat metadata (useful if you hit a stale/active lock error)
-- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/tree_runner.log`: append-only orchestration log for `tree_runner.py` itself
-- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/conversations/conversation_debug.jsonl`: conversation recovery/attach/fork debug events (if configured)
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/logs/run_events.jsonl`: append-only orchestration event log for `tree_runner.py` itself
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/logs/conversations/conversation_debug.jsonl`: conversation recovery/attach/fork debug events (if configured)
 
 Tip: `tree_runner.py` prints a small JSON summary to stdout at the end of each invocation. If you want a persistent record of that, capture stdout/stderr when you run it.
 
 ### 2) Per-evaluation multi-agent logs (most useful)
 
-Each evaluated idea gets its own experiment folder at:
+Each evaluated idea has:
 
+**Outputs** (experiment folder):
 - `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/eval/<eval_id>/experiment/<eval_id>/`
+  - `summary.json`: approved status, exit codes, result paths, scoring summary
+  - `meta_config_sweep_results.csv`: candidate sweep results
 
-Common files to inspect:
-
-- `summary.json`: approved status, exit codes, result paths, scoring summary
-- `planner_prompt.txt`, `plan.md`
-- `review_round_*.md` (and optionally `_sanitized.md`, `_dropped_new_issues.txt`)
-- `tests.log` (if tests are enabled)
-- `sweep.log` (sweep stdout/stderr)
-- `meta_config_sweep_results.csv` (candidate sweep results copied into the experiment folder)
-
-Additionally, `tree_runner.py` tees the stdout/stderr of the multi-agent subprocess into:
-
-- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/eval/<eval_id>/multi_agent_runner.subprocess.log`
-
-If the coder backend uses Codex / MCP, also check:
-
-- `codex_mcp_transcript.jsonl`
-- `codex_cli_events_round_*.jsonl`, `codex_cli_stderr_round_*.log`, `codex_cli_cmd_round_*.txt`
-- `coder_prompt_round_*.txt`, `coder_output_round_*.txt`, `diff_round_*.diff`
-
-If Agents SDK tracing is enabled, a local JSONL trace is also written:
-
-- `agents_trace.jsonl`
+**Logs** (consolidated):
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/logs/evals/<eval_id>/`
+  - `multi_agent_runner.subprocess.log`: stdout/stderr from `multi_agent_runner.py`
+  - `eval_events.jsonl`: structured eval lifecycle events (queued/started/requeued/completed)
+  - `tests.log` (if tests are enabled)
+  - `sweep.log` (sweep stdout/stderr)
+  - `agents_trace.jsonl` (Agents SDK tracing)
+  - `codex_mcp_transcript.jsonl`
+  - `codex_cli_events_round_*.jsonl`, `codex_cli_stderr_round_*.log`, `codex_cli_cmd_round_*.txt`
+  - `coder_prompt_round_*.txt`, `coder_output_round_*.txt`, `diff_round_*.diff`
+  - `reviewer_prompt_round_*.txt`, `review_round_*.md` (and optionally `_sanitized.md`)
+  - `review_round_*_dropped_new_issues.txt` (only if reviewer introduced new issues after round 0)
+  - `plan.md`, `planner_prompt.txt`
+  - `codex_session_id.txt`, `codex_run_details_round_*.json` (if Codex is used)
 
 ### 3) Idea generation logs (when ideas look low-quality or duplicated)
 
-The ideas generated for each node are stored under:
+Ideas generated for each node live here:
 
 - `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/node_ideas/<node_id>/`
 
-If `tree_runner.py` had to generate missing ideas for a node, it also tees the stdout/stderr of the idea generation subprocess into:
+Idea generation logs are consolidated here:
 
-- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/node_ideas/<node_id>/generate_ideas.subprocess.log`
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/logs/idea_generation/`
+  - `generate_ideas.subprocess.node_<node_id>.log` (stdout/stderr from `generate_ideas.py`)
+  - `prompts/` (prompt dumps)
+  - `claude_debug/` (Claude SDK debug logs)
 
-If you want to inspect the raw prompt/context used during idea generation, check:
+### 4) LLM debug logs (OpenAI direct calls)
 
-- `agentic_experimentation/idea_generation/.idea_generation_logs/` (e.g. `prompt_*.txt`, `claude_debug_*.log`)
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/logs/llm/openai_llm_debug.log`
+  - Raw prompt/response and HTTP response bodies for direct OpenAI calls (when enabled).
 
-### 4) Sweep output outside the tree run (optional)
+### 5) Sweep output outside the tree run (optional)
 
 If `agent_config.json` sets `agentic_output_root`, sweeps may also write to an external per-run directory (in addition to what is copied into the tree run's `eval/...` folders). Use `summary.json` to locate the exact output path.
 
-### 5) Phoenix / Arize traces (external)
+### 6) Phoenix / Arize traces (external)
 
 If Phoenix tracing is enabled (via `PHOENIX_*` env vars and/or agent config), LLM/tool spans are emitted by:
 
@@ -362,7 +364,7 @@ Open `VALIDATION_REPORT.md` in the run folder. It can flag:
 - If a conversation JSON is partially written/corrupt, runner/idea generation recover it to `*.corrupt_<timestamp>` and continue from a fresh state.
 - Recovery events are recorded in:
   - `manifest.json -> events[]` (`type=conversation_json_recovery`)
-  - `conversations/conversation_debug.jsonl`
+  - `logs/conversations/conversation_debug.jsonl`
 - `--idea-conversation-mode auto` now uses provider-native continuation for Claude sessions when a resumable provider session is available; otherwise it falls back to replay.
 - In branch forks, the first child-node idea-generation call resumes the parent session and forks to a child session; subsequent calls continue on the child session.
 - If you need deterministic behavior, use `--idea-conversation-mode replay`.

@@ -29,6 +29,7 @@ def _bootstrap_resume_run(
     max_parallel_evals: int,
     max_parallel_per_node: int | None = None,
     eval_retries: int = 0,
+    strict_fail_depth: bool = False,
     sweep_config_limit: int = 5,
     preexisting_evaluations: dict[str, dict[str, Any]] | None = None,
     task_plan_depth0: list[dict[str, Any]] | None = None,
@@ -78,7 +79,7 @@ def _bootstrap_resume_run(
             "parallel_backend": "threadpool",
             "eval_retries": int(eval_retries),
             "eval_timeout_seconds": None,
-            "strict_fail_depth": False,
+            "strict_fail_depth": bool(strict_fail_depth),
             "sweep_config_limit": int(sweep_config_limit),
             "max_total_idea_evals": None,
             "stop_on_empty_frontier": True,
@@ -103,7 +104,7 @@ def _bootstrap_resume_run(
             "mode": "auto",
             "history_window_turns": 12,
             "history_max_chars": 20000,
-            "debug_log_jsonl_path": str(run_root / "conversations" / "conversation_debug.jsonl"),
+            "debug_log_jsonl_path": str(run_root / "logs" / "conversations" / "conversation_debug.jsonl"),
         },
         "root": {
             "root_commit": "dry_root_commit",
@@ -428,3 +429,48 @@ def test_resume_running_eval_is_reused_without_duplication(monkeypatch, tmp_path
     assert eval_rec.get("status") == "completed"
     assert eval_rec.get("task_state") == "completed"
     assert int(eval_rec.get("attempt") or 0) >= 2
+
+
+def test_strict_fail_depth_skips_remaining_tasks(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    baseline_csv = tmp_path / "baseline.csv"
+    baseline_csv.write_text("config_id,status\n0,ok\n1,ok\n", encoding="utf-8")
+    config_path = tmp_path / "agent_config.json"
+    _write_json(config_path, {"baseline_csv": str(baseline_csv), "scoring": {"score_column": "core_topN_sharpe"}})
+
+    _bootstrap_resume_run(
+        runs_root=runs_root,
+        tree_run_id="strict_fail_case",
+        config_path=config_path,
+        baseline_csv=baseline_csv,
+        ideas_per_node=2,
+        beam_width=1,
+        max_depth=1,
+        max_parallel_evals=1,
+        eval_retries=0,
+        strict_fail_depth=True,
+        sweep_config_limit=2,
+    )
+
+    def failing_worker(**kwargs: Any) -> dict[str, Any]:
+        eval_id = str(kwargs.get("eval_id") or "")
+        if eval_id == "0001":
+            return {
+                "status": "failed",
+                "error": "forced_failure",
+                "timed_out": False,
+                "updates": {},
+                "cleanup_requests": [],
+            }
+        return _stub_completed_worker(**kwargs)
+
+    monkeypatch.setattr(tree_runner, "_execute_eval_task_worker", failing_worker)
+    manifest = _run_tree_resume_dry(runs_root=runs_root, tree_run_id="strict_fail_case", config_path=config_path)
+
+    evals = manifest.get("evaluations") or {}
+    eval_1 = evals.get("0001") or {}
+    eval_2 = evals.get("0002") or {}
+
+    assert eval_1.get("status") == "failed"
+    assert eval_2.get("status") == "failed"
+    assert (eval_2.get("error_payload") or {}).get("error_type") == "StrictDepthFailure"

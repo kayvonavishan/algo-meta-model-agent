@@ -22,15 +22,17 @@ graph TD
 
 ## Artifact pipeline (per iteration)
 
+Log files are written under `<exp_dir>/logs/` (or `AGENTIC_EVAL_LOG_DIR` when set). Non-log artifacts (like `summary.json` or `meta_config_sweep_results.csv`) stay in `<exp_dir>/`.
+
 - `idea.md`: selected idea text.
-- `planner_prompt.txt` / `plan.md`: prompt and detailed plan.
-- `coder_prompt_round_<n>.txt` / `coder_output_round_<n>.txt`: coder prompt and final natural-language summary per round.
-- `diff_round_<n>.diff`: cumulative `git diff` after each coder round (includes untracked files via `git diff --no-index`).
-- `reviewer_prompt_round_<n>.txt` / `review_round_<n>.md`: reviewer prompt and verdict per round.
-- `agents_trace.jsonl`: local JSONL trace of outer-agent spans (LLM calls, tool calls, etc.).
-- `codex_mcp_transcript.jsonl`: local JSONL transcript of Codex MCP tool calls and key events (`tool_call`, `tool_result`, `session_configured`, etc.).
-- `tests.log`: optional test run output.
-- `sweep.log`: sweep command output.
+- `planner_prompt.txt` / `plan.md`: prompt and detailed plan (log dir).
+- `coder_prompt_round_<n>.txt` / `coder_output_round_<n>.txt`: coder prompt and final natural-language summary per round (log dir).
+- `diff_round_<n>.diff`: cumulative `git diff` after each coder round (includes untracked files via `git diff --no-index`) (log dir).
+- `reviewer_prompt_round_<n>.txt` / `review_round_<n>.md`: reviewer prompt and verdict per round (log dir).
+- `agents_trace.jsonl`: local JSONL trace of outer-agent spans (LLM calls, tool calls, etc.) (log dir).
+- `codex_mcp_transcript.jsonl`: local JSONL transcript of Codex MCP tool calls and key events (`tool_call`, `tool_result`, `session_configured`, etc.) (log dir).
+- `tests.log`: optional test run output (log dir).
+- `sweep.log`: sweep command output (log dir).
 - `meta_config_sweep_results.csv`: copied sweep results (if produced).
 - `summary.json`: run metadata (idea, plan, review verdict, tests/sweep exit codes, score).
 
@@ -41,6 +43,7 @@ Each iteration creates an isolated git worktree, then loops `plan → edit → d
 1. **Create run directory + worktree**
    - Worktree: `agentic_experimentation/worktrees/<run_id>/`
    - Artifacts: `agentic_experimentation/experiments/<run_id>/`
+   - Logs: `agentic_experimentation/experiments/<run_id>/logs/` (or `AGENTIC_EVAL_LOG_DIR`)
 2. **Planner LLM generates a plan**
    - Inputs: `idea.md`, repo context from `planner_repo_files.txt` (if configured)
    - Outputs: `planner_prompt.txt`, `plan.md`
@@ -104,7 +107,7 @@ The coder edits files in-place via Codex MCP. The runner records the resulting c
 
 ## Debugging and tracing
 
-- Local per-run tracing:
+- Local per-run tracing (log dir):
   - `agents_trace.jsonl`: planner/reviewer model calls and spans.
   - `codex_mcp_transcript.jsonl`: Codex MCP I/O (this is the primary “what exactly did Codex do?” log).
 - Codex rollout log:

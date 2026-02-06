@@ -482,7 +482,7 @@ def _render_conversation_replay_block(
 
 
 def _write_debug_log(*, resolved_cli_path: str, cwd: Path, model: Optional[str], prompt_len: int, stderr_lines: List[str], exc: Exception) -> Path:
-    log_dir = Path(__file__).resolve().parent / ".idea_generation_logs"
+    log_dir = _idea_log_root() / "claude_debug"
     log_path = log_dir / f"claude_debug_{_now_tag()}.log"
     body = "\n".join(
         [
@@ -502,6 +502,20 @@ def _write_debug_log(*, resolved_cli_path: str, cwd: Path, model: Optional[str],
     )
     _write_text(log_path, body)
     return log_path
+
+
+def _idea_log_root() -> Path:
+    raw = os.getenv("AGENTIC_IDEA_LOG_DIR") or os.getenv("AGENTIC_LOG_DIR") or ""
+    raw = str(raw).strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    default_dir = Path(__file__).resolve().parents[1] / "logs" / "idea_generation"
+    default_dir.mkdir(parents=True, exist_ok=True)
+    return default_dir
 
 
 def _load_env_files(paths: Iterable[Path]) -> None:
@@ -1552,7 +1566,7 @@ def main() -> int:
                 conversation_state=conversation_state,
             )
 
-            prompt_dump_dir = Path(__file__).resolve().parent / ".idea_generation_logs"
+            prompt_dump_dir = _idea_log_root() / "prompts"
             prompt_dump_path = prompt_dump_dir / f"prompt_{_now_tag()}_{next_num:03d}.txt"
             _write_text(prompt_dump_path, prompt)
 

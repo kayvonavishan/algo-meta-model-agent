@@ -61,6 +61,20 @@ def _truncate_for_phoenix(text: str) -> str:
     return s[:max_chars] + "\n... [truncated]\n"
 
 
+def _resolve_log_dir(exp_dir: Path) -> Path:
+    raw = os.environ.get("AGENTIC_EVAL_LOG_DIR") or os.environ.get("AGENTIC_LOG_DIR") or ""
+    raw = str(raw).strip()
+    if not raw:
+        p = Path(exp_dir) / "logs"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = Path(exp_dir) / p
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def _read_jsonl_objects(path):  # noqa: ANN001
     items = []
     if not path:
@@ -101,27 +115,30 @@ def _normalize_round_idx(val):  # noqa: ANN001
 def _write_codex_run_details(*, exp_dir, run_id, round_idx, backend, worktree_path):  # noqa: ANN001
     exp_dir = Path(exp_dir)
     exp_dir.mkdir(parents=True, exist_ok=True)
-    out_path = exp_dir / f"codex_run_details_round_{round_idx}.json"
+    log_dir = _resolve_log_dir(exp_dir)
+    codex_cli_root = log_dir / "codex_cli"
+    codex_cli_root.mkdir(parents=True, exist_ok=True)
+    out_path = log_dir / f"codex_run_details_round_{round_idx}.json"
 
     details = {
         "run_id": str(run_id),
         "round_idx": round_idx,
         "backend": str(backend),
         "worktree_path": str(worktree_path),
-        "coder_prompt_path": str(exp_dir / f"coder_prompt_round_{round_idx}.txt"),
-        "coder_output_path": str(exp_dir / f"coder_output_round_{round_idx}.txt"),
-        "diff_path": str(exp_dir / f"diff_round_{round_idx}.diff"),
-        "codex_mcp_transcript_path": str(exp_dir / "codex_mcp_transcript.jsonl"),
-        "codex_cli_events_path": str(exp_dir / f"codex_cli_events_round_{round_idx}.jsonl"),
-        "codex_cli_stderr_path": str(exp_dir / f"codex_cli_stderr_round_{round_idx}.log"),
-        "codex_cli_cmd_path": str(exp_dir / f"codex_cli_cmd_round_{round_idx}.txt"),
-        "codex_cli_last_message_path": str(exp_dir / f"codex_cli_last_message_round_{round_idx}.txt"),
-        "codex_session_id_path": str(exp_dir / "codex_session_id.txt"),
+        "coder_prompt_path": str(log_dir / f"coder_prompt_round_{round_idx}.txt"),
+        "coder_output_path": str(log_dir / f"coder_output_round_{round_idx}.txt"),
+        "diff_path": str(log_dir / f"diff_round_{round_idx}.diff"),
+        "codex_mcp_transcript_path": str(log_dir / "codex_mcp_transcript.jsonl"),
+        "codex_cli_events_path": str(codex_cli_root / f"codex_cli_events_round_{round_idx}.jsonl"),
+        "codex_cli_stderr_path": str(codex_cli_root / f"codex_cli_stderr_round_{round_idx}.log"),
+        "codex_cli_cmd_path": str(codex_cli_root / f"codex_cli_cmd_round_{round_idx}.txt"),
+        "codex_cli_last_message_path": str(codex_cli_root / f"codex_cli_last_message_round_{round_idx}.txt"),
+        "codex_session_id_path": str(log_dir / "codex_session_id.txt"),
     }
 
     # Best-effort: include transcript events for this run/round for quick inspection.
     events = []
-    mcp_path = exp_dir / "codex_mcp_transcript.jsonl"
+    mcp_path = log_dir / "codex_mcp_transcript.jsonl"
     if mcp_path.exists():
         for obj in _read_jsonl_objects(mcp_path):
             if str(obj.get("run_id") or "") != str(run_id):
@@ -134,7 +151,7 @@ def _write_codex_run_details(*, exp_dir, run_id, round_idx, backend, worktree_pa
     details["codex_mcp_events"] = events
 
     cli_events = []
-    cli_path = exp_dir / f"codex_cli_events_round_{round_idx}.jsonl"
+    cli_path = codex_cli_root / f"codex_cli_events_round_{round_idx}.jsonl"
     if cli_path.exists():
         cli_events = _read_jsonl_objects(cli_path)
     details["codex_cli_events"] = cli_events
@@ -449,7 +466,7 @@ def _ensure_trace_processor_registered():
         def _write(self, payload):  # noqa: ANN001
             ctx = _TRACE_CONTEXT.get() or {}
             exp_dir = Path(ctx.get("exp_dir") or os.environ.get("AGENTIC_TRACE_DIR") or ".")
-            exp_dir.mkdir(parents=True, exist_ok=True)
+            log_dir = _resolve_log_dir(exp_dir)
             payload = dict(payload)
             payload["ts"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
             payload["run_id"] = ctx.get("run_id") or os.environ.get("AGENTIC_TRACE_RUN_ID")
@@ -457,12 +474,12 @@ def _ensure_trace_processor_registered():
             payload["round_idx"] = ctx.get("round_idx")
             if payload["round_idx"] is None:
                 payload["round_idx"] = os.environ.get("AGENTIC_TRACE_ROUND") or None
-            _append_jsonl(exp_dir / "agents_trace.jsonl", payload)
+            _append_jsonl(log_dir / "agents_trace.jsonl", payload)
 
         def _write_codex(self, payload):  # noqa: ANN001
             ctx = _TRACE_CONTEXT.get() or {}
             exp_dir = Path(ctx.get("exp_dir") or os.environ.get("AGENTIC_TRACE_DIR") or ".")
-            exp_dir.mkdir(parents=True, exist_ok=True)
+            log_dir = _resolve_log_dir(exp_dir)
             payload = dict(payload)
             payload["ts"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
             payload["run_id"] = ctx.get("run_id") or os.environ.get("AGENTIC_TRACE_RUN_ID")
@@ -470,7 +487,7 @@ def _ensure_trace_processor_registered():
             payload["round_idx"] = ctx.get("round_idx")
             if payload["round_idx"] is None:
                 payload["round_idx"] = os.environ.get("AGENTIC_TRACE_ROUND") or None
-            _append_jsonl(exp_dir / "codex_mcp_transcript.jsonl", payload)
+            _append_jsonl(log_dir / "codex_mcp_transcript.jsonl", payload)
 
     add_trace_processor(_JsonlTraceProcessor())
     _TRACE_PROCESSOR_REGISTERED = True
@@ -486,7 +503,7 @@ def _append_jsonl(path, payload):  # noqa: ANN001
 def _append_codex_transcript(payload):  # noqa: ANN001
     ctx = _TRACE_CONTEXT.get() or {}
     exp_dir = Path(ctx.get("exp_dir") or os.environ.get("AGENTIC_TRACE_DIR") or ".")
-    exp_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = _resolve_log_dir(exp_dir)
     payload = dict(payload)
     payload["ts"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
     payload["run_id"] = ctx.get("run_id") or os.environ.get("AGENTIC_TRACE_RUN_ID")
@@ -494,7 +511,7 @@ def _append_codex_transcript(payload):  # noqa: ANN001
     payload["round_idx"] = ctx.get("round_idx")
     if payload["round_idx"] is None:
         payload["round_idx"] = os.environ.get("AGENTIC_TRACE_ROUND") or None
-    _append_jsonl(exp_dir / "codex_mcp_transcript.jsonl", payload)
+    _append_jsonl(log_dir / "codex_mcp_transcript.jsonl", payload)
 
 
 def _call_tool_result_to_text(result):  # noqa: ANN001
@@ -766,6 +783,7 @@ async def _main_async():
             run_id = f"{base_run_id}_{i:02d}"
         exp_dir = experiments_root / run_id
         exp_dir.mkdir(parents=True, exist_ok=True)
+        log_dir = _resolve_log_dir(exp_dir)
 
         run_stack = contextlib.ExitStack()
         run_stack.__enter__()
@@ -824,7 +842,8 @@ async def _main_async():
                 repo_context=planner_context,
                 meta_model_guide=meta_model_guide,
             )
-            _write_text(exp_dir / "planner_prompt.txt", planner_prompt)
+            planner_prompt_path = log_dir / "planner_prompt.txt"
+            _write_text(planner_prompt_path, planner_prompt)
             planner_system = _read_text(planner_system_path) if planner_system_path else SYSTEM_PROMPT
             plan_text = ""
 
@@ -835,7 +854,7 @@ async def _main_async():
                     attributes={
                         "run_id": run_id,
                         "step": "planner",
-                        "planner_prompt_path": str(exp_dir / "planner_prompt.txt"),
+                                "planner_prompt_path": str(planner_prompt_path),
                     },
                 )
             with planner_span_cm as planner_span:
@@ -849,7 +868,7 @@ async def _main_async():
                     plan_text = "PLAN:\n1. (dry-run) No-op.\nRISKS:\n- dry-run\n"
                 else:
                     _ensure_trace_processor_registered()
-                    with _tracing_scope(exp_dir=exp_dir, run_id=run_id, step="planner"):
+                    with _tracing_scope(exp_dir=log_dir, run_id=run_id, step="planner"):
                         plan_call = await _agents_sdk_generate_text(
                             config.get("agents", {}).get("planner", {}),
                             system_prompt=planner_system,
@@ -873,7 +892,7 @@ async def _main_async():
                                 phoenix_obs.set_text(planner_span, "agents.run_details_json", plan_call.run_details_preview)
                         except Exception:  # pylint: disable=broad-except
                             pass
-            _write_text(exp_dir / "plan.md", plan_text)
+            _write_text(log_dir / "plan.md", plan_text)
 
             # Coder <-> Reviewer repair loop (in-place edits in the same worktree via Codex MCP)
             coder_system = _read_text(coder_system_path) if coder_system_path else SYSTEM_PROMPT
@@ -905,13 +924,14 @@ async def _main_async():
                     prev_diff_text=diff_text,
                     meta_model_guide=meta_model_guide,
                 )
-                _write_text(exp_dir / f"coder_prompt_round_{round_idx}.txt", coder_prompt)
+                coder_prompt_path = log_dir / f"coder_prompt_round_{round_idx}.txt"
+                _write_text(coder_prompt_path, coder_prompt)
 
                 if args.dry_run_llm:
                     coder_output = "(dry-run) skipped Codex edits."
                 else:
                     _ensure_trace_processor_registered()
-                    with _tracing_scope(exp_dir=exp_dir, run_id=run_id, step="coder", round_idx=round_idx):
+                    with _tracing_scope(exp_dir=log_dir, run_id=run_id, step="coder", round_idx=round_idx):
                         codex_span_cm = contextlib.nullcontext()
                         if phoenix_tracer is not None:
                             codex_span_cm = phoenix_tracer.start_as_current_span(
@@ -922,7 +942,7 @@ async def _main_async():
                                     "round_idx": round_idx,
                                     "backend": coder_backend,
                                     "worktree_path": str(worktree_path),
-                                    "coder_prompt_path": str(exp_dir / f"coder_prompt_round_{round_idx}.txt"),
+                                    "coder_prompt_path": str(coder_prompt_path),
                                     "codex_session_id": str(codex_session_id) if codex_session_id else None,
                                 },
                             )
@@ -990,10 +1010,12 @@ async def _main_async():
                                         phoenix_obs.set_text(codex_span, "codex.run_details_json", codex_details_preview)
                                 except Exception:  # pylint: disable=broad-except
                                     pass
-                _write_text(exp_dir / f"coder_output_round_{round_idx}.txt", coder_output)
+                coder_output_path = log_dir / f"coder_output_round_{round_idx}.txt"
+                _write_text(coder_output_path, coder_output)
 
                 diff_text = _git_diff_with_untracked(worktree_path)
-                _write_text(exp_dir / f"diff_round_{round_idx}.diff", diff_text)
+                diff_path = log_dir / f"diff_round_{round_idx}.diff"
+                _write_text(diff_path, diff_text)
 
                 if run_span is not None:
                     try:
@@ -1001,9 +1023,9 @@ async def _main_async():
                             "agentic.round_artifacts",
                             {
                                 "round_idx": round_idx,
-                                "coder_prompt_path": str(exp_dir / f"coder_prompt_round_{round_idx}.txt"),
-                                "coder_output_path": str(exp_dir / f"coder_output_round_{round_idx}.txt"),
-                                "diff_path": str(exp_dir / f"diff_round_{round_idx}.diff"),
+                                "coder_prompt_path": str(coder_prompt_path),
+                                "coder_output_path": str(coder_output_path),
+                                "diff_path": str(diff_path),
                             },
                         )
                     except Exception:  # pylint: disable=broad-except
@@ -1036,7 +1058,7 @@ async def _main_async():
                         )
                     review_text = "VERDICT: REJECT\nISSUES:\n" + "\n".join(issues_lines) + "\nNOTES:\n" + "\n".join(notes_lines) + "\n"
                     review_issues = "; ".join(i.lstrip("- ").strip() for i in issues_lines)
-                    _write_text(exp_dir / f"review_round_{round_idx}.md", review_text)
+                    _write_text(log_dir / f"review_round_{round_idx}.md", review_text)
                     review_rounds.append(
                         {
                             "round": round_idx,
@@ -1057,7 +1079,8 @@ async def _main_async():
                     review_round_idx=round_idx,
                     baseline_issues=(baseline_review_issues or "(none)"),
                 )
-                _write_text(exp_dir / f"reviewer_prompt_round_{round_idx}.txt", review_prompt)
+                reviewer_prompt_path = log_dir / f"reviewer_prompt_round_{round_idx}.txt"
+                _write_text(reviewer_prompt_path, review_prompt)
 
                 reviewer_span_cm = contextlib.nullcontext()
                 if phoenix_tracer is not None:
@@ -1067,7 +1090,7 @@ async def _main_async():
                             "run_id": run_id,
                             "step": "reviewer",
                             "round_idx": round_idx,
-                            "reviewer_prompt_path": str(exp_dir / f"reviewer_prompt_round_{round_idx}.txt"),
+                            "reviewer_prompt_path": str(reviewer_prompt_path),
                         },
                     )
                 with reviewer_span_cm as reviewer_span:
@@ -1081,7 +1104,7 @@ async def _main_async():
                         review_text = "VERDICT: REJECT\nISSUES:\n- dry-run\nNOTES:\n- dry-run\n"
                     else:
                         _ensure_trace_processor_registered()
-                        with _tracing_scope(exp_dir=exp_dir, run_id=run_id, step="reviewer", round_idx=round_idx):
+                        with _tracing_scope(exp_dir=log_dir, run_id=run_id, step="reviewer", round_idx=round_idx):
                             review_call = await _agents_sdk_generate_text(
                                 config.get("agents", {}).get("reviewer", {}),
                                 system_prompt=reviewer_system,
@@ -1109,7 +1132,7 @@ async def _main_async():
                                     )
                             except Exception:  # pylint: disable=broad-except
                                 pass
-                _write_text(exp_dir / f"review_round_{round_idx}.md", review_text)
+                _write_text(log_dir / f"review_round_{round_idx}.md", review_text)
 
                 if run_span is not None:
                     try:
@@ -1117,8 +1140,8 @@ async def _main_async():
                             "agentic.reviewer_artifacts",
                             {
                                 "round_idx": round_idx,
-                                "reviewer_prompt_path": str(exp_dir / f"reviewer_prompt_round_{round_idx}.txt"),
-                                "review_path": str(exp_dir / f"review_round_{round_idx}.md"),
+                                "reviewer_prompt_path": str(log_dir / f"reviewer_prompt_round_{round_idx}.txt"),
+                                "review_path": str(log_dir / f"review_round_{round_idx}.md"),
                             },
                         )
                     except Exception:  # pylint: disable=broad-except
@@ -1137,10 +1160,10 @@ async def _main_async():
                     # Prevent accidental scope creep: pass only baseline issues to the coder even if the
                     # reviewer violates the "no new issues after round 0" rule.
                     review_text = _replace_issues_section(review_text, review_issues)
-                    _write_text(exp_dir / f"review_round_{round_idx}_sanitized.md", review_text)
+                    _write_text(log_dir / f"review_round_{round_idx}_sanitized.md", review_text)
                     if dropped_new:
                         _write_text(
-                            exp_dir / f"review_round_{round_idx}_dropped_new_issues.txt",
+                            log_dir / f"review_round_{round_idx}_dropped_new_issues.txt",
                             "\n".join(dropped_new).strip() + "\n",
                         )
                 review_rounds.append(
@@ -1169,7 +1192,7 @@ async def _main_async():
             # Tests
             test_cmd = config.get("test_command")
             if proceed and test_cmd:
-                tests_log = exp_dir / "tests.log"
+                tests_log = _resolve_log_dir(exp_dir) / "tests.log"
                 test_cwd_value = config.get("test_cwd", ".")
                 test_cwd = Path(test_cwd_value)
                 if not test_cwd.is_absolute():
@@ -1206,7 +1229,7 @@ async def _main_async():
 
             # Sweep
             if proceed:
-                sweep_log = exp_dir / "sweep.log"
+                sweep_log = _resolve_log_dir(exp_dir) / "sweep.log"
                 run_results_csv = results_csv
                 env_extra = None
                 if agentic_output_root:
@@ -1295,7 +1318,7 @@ async def _main_async():
                                 pass
 
             if codex_session_id:
-                _write_text(exp_dir / "codex_session_id.txt", str(codex_session_id).strip() + "\n")
+                _write_text(log_dir / "codex_session_id.txt", str(codex_session_id).strip() + "\n")
 
             summary = {
                 "run_id": run_id,
@@ -1327,7 +1350,7 @@ async def _main_async():
                 if not completed_dir:
                     completed_dir = Path(ideas_path) / "completed"
                 dest = _archive_idea_file(idea_path=idea_entry["path"], completed_dir=completed_dir, run_id=run_id)
-                _write_text(exp_dir / "idea_archived_to.txt", str(dest) + "\n")
+                _write_text(log_dir / "idea_archived_to.txt", str(dest) + "\n")
         except BaseException:  # noqa: BLE001
             exc_info = sys.exc_info()
             raise
@@ -1586,11 +1609,15 @@ def _codex_cli_edit_repo_sync(  # noqa: PLR0913
     exp_dir = Path(exp_dir)
     exp_dir.mkdir(parents=True, exist_ok=True)
 
-    events_path = exp_dir / f"codex_cli_events_round_{round_idx}.jsonl"
-    stderr_path = exp_dir / f"codex_cli_stderr_round_{round_idx}.log"
-    last_message_path = exp_dir / f"codex_cli_last_message_round_{round_idx}.txt"
-    cmd_path = exp_dir / f"codex_cli_cmd_round_{round_idx}.txt"
-    login_status_path = exp_dir / "codex_cli_login_status.txt"
+    log_dir = _resolve_log_dir(exp_dir)
+    codex_cli_root = log_dir / "codex_cli"
+    codex_cli_root.mkdir(parents=True, exist_ok=True)
+
+    events_path = codex_cli_root / f"codex_cli_events_round_{round_idx}.jsonl"
+    stderr_path = codex_cli_root / f"codex_cli_stderr_round_{round_idx}.log"
+    last_message_path = codex_cli_root / f"codex_cli_last_message_round_{round_idx}.txt"
+    cmd_path = codex_cli_root / f"codex_cli_cmd_round_{round_idx}.txt"
+    login_status_path = codex_cli_root / "codex_cli_login_status.txt"
 
     codex_prefix = _resolve_codex_cli_prefix(codex_cli_cfg=codex_cli_cfg)
     # `-C` makes the workspace root explicit; this avoids cases where Codex defaults to

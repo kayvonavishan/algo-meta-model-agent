@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -284,6 +284,7 @@ def _ensure_standard_run_dirs(run_root: Path) -> dict[str, Path]:
     conversations_root = run_root / "conversations"
     for p in (wt_root, cand_root, node_ideas_root, artifacts_root, eval_root, conversations_root):
         _safe_mkdir(p)
+    _ensure_log_dirs(run_root)
     return {
         "wt_root": wt_root,
         "cand_root": cand_root,
@@ -292,6 +293,115 @@ def _ensure_standard_run_dirs(run_root: Path) -> dict[str, Path]:
         "eval_root": eval_root,
         "conversations_root": conversations_root,
     }
+
+
+def _ensure_log_dirs(run_root: Path) -> dict[str, Path]:
+    logs_root = run_root / "logs"
+    conversations_root = logs_root / "conversations"
+    evals_root = logs_root / "evals"
+    idea_generation_root = logs_root / "idea_generation"
+    llm_root = logs_root / "llm"
+    for p in (logs_root, conversations_root, evals_root, idea_generation_root, llm_root):
+        _safe_mkdir(p)
+    return {
+        "logs_root": logs_root,
+        "conversations_root": conversations_root,
+        "evals_root": evals_root,
+        "idea_generation_root": idea_generation_root,
+        "llm_root": llm_root,
+    }
+
+
+def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", errors="replace") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        return
+
+
+def _make_log_record(
+    *,
+    level: str,
+    component: str,
+    run_id: str,
+    event: str,
+    message: str,
+    eval_id: Optional[str] = None,
+    node_id: Optional[str] = None,
+    payload: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    rec: dict[str, Any] = {
+        "ts": _utc_now_iso(),
+        "level": str(level),
+        "component": str(component),
+        "run_id": str(run_id),
+        "event": str(event),
+        "message": str(message),
+    }
+    if eval_id is not None:
+        rec["eval_id"] = str(eval_id)
+    if node_id is not None:
+        rec["node_id"] = str(node_id)
+    if payload:
+        rec["payload"] = payload
+    return rec
+
+
+def _append_log_records(paths: Sequence[Path], record: dict[str, Any]) -> None:
+    for path in paths:
+        _append_jsonl(Path(path), record)
+
+
+def _run_event_log_paths(run_root: Path) -> list[Path]:
+    return [_ensure_log_dirs(run_root)["logs_root"] / "run_events.jsonl"]
+
+
+def _eval_log_roots(run_root: Path, eval_id: str) -> list[Path]:
+    return [_ensure_log_dirs(run_root)["evals_root"] / str(eval_id)]
+
+
+def _eval_event_log_paths(run_root: Path, eval_id: str) -> list[Path]:
+    return [root / "eval_events.jsonl" for root in _eval_log_roots(run_root, eval_id)]
+
+
+def _conversation_turn_log_paths(run_root: Path, conversation_id: str) -> dict[str, Optional[Path]]:
+    cid = str(conversation_id)
+    consolidated = _ensure_log_dirs(run_root)["conversations_root"] / f"{cid}.jsonl"
+    return {"primary": consolidated, "secondary": None}
+
+
+def _conversation_debug_log_paths(*, manifest: dict[str, Any], run_root: Path) -> list[Path]:
+    cfg = manifest.get("conversation_config") or {}
+    if isinstance(cfg, dict):
+        raw = str(cfg.get("debug_log_jsonl_path") or "").strip()
+    else:
+        raw = ""
+    default_consolidated = _ensure_log_dirs(run_root)["conversations_root"] / "conversation_debug.jsonl"
+    if raw:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = run_root / p
+        return [p]
+    return [default_consolidated]
+
+
+def _idea_log_roots(run_root: Path, node_id: str) -> list[Path]:
+    return [_ensure_log_dirs(run_root)["idea_generation_root"]]
+
+
+def _idea_subprocess_log_paths(run_root: Path, node_id: str) -> list[Path]:
+    return [
+        _ensure_log_dirs(run_root)["idea_generation_root"] / f"generate_ideas.subprocess.node_{node_id}.log"
+    ]
+
+
+def _llm_debug_log_paths(*, run_root: Path, repo_root: Path) -> dict[str, Optional[Path]]:
+    consolidated = _ensure_log_dirs(run_root)["llm_root"] / "openai_llm_debug.log"
+    return {"primary": consolidated, "secondary": None}
+
+
 
 
 def _node_ref_name(tree_run_id: str, node_id: str) -> str:
@@ -412,11 +522,42 @@ def _append_tree_log(run_root: Path, message: str) -> None:
     have no side-effects.
     """
     try:
-        ts = _utc_now_iso()
-        p = run_root / "tree_runner.log"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("a", encoding="utf-8", errors="replace") as f:
-            f.write(f"[{ts}] {message.rstrip()}\n")
+        msg = (message or "").rstrip()
+        event = msg.split(" ", 1)[0] if msg else "log"
+        rec = _make_log_record(
+            level="info",
+            component="tree_runner",
+            run_id=str(run_root.name),
+            event=event,
+            message=msg,
+        )
+        _append_log_records(_run_event_log_paths(run_root), rec)
+    except Exception:
+        return
+
+
+def _append_eval_event(
+    *,
+    run_root: Path,
+    eval_id: str,
+    event: str,
+    message: str,
+    level: str = "info",
+    node_id: Optional[str] = None,
+    payload: Optional[dict[str, Any]] = None,
+) -> None:
+    try:
+        rec = _make_log_record(
+            level=level,
+            component="tree_runner",
+            run_id=str(run_root.name),
+            eval_id=str(eval_id),
+            node_id=(str(node_id) if node_id is not None else None),
+            event=str(event),
+            message=str(message),
+            payload=payload,
+        )
+        _append_log_records(_eval_event_log_paths(run_root, str(eval_id)), rec)
     except Exception:
         return
 
@@ -687,6 +828,14 @@ def _execute_eval_task_worker(
         except Exception as exc:  # noqa: BLE001
             status = "failed"
             error = f"{type(exc).__name__}: {exc}"
+        _append_eval_event(
+            run_root=run_root,
+            eval_id=str(eval_id),
+            node_id=str(node_id),
+            event="eval_finished",
+            message=f"eval finished status={status}",
+            payload={"status": status, "error": error, "timed_out": False},
+        )
         return {
             "status": status,
             "error": error,
@@ -716,6 +865,16 @@ def _execute_eval_task_worker(
         env = dict(os.environ)
         env["AGENTIC_OUTPUT_DIR"] = str(sweep_output_dir)
         env["AGENTIC_RESULTS_CSV"] = str(sweep_results_csv)
+        eval_log_roots = _eval_log_roots(run_root, eval_id)
+        primary_eval_log_root = eval_log_roots[0] if eval_log_roots else (_ensure_log_dirs(run_root)["evals_root"] / eval_id)
+        primary_eval_log_root.mkdir(parents=True, exist_ok=True)
+        env["AGENTIC_EVAL_LOG_DIR"] = str(primary_eval_log_root)
+        llm_paths = _llm_debug_log_paths(run_root=run_root, repo_root=repo_root)
+        if llm_paths.get("primary") is not None:
+            env["LLM_DEBUG_FILE"] = str(llm_paths["primary"])
+        if llm_paths.get("secondary") is not None:
+            env["LLM_DEBUG_FILE_SECONDARY"] = str(llm_paths["secondary"])
+        env.setdefault("LLM_DEBUG", "1")
         worker_tmp_dir = Path(eval_output_root) / "tmp"
         worker_tmp_dir.mkdir(parents=True, exist_ok=True)
         env["TMPDIR"] = str(worker_tmp_dir)
@@ -730,6 +889,8 @@ def _execute_eval_task_worker(
             str(idea_path),
             "--config",
             str(config_path),
+            "--agentic-output-root",
+            "",
             "--experiments-root",
             str(experiment_dir),
             "--run-id",
@@ -741,7 +902,7 @@ def _execute_eval_task_worker(
         if sweep_config_limit is not None:
             mar_args.extend(["--sweep-config-limit", str(int(sweep_config_limit))])
 
-        mar_log_path = eval_output_root / "multi_agent_runner.subprocess.log"
+        mar_log_path = primary_eval_log_root / "multi_agent_runner.subprocess.log"
         _append_tree_log(run_root, f"multi_agent_runner eval_id={eval_id} log={mar_log_path}")
         rc = _run_python_logged(
             repo_root=repo_root,
@@ -833,6 +994,14 @@ def _execute_eval_task_worker(
         _ = keep_rejected_worktrees
         _ = keep_failed_artifacts
 
+    _append_eval_event(
+        run_root=run_root,
+        eval_id=str(eval_id),
+        node_id=str(node_id),
+        event="eval_finished",
+        message=f"eval finished status={status}",
+        payload={"status": status, "error": error, "timed_out": bool(timed_out)},
+    )
     return {
         "status": status,
         "error": error,
@@ -1503,37 +1672,26 @@ def _conversation_id_for_node(node_id: str) -> str:
 def _conversation_paths(*, run_root: Path, conversation_id: str) -> dict[str, Path]:
     conv_root = _ensure_standard_run_dirs(run_root)["conversations_root"]
     cid = str(conversation_id)
+    turn_paths = _conversation_turn_log_paths(run_root, cid)
+    turn_log_path = turn_paths["primary"] or (conv_root / f"{cid}.jsonl")
     return {
         "state_json_path": conv_root / f"{cid}.json",
-        "turn_log_jsonl_path": conv_root / f"{cid}.jsonl",
+        "turn_log_jsonl_path": turn_log_path,
         "summary_md_path": conv_root / f"{cid}_summary.md",
     }
 
 
 def _conversation_debug_log_path(*, manifest: dict[str, Any], run_root: Path) -> Optional[Path]:
-    cfg = manifest.get("conversation_config") or {}
-    if not isinstance(cfg, dict):
-        return None
-    raw = str(cfg.get("debug_log_jsonl_path") or "").strip()
-    if not raw:
-        return None
-    p = Path(raw).expanduser()
-    if not p.is_absolute():
-        p = run_root / p
-    return p
+    paths = _conversation_debug_log_paths(manifest=manifest, run_root=run_root)
+    return paths[0] if paths else None
 
 
 def _append_conversation_debug_log(*, manifest: dict[str, Any], run_root: Path, event: dict[str, Any]) -> None:
-    path = _conversation_debug_log_path(manifest=manifest, run_root=run_root)
-    if path is None:
+    paths = _conversation_debug_log_paths(manifest=manifest, run_root=run_root)
+    if not paths:
         return
     rec = {"timestamp": _utc_now_iso(), **(event or {})}
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8", errors="replace") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception:
-        return
+    _append_log_records(paths, rec)
 
 
 def _read_json_if_exists(
@@ -2016,6 +2174,7 @@ def _ensure_manifest_conversation_schema(
     run_config.setdefault("idea_history_window_turns", int(getattr(args, "idea_history_window_turns", 12)))
     run_config.setdefault("idea_history_max_chars", int(getattr(args, "idea_history_max_chars", 20000)))
     run_config.setdefault("max_parallel_evals", int(getattr(args, "max_parallel_evals", 1)))
+    run_config.setdefault("dry_run", bool(getattr(args, "dry_run", False)))
     _max_parallel_per_node = getattr(args, "max_parallel_per_node", None)
     run_config.setdefault("max_parallel_per_node", (int(_max_parallel_per_node) if _max_parallel_per_node is not None else None))
     run_config.setdefault("parallel_backend", str(getattr(args, "parallel_backend", "threadpool")))
@@ -2032,10 +2191,19 @@ def _ensure_manifest_conversation_schema(
     conversation_config.setdefault("history_window_turns", int(run_config.get("idea_history_window_turns") or 12))
     _idea_history_max_chars_raw = run_config.get("idea_history_max_chars", 20000)
     conversation_config.setdefault("history_max_chars", int(20000 if _idea_history_max_chars_raw is None else _idea_history_max_chars_raw))
-    conversation_config.setdefault(
-        "debug_log_jsonl_path",
-        str(_ensure_standard_run_dirs(run_root)["conversations_root"] / "conversation_debug.jsonl"),
-    )
+    log_default = _ensure_log_dirs(run_root)["conversations_root"] / "conversation_debug.jsonl"
+    debug_path_raw = str(conversation_config.get("debug_log_jsonl_path") or "").strip()
+    if not debug_path_raw:
+        conversation_config["debug_log_jsonl_path"] = str(log_default)
+    else:
+        try:
+            resolved = Path(debug_path_raw)
+            if not resolved.is_absolute():
+                resolved = run_root / resolved
+            if resolved.resolve() == log_default.resolve():
+                conversation_config["debug_log_jsonl_path"] = str(log_default)
+        except Exception:
+            conversation_config.setdefault("debug_log_jsonl_path", str(log_default))
 
     conversations = manifest.setdefault("conversations", {})
     if not isinstance(conversations, dict):
@@ -2119,6 +2287,14 @@ def _record_scheduler_event(
     if reason:
         details["reason"] = str(reason)
     events.append({"ts": _utc_now_iso(), "type": f"scheduler_{event_type}", "details": details})
+    _append_eval_event(
+        run_root=run_root,
+        eval_id=str(eval_id),
+        node_id=(str(parent_node_id) if parent_node_id is not None else None),
+        event=f"scheduler_{event_type}",
+        message="scheduler event",
+        payload=details,
+    )
     _append_tree_log(
         run_root,
         "scheduler_event"
@@ -2732,6 +2908,78 @@ def _validate_run(*, repo_root: Path, run_root: Path, manifest: dict[str, Any]) 
                 if p.exists() and _sha256_file(p) != str(base_prov["sha256"]):
                     _issue("sha_mismatch", "Parent baseline sha256 mismatch", eval_id=str(eid), path=str(p))
 
+    run_cfg = manifest.get("run_config") or {}
+    dry_run = bool(run_cfg.get("dry_run")) if isinstance(run_cfg, dict) else False
+
+    # Run-level log checks.
+    run_log_path = _ensure_log_dirs(run_root)["logs_root"] / "run_events.jsonl"
+    if not run_log_path.exists():
+        _issue("missing_log", "Run events log missing", path=str(run_log_path))
+
+    # Conversation turn log checks (if any turns exist).
+    if isinstance(conversations, dict):
+        for cid, crec in conversations.items():
+            if not isinstance(crec, dict):
+                continue
+            if not crec.get("latest_turn_id"):
+                continue
+            turn_path = crec.get("turn_log_jsonl_path")
+            if turn_path:
+                p = Path(str(turn_path)).expanduser()
+                if not p.exists():
+                    _issue("missing_log", "Conversation turn log missing", conversation_id=str(cid), path=str(p))
+
+    # Idea generation logs (skip for dry-run).
+    if not dry_run and isinstance(nodes, dict):
+        for nid, nrec in nodes.items():
+            if not isinstance(nrec, dict):
+                continue
+            generated = nrec.get("generated_idea_files") or []
+            if not generated:
+                continue
+            for log_path in _idea_subprocess_log_paths(run_root, str(nid)):
+                p = Path(str(log_path)).expanduser()
+                if not p.exists():
+                    _issue("missing_log", "Idea generation subprocess log missing", node_id=str(nid), path=str(p))
+
+    # Eval log checks.
+    if isinstance(evals, dict):
+        for eid, ev in evals.items():
+            if not isinstance(ev, dict):
+                continue
+            started = bool(ev.get("started_at"))
+            if not started:
+                continue
+            root = _ensure_log_dirs(run_root)["evals_root"] / str(eid)
+            ev_events = root / "eval_events.jsonl"
+            mar_log = root / "multi_agent_runner.subprocess.log"
+            if not ev_events.exists():
+                _issue("missing_log", "Eval events log missing", eval_id=str(eid), path=str(ev_events))
+            if not mar_log.exists():
+                _issue("missing_log", "Eval subprocess log missing", eval_id=str(eid), path=str(mar_log))
+
+            # Check sweep/tests logs when a summary exists.
+            summary_path = None
+            parent_rel = ev.get("parent_relative") or {}
+            if isinstance(parent_rel, dict):
+                summary_path = parent_rel.get("summary_json_path")
+            summary = None
+            if summary_path:
+                sp = Path(str(summary_path)).expanduser()
+                if sp.exists():
+                    try:
+                        summary = _read_json(sp)
+                    except Exception:
+                        summary = None
+            if ev.get("candidate_results_csv_path"):
+                sweep_log = root / "sweep.log"
+                if not sweep_log.exists():
+                    _issue("missing_log", "Sweep log missing", eval_id=str(eid), path=str(sweep_log))
+            if isinstance(summary, dict) and ("tests_exit_code" in summary or "tests_log" in summary):
+                tests_log = root / "tests.log"
+                if not tests_log.exists():
+                    _issue("missing_log", "Tests log missing", eval_id=str(eid), path=str(tests_log))
+
     # Frontier/expanded consistency checks.
     try:
         current_depth = int(state.get("current_depth") or 0)
@@ -3065,6 +3313,7 @@ def _init_or_resume_manifest(
             "sweep_config_limit": (int(args.sweep_config_limit) if args.sweep_config_limit is not None else None),
             "max_total_idea_evals": (int(args.max_total_idea_evals) if args.max_total_idea_evals is not None else None),
             "stop_on_empty_frontier": bool(args.stop_on_empty_frontier),
+            "dry_run": bool(args.dry_run),
             "resume": bool(args.resume),
             "lock_stale_seconds": int(args.lock_stale_seconds),
             "artifact_policy": artifact_policy,
@@ -3081,12 +3330,13 @@ def _init_or_resume_manifest(
             "cand_root": str(paths["cand_root"]),
             "eval_root": str(paths["eval_root"]),
             "conversations_root": str(paths["conversations_root"]),
+            "logs_root": str(_ensure_log_dirs(run_root)["logs_root"]),
         },
         "conversation_config": {
             "mode": str(args.idea_conversation_mode),
             "history_window_turns": int(args.idea_history_window_turns),
             "history_max_chars": int(args.idea_history_max_chars),
-            "debug_log_jsonl_path": str(paths["conversations_root"] / "conversation_debug.jsonl"),
+            "debug_log_jsonl_path": str(_ensure_log_dirs(run_root)["conversations_root"] / "conversation_debug.jsonl"),
         },
         "root": {
             "root_commit": root_commit,
@@ -3122,7 +3372,8 @@ def _init_or_resume_manifest(
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(list(argv or sys.argv[1:]))
+    argv_list = list(argv or sys.argv[1:])
+    args = _parse_args(argv_list)
     if int(args.idea_history_max_chars) < -1:
         raise ValueError("--idea-history-max-chars must be -1, 0, or a positive integer.")
     if int(args.max_parallel_evals) < 1:
@@ -3156,7 +3407,12 @@ def main(argv: list[str] | None = None) -> int:
     manifest = None
     try:
         lock_info = lock.acquire()
-        manifest = _init_or_resume_manifest(run_root=run_root, repo_root=repo_root, agentic_root=agentic_root, args=args)
+        manifest = _init_or_resume_manifest(
+            run_root=run_root,
+            repo_root=repo_root,
+            agentic_root=agentic_root,
+            args=args,
+        )
         _append_tree_log(
             run_root,
             "start"
@@ -3403,7 +3659,11 @@ def main(argv: list[str] | None = None) -> int:
                     if bool(args.dry_run):
                         _dry_run_ensure_ideas(node_ideas_dir=node_ideas_dir, node_id=str(node_id), desired_k=desired_k)
                     else:
-                        gen_log_path = node_ideas_dir / "generate_ideas.subprocess.log"
+                        idea_log_roots = _idea_log_roots(run_root, str(node_id))
+                        primary_idea_log_root = idea_log_roots[0] if idea_log_roots else _ensure_log_dirs(run_root)["idea_generation_root"]
+                        primary_idea_log_root.mkdir(parents=True, exist_ok=True)
+                        gen_log_paths = _idea_subprocess_log_paths(run_root, str(node_id))
+                        gen_log_path = gen_log_paths[0] if gen_log_paths else (primary_idea_log_root / f"generate_ideas.subprocess.node_{node_id}.log")
                         _append_tree_log(run_root, f"generate_ideas node_id={node_id} missing={missing} log={gen_log_path}")
                         gen_args = [
                             "agentic_experimentation/idea_generation/generate_ideas.py",
@@ -3427,6 +3687,13 @@ def main(argv: list[str] | None = None) -> int:
                         for d in context_dirs:
                             gen_args.extend(["--context-ideas-dir", str(d)])
                         env = dict(os.environ)
+                        env["AGENTIC_IDEA_LOG_DIR"] = str(primary_idea_log_root)
+                        llm_paths = _llm_debug_log_paths(run_root=run_root, repo_root=repo_root)
+                        if llm_paths.get("primary") is not None:
+                            env["LLM_DEBUG_FILE"] = str(llm_paths["primary"])
+                        if llm_paths.get("secondary") is not None:
+                            env["LLM_DEBUG_FILE_SECONDARY"] = str(llm_paths["secondary"])
+                        env.setdefault("LLM_DEBUG", "1")
                         rc = _run_python_logged(repo_root=repo_root, args=gen_args, env=env, log_path=gen_log_path, echo=True)
                         if rc != 0:
                             raise RuntimeError(f"generate_ideas.py failed for node {node_id} (exit {rc})")

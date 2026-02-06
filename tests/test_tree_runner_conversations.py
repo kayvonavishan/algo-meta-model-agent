@@ -47,7 +47,9 @@ def test_manifest_schema_migration_adds_conversation_fields(tmp_path: Path) -> N
     assert conv_cfg["mode"] == "auto"
     assert conv_cfg["history_window_turns"] == 12
     assert conv_cfg["history_max_chars"] == 20000
-    assert str(conv_cfg["debug_log_jsonl_path"]).replace("\\", "/").endswith("conversations/conversation_debug.jsonl")
+    assert str(conv_cfg["debug_log_jsonl_path"]).replace("\\", "/").endswith(
+        "logs/conversations/conversation_debug.jsonl"
+    )
 
     nodes = manifest["nodes"]
     assert nodes["0000"]["conversation_id"] == "node_0000"
@@ -81,7 +83,7 @@ def test_conversation_fork_and_sync_latest_turn(tmp_path: Path) -> None:
             "mode": "auto",
             "history_window_turns": 12,
             "history_max_chars": 20000,
-            "debug_log_jsonl_path": str(run_root / "conversations" / "conversation_debug.jsonl"),
+            "debug_log_jsonl_path": str(run_root / "logs" / "conversations" / "conversation_debug.jsonl"),
         },
         "conversations": {},
         "nodes": {
@@ -147,7 +149,7 @@ def test_branch_lineage_is_isolated_across_siblings(tmp_path: Path) -> None:
             "mode": "auto",
             "history_window_turns": 12,
             "history_max_chars": 20000,
-            "debug_log_jsonl_path": str(run_root / "conversations" / "conversation_debug.jsonl"),
+            "debug_log_jsonl_path": str(run_root / "logs" / "conversations" / "conversation_debug.jsonl"),
         },
         "conversations": {},
         "nodes": {
