@@ -3,8 +3,9 @@
 This is an example of the *general structure* of the idea generation prompt assembled by `agentic_experimentation/idea_generation/generate_ideas.py`.
 
 Notes:
-- Sections may be truncated if `max_context_chars` is reached (oldest prior ideas are dropped first).
+- Sections may be truncated if `max_context_chars` is reached.
 - The "Current Status / Artifacts / Branch Timeline" block is included only when `--baseline-context-json` is provided.
+- A replay-memory section is appended when conversation continuation uses replay mode (`--conversation-mode replay`, or `auto` fallback).
 - Values/paths below are illustrative; treat them as placeholders.
 
 ---
@@ -18,7 +19,8 @@ Experiment Description:
 
 Model Description:
 - The meta model selects top-performing base strategies for the next period using training-free signals (see `adaptive_vol_momentum.py`).
-- You will be given additional read-only repo context below (`META_MODEL_GUIDE.md`, `adaptive_vol_momentum.py`, and prior idea files) to help you avoid duplicating past ideas.
+- You will be given additional read-only repo context below (`META_MODEL_GUIDE.md`, `adaptive_vol_momentum.py`, `scoring.py`, `selection.py`).
+- You will also be given branch timeline and rejected-idea summaries (idea file paths + metrics) so you can avoid duplicating ideas already tested.
 
 Output Guidelines:
 - Ideas must be implementable as a single coding change (idea -> implement).
@@ -185,28 +187,34 @@ Rejected Ideas (evaluated but not selected for this branch):
    sweep_results_csv: `C:\Users\micha\myhome\algo\artifacts\period_returns\agentic_20260205_015900\run_0\meta_config_sweep_results.csv`
    avg_trade_return_plots_dir: `C:\Users\micha\myhome\algo\artifacts\period_returns\agentic_20260205_015900\run_0\avg_trade_return_plots`
 
-===== REPO CONTEXT (READ-ONLY) =====
+===== META MODEL CONTEXT =====
+META_MODEL_GUIDE.md
+ - description: High-level guide for the meta model design, assumptions, and workflow.
+ - location: C:\Users\micha\myhome\git\algo-meta-model-agent\agentic_experimentation\worktrees\tree_runs\20260205\wt\0007\META_MODEL_GUIDE.md
+adaptive_vol_momentum.py
+ - description: Primary meta model implementation and sweep/backtest driver.
+ - location: C:\Users\micha\myhome\git\algo-meta-model-agent\agentic_experimentation\worktrees\tree_runs\20260205\wt\0007\adaptive_vol_momentum.py
+scoring.py
+ - description: Performance scoring and summary metric computation utilities.
+ - location: C:\Users\micha\myhome\git\algo-meta-model-agent\agentic_experimentation\worktrees\tree_runs\20260205\wt\0007\scoring.py
+selection.py
+ - description: Selection logic used to choose top strategies/models each period.
+ - location: C:\Users\micha\myhome\git\algo-meta-model-agent\agentic_experimentation\worktrees\tree_runs\20260205\wt\0007\selection.py
 
------ FILE: META_MODEL_GUIDE.md -----
-[... full guide text here; may be truncated if needed ...]
+===== IDEA CONVERSATION MEMORY (REPLAY) =====
+Use this for continuity with prior idea-generation turns in this branch.
+Prefer non-duplicate ideas and build on prior reasoning where useful.
 
------ FILE: adaptive_vol_momentum.py -----
-```python
-# ... full source of adaptive_vol_momentum.py here; may be truncated if needed ...
-def run_meta_model(...):
-    ...
-```
+compact_summary:
+Earlier branch history summary (oldest -> newest):
+- turn_0001: ... output_hash=...
+- turn_0002: ... output_hash=...
 
------ PRIOR IDEAS (DO NOT DUPLICATE) -----
-
-### 000_some_prior_idea.md
+[turn_0007] 2026-02-05T01:23:45Z
+output_idea_path: agentic_experimentation/worktrees/tree_runs/20260205/node_ideas/0007/0005_example.md
+assistant_output:
 IDEA: ...
 RATIONALE: ...
 REQUIRED_CHANGES: ...
 
-### 001_another_prior_idea.md
-IDEA: ...
-RATIONALE: ...
-REQUIRED_CHANGES: ...
-
-[... more idea md files; if too long, oldest are dropped first ...]
+===== END IDEA CONVERSATION MEMORY =====

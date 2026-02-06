@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agentic_experimentation.tree_runner import _tree_summary_markdown, _validate_run
+from agentic_experimentation.tree_runner import _compute_depth_progress, _parse_args, _tree_summary_markdown, _validate_run
 
 
 def test_tree_summary_includes_nodes_and_best_path(tmp_path: Path) -> None:
@@ -146,3 +146,117 @@ def test_validate_run_flags_frontier_depth_holes(tmp_path: Path) -> None:
     msgs = [i["message"] for i in issues if i.get("kind") == "state_inconsistency"]
     assert "frontier_node_depth_mismatch" in msgs
     assert "unexpanded_nodes_before_current_depth" in msgs
+
+
+def test_tree_summary_includes_depth_progress_and_eval_timing(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    artifacts = run_root / "artifacts"
+    artifacts.mkdir(parents=True)
+
+    root_csv = artifacts / "root_baseline.csv"
+    root_csv.write_text("config_id,status\n0,ok\n", encoding="utf-8")
+
+    manifest = {
+        "tree_run_id": "t1",
+        "run_config": {
+            "ideas_per_node": 2,
+            "max_depth": 2,
+            "beam_width": 1,
+            "max_parallel_evals": 2,
+            "max_parallel_per_node": 1,
+            "parallel_backend": "threadpool",
+            "eval_retries": 1,
+            "eval_timeout_seconds": 60,
+            "strict_fail_depth": False,
+        },
+        "state": {
+            "stop_reason": None,
+            "task_plan_by_depth": {"0": [{"eval_id": "0001"}, {"eval_id": "0002"}]},
+            "depth_progress_by_depth": {
+                "0": {
+                    "depth": 0,
+                    "total_tasks": 2,
+                    "queued": 0,
+                    "running": 0,
+                    "completed": 1,
+                    "failed": 1,
+                    "done": 2,
+                    "pending": 0,
+                    "requeued": 1,
+                    "attempts_total": 3,
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                }
+            },
+        },
+        "nodes": {
+            "0000": {
+                "node_id": "0000",
+                "parent_node_id": None,
+                "depth": 0,
+                "baseline_results_csv_path": str(root_csv),
+                "idea_chain": [],
+                "artifacts": {},
+            }
+        },
+        "evaluations": {
+            "0001": {
+                "eval_id": "0001",
+                "depth": 0,
+                "parent_node_id": "0000",
+                "status": "completed",
+                "task_state": "completed",
+                "attempt": 2,
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "finished_at": "2026-01-01T00:00:05+00:00",
+                "error_payload": {},
+                "decision": {},
+            },
+            "0002": {
+                "eval_id": "0002",
+                "depth": 0,
+                "parent_node_id": "0000",
+                "status": "failed",
+                "task_state": "failed",
+                "attempt": 1,
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "finished_at": "2026-01-01T00:00:03+00:00",
+                "error": "boom",
+                "error_payload": {"error_type": "EvalError"},
+                "decision": {},
+            },
+        },
+    }
+
+    md = _tree_summary_markdown(run_root=run_root, manifest=manifest)
+    assert "## Depth Progress" in md
+    assert "| depth | total_tasks | queued | running | completed | failed |" in md
+    assert "| 0 | 2 | 0 | 0 | 1 | 1 | 2 | 0 | 1 | 3 | 2026-01-01T00:00:00+00:00 |" in md
+    assert "## Evaluations" in md
+    assert "| eval_id | depth | parent_node_id | status | task_state | attempt |" in md
+    assert "| 0001 | 0 | 0000 | completed | completed | 2 | 2026-01-01T00:00:00+00:00 | 2026-01-01T00:00:05+00:00 | 5.000 |  |  |" in md
+    assert "| 0002 | 0 | 0000 | failed | failed | 1 | 2026-01-01T00:00:00+00:00 | 2026-01-01T00:00:03+00:00 | 3.000 | EvalError | boom |" in md
+
+
+def test_compute_depth_progress_counts_requeues() -> None:
+    manifest = {
+        "state": {"task_plan_by_depth": {"0": [{"eval_id": "0001"}, {"eval_id": "0002"}]}},
+        "evaluations": {
+            "0001": {"eval_id": "0001", "depth": 0, "task_state": "completed", "attempt": 2},
+            "0002": {"eval_id": "0002", "depth": 0, "task_state": "failed", "attempt": 1},
+        },
+        "events": [
+            {"type": "scheduler_requeued", "details": {"depth": 0, "eval_id": "0001"}},
+            {"type": "scheduler_requeued", "details": {"depth": 1, "eval_id": "9999"}},
+        ],
+    }
+    progress = _compute_depth_progress(manifest=manifest, depth=0)
+    assert progress["total_tasks"] == 2
+    assert progress["completed"] == 1
+    assert progress["failed"] == 1
+    assert progress["requeued"] == 1
+    assert progress["attempts_total"] == 3
+
+
+def test_parse_args_defaults_rollout_parallelism_to_one() -> None:
+    args = _parse_args([])
+    assert int(args.max_parallel_evals) == 1

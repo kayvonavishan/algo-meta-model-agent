@@ -7,7 +7,8 @@ Experiment Description:
 
 Model Description:
 - The meta model selects top-performing base strategies for the next period using training-free signals (see adaptive_vol_momentum.py).
-- You will be given additional read-only repo context below (META_MODEL_GUIDE.md, adaptive_vol_momentum.py, and prior idea files) to help you avoid duplicating past ideas.
+- You will be given additional read-only repo context below (META_MODEL_GUIDE.md, adaptive_vol_momentum.py, scoring.py, selection.py).
+- You will also be given branch timeline and rejected-idea summaries (idea file paths + metrics) so you can avoid duplicating ideas already tested.
 
 Output Guidelines:
 - Ideas must be implementable as a single coding change (idea -> implement).

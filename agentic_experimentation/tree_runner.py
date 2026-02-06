@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as _futures
 import contextlib
 import dataclasses
 import datetime as _dt
@@ -52,6 +53,42 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=1,
         help="Beam width (max number of nodes to continue per depth).",
+    )
+    parser.add_argument(
+        "--max-parallel-evals",
+        type=int,
+        default=1,
+        help="Global cap for concurrently running eval tasks at a depth.",
+    )
+    parser.add_argument(
+        "--max-parallel-per-node",
+        type=int,
+        default=None,
+        help="Optional fairness cap for concurrent eval tasks per parent node.",
+    )
+    parser.add_argument(
+        "--parallel-backend",
+        choices=["threadpool"],
+        default="threadpool",
+        help="Parallel execution backend for eval tasks.",
+    )
+    parser.add_argument(
+        "--eval-retries",
+        type=int,
+        default=0,
+        help="Number of retries for failed eval tasks at the same depth.",
+    )
+    parser.add_argument(
+        "--eval-timeout-seconds",
+        type=int,
+        default=None,
+        help="Optional timeout per eval task (seconds).",
+    )
+    parser.add_argument(
+        "--strict-fail-depth",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If true, stop scheduling remaining tasks at this depth after a non-retriable failure.",
     )
     parser.add_argument(
         "--sweep-config-limit",
@@ -117,6 +154,24 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--config",
         default="agentic_experimentation/agent_config.json",
         help="Path to agent config JSON for multi_agent_runner execution.",
+    )
+    parser.add_argument(
+        "--idea-conversation-mode",
+        choices=["off", "auto", "native", "replay"],
+        default="auto",
+        help="Idea-generation conversation continuation mode.",
+    )
+    parser.add_argument(
+        "--idea-history-window-turns",
+        type=int,
+        default=12,
+        help="Replay: max recent turns to include in idea-generation conversation memory.",
+    )
+    parser.add_argument(
+        "--idea-history-max-chars",
+        type=int,
+        default=20000,
+        help="Replay memory char budget (-1 = unbounded, 0 = disable replay memory).",
     )
     parser.add_argument(
         "--dedupe-scope",
@@ -226,7 +281,8 @@ def _ensure_standard_run_dirs(run_root: Path) -> dict[str, Path]:
     node_ideas_root = run_root / "node_ideas"
     artifacts_root = run_root / "artifacts"
     eval_root = run_root / "eval"
-    for p in (wt_root, cand_root, node_ideas_root, artifacts_root, eval_root):
+    conversations_root = run_root / "conversations"
+    for p in (wt_root, cand_root, node_ideas_root, artifacts_root, eval_root, conversations_root):
         _safe_mkdir(p)
     return {
         "wt_root": wt_root,
@@ -234,6 +290,7 @@ def _ensure_standard_run_dirs(run_root: Path) -> dict[str, Path]:
         "node_ideas_root": node_ideas_root,
         "artifacts_root": artifacts_root,
         "eval_root": eval_root,
+        "conversations_root": conversations_root,
     }
 
 
@@ -371,6 +428,7 @@ def _run_python_logged(
     env: dict[str, str],
     log_path: Path,
     echo: bool = True,
+    timeout_seconds: Optional[int] = None,
 ) -> int:
     """
     Run a Python subprocess and tee stdout/stderr into a log file.
@@ -446,7 +504,19 @@ def _run_python_logged(
     for t in threads:
         t.start()
 
-    rc = int(cp.wait())
+    timed_out = False
+    try:
+        if timeout_seconds is not None and int(timeout_seconds) > 0:
+            rc = int(cp.wait(timeout=float(timeout_seconds)))
+        else:
+            rc = int(cp.wait())
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        with contextlib.suppress(Exception):
+            cp.kill()
+        with contextlib.suppress(Exception):
+            cp.wait(timeout=5)
+        rc = 124
 
     # Wait for pump threads to finish (short timeout avoids rare hangs).
     for _ in threads:
@@ -461,7 +531,7 @@ def _run_python_logged(
             pass
 
     dur = time.time() - started
-    _write(f"\n[exit] code={rc} duration_s={dur:.3f}\n")
+    _write(f"\n[exit] code={rc} duration_s={dur:.3f} timed_out={str(timed_out).lower()}\n")
     return rc
 
 
@@ -525,6 +595,251 @@ def _dry_run_write_candidate_csv(*, path: Path, config_id_limit: Optional[int], 
         status = "ok" if ok else ("error" if i == 0 else "ok")
         rows.append(f"{i},{status},0.0")
     path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+
+def _execute_eval_task_worker(
+    *,
+    repo_root: Path,
+    run_root: Path,
+    tree_run_id: str,
+    eval_id: str,
+    node_id: str,
+    idea_path: Path,
+    node_commit: str,
+    node_baseline_csv_path: Path,
+    eval_output_root: Path,
+    experiment_dir: Path,
+    sweep_output_dir: Path,
+    sweep_results_csv: Path,
+    config_path: Path,
+    sweep_config_limit: Optional[int],
+    eval_timeout_seconds: Optional[int],
+    score_column: Optional[str],
+    root_baseline_csv: Path,
+    dry_run: bool,
+    keep_rejected_worktrees: bool,
+    keep_failed_artifacts: bool,
+    compute_score_fn: Any,
+) -> dict[str, Any]:
+    updates: dict[str, Any] = {}
+    cleanup_requests: list[dict[str, str]] = []
+    status = "failed"
+    error: Optional[str] = None
+    timed_out = False
+
+    if dry_run:
+        try:
+            artifacts_root = _ensure_standard_run_dirs(run_root)["artifacts_root"]
+            parent_baseline_prov = _ensure_artifact_copy(
+                run_root=run_root,
+                source_path=node_baseline_csv_path,
+                dest_name=f"baseline_node_{node_id}.csv",
+            )
+            updates["parent_baseline_provenance"] = parent_baseline_prov
+
+            scenario = _dry_run_scenario(eval_id=eval_id)
+            candidate_art_path = artifacts_root / f"candidate_eval_{eval_id}.csv"
+            _dry_run_write_candidate_csv(
+                path=candidate_art_path,
+                config_id_limit=sweep_config_limit,
+                ok=bool(scenario.get("strict_complete", True)),
+            )
+            cand_prov = _copy_with_provenance(source_path=candidate_art_path, dest_path=candidate_art_path)
+            updates["candidate_results_provenance"] = cand_prov
+            updates["candidate_results_csv_path"] = str(candidate_art_path)
+            updates["candidate_commit"] = node_commit
+
+            if sweep_config_limit is not None:
+                strict = _strict_completeness_counts(csv_path=candidate_art_path, config_id_limit=int(sweep_config_limit))
+                updates["strict_completeness"] = strict
+
+            should_explore = bool(scenario.get("should_explore"))
+            grade = scenario.get("grade")
+            primary_delta = float(scenario.get("primary_delta") or 0.0)
+            rank_score = scenario.get("rank_score")
+
+            updates["parent_relative"] = {
+                "recommendation_summary": {
+                    "should_explore": should_explore,
+                    "grade": grade,
+                    "score": None,
+                    "reasons": ["dry_run"],
+                },
+                "primary_delta": primary_delta,
+                "baseline_rows_used": (int(sweep_config_limit) if sweep_config_limit is not None else 1),
+                "candidate_rows_used": (int(sweep_config_limit) if sweep_config_limit is not None else 1),
+                "score": None,
+                "summary_json_path": "",
+            }
+            updates["root_relative"] = {
+                "recommendation_summary": {
+                    "should_explore": should_explore,
+                    "grade": grade,
+                    "score": rank_score,
+                    "reasons": ["dry_run"],
+                },
+                "primary_delta": primary_delta,
+                "baseline_rows_used": (int(sweep_config_limit) if sweep_config_limit is not None else 1),
+                "candidate_rows_used": (int(sweep_config_limit) if sweep_config_limit is not None else 1),
+                "score": None,
+            }
+            status = "completed"
+        except Exception as exc:  # noqa: BLE001
+            status = "failed"
+            error = f"{type(exc).__name__}: {exc}"
+        return {
+            "status": status,
+            "error": error,
+            "timed_out": False,
+            "updates": updates,
+            "cleanup_requests": cleanup_requests,
+        }
+
+    cand_dir = _ensure_standard_run_dirs(run_root)["cand_root"] / eval_id
+    try:
+        if cand_dir.exists():
+            try:
+                cleanup_worktree(repo_root=repo_root, worktree_path=cand_dir)
+            except Exception as exc:  # noqa: BLE001
+                cleanup_requests.append({"path": str(cand_dir), "kind": "worktree", "reason": str(exc)})
+                raise
+
+        cand_info = create_candidate_worktree(
+            repo_root=repo_root,
+            run_root=run_root,
+            tree_run_id=tree_run_id,
+            eval_id=eval_id,
+            parent_commit=node_commit,
+        )
+        updates["candidate_worktree_path"] = cand_info["worktree_path"]
+
+        env = dict(os.environ)
+        env["AGENTIC_OUTPUT_DIR"] = str(sweep_output_dir)
+        env["AGENTIC_RESULTS_CSV"] = str(sweep_results_csv)
+        worker_tmp_dir = Path(eval_output_root) / "tmp"
+        worker_tmp_dir.mkdir(parents=True, exist_ok=True)
+        env["TMPDIR"] = str(worker_tmp_dir)
+        env["TMP"] = str(worker_tmp_dir)
+        env["TEMP"] = str(worker_tmp_dir)
+        mar_args = [
+            "agentic_experimentation/multi_agent_runner.py",
+            "--in-place",
+            "--worktree-path",
+            str(cand_info["worktree_path"]),
+            "--idea-path",
+            str(idea_path),
+            "--config",
+            str(config_path),
+            "--experiments-root",
+            str(experiment_dir),
+            "--run-id",
+            eval_id,
+            "--baseline-csv",
+            str(node_baseline_csv_path),
+            "--no-archive-ideas",
+        ]
+        if sweep_config_limit is not None:
+            mar_args.extend(["--sweep-config-limit", str(int(sweep_config_limit))])
+
+        mar_log_path = eval_output_root / "multi_agent_runner.subprocess.log"
+        _append_tree_log(run_root, f"multi_agent_runner eval_id={eval_id} log={mar_log_path}")
+        rc = _run_python_logged(
+            repo_root=repo_root,
+            args=mar_args,
+            env=env,
+            log_path=mar_log_path,
+            echo=True,
+            timeout_seconds=eval_timeout_seconds,
+        )
+        if rc == 124 and eval_timeout_seconds is not None:
+            timed_out = True
+            raise TimeoutError(f"multi_agent_runner timed out after {int(eval_timeout_seconds)} seconds")
+        if rc != 0:
+            raise RuntimeError(f"multi_agent_runner failed (exit {rc})")
+
+        exp_dir = Path(experiment_dir) / eval_id
+        summary_path = exp_dir / "summary.json"
+        if not summary_path.exists():
+            raise RuntimeError(f"Missing summary.json at {summary_path}")
+        summary = _read_json(summary_path)
+        if not isinstance(summary, dict):
+            raise RuntimeError(f"Invalid summary.json at {summary_path}")
+        approved = bool(summary.get("approved"))
+        sweep_exit = summary.get("sweep_exit_code")
+        candidate_csv = exp_dir / "meta_config_sweep_results.csv"
+        if not approved or sweep_exit != 0 or not candidate_csv.exists():
+            raise RuntimeError("Idea did not reach approved+sweep-success state; no candidate results.")
+
+        cand_wt_path = Path(str(cand_info["worktree_path"]))
+        msg = f"tree_run {tree_run_id} eval {eval_id} idea {idea_path.name}"
+        candidate_commit = _git_commit_all(worktree_path=cand_wt_path, message=msg)
+        updates["candidate_commit"] = candidate_commit
+
+        parent_baseline_prov = _ensure_artifact_copy(
+            run_root=run_root,
+            source_path=node_baseline_csv_path,
+            dest_name=f"baseline_node_{node_id}.csv",
+        )
+        cand_prov = _copy_with_provenance(
+            source_path=candidate_csv,
+            dest_path=_ensure_standard_run_dirs(run_root)["artifacts_root"] / f"candidate_eval_{eval_id}.csv",
+        )
+        updates["parent_baseline_provenance"] = parent_baseline_prov
+        updates["candidate_results_provenance"] = cand_prov
+        copied_candidate_csv = Path(str(cand_prov["copied_to_path"]))
+        updates["candidate_results_csv_path"] = str(copied_candidate_csv)
+
+        parent_score = compute_score_fn(
+            Path(str(parent_baseline_prov["copied_to_path"])),
+            copied_candidate_csv,
+            score_column,
+            config_id_limit=sweep_config_limit,
+        )
+        root_score = compute_score_fn(
+            root_baseline_csv,
+            copied_candidate_csv,
+            score_column,
+            config_id_limit=sweep_config_limit,
+        )
+        updates["parent_relative"] = {
+            "recommendation_summary": _recommendation_summary(parent_score),
+            "primary_delta": _primary_delta(parent_score),
+            "baseline_rows_used": parent_score.get("baseline_rows_used"),
+            "candidate_rows_used": parent_score.get("candidate_rows_used"),
+            "score": parent_score.get("score"),
+            "summary_json_path": str(summary_path),
+        }
+        updates["root_relative"] = {
+            "recommendation_summary": _recommendation_summary(root_score),
+            "primary_delta": _primary_delta(root_score),
+            "baseline_rows_used": root_score.get("baseline_rows_used"),
+            "candidate_rows_used": root_score.get("candidate_rows_used"),
+            "score": root_score.get("score"),
+        }
+
+        if sweep_config_limit is not None:
+            strict = _strict_completeness_counts(csv_path=copied_candidate_csv, config_id_limit=int(sweep_config_limit))
+            updates["strict_completeness"] = strict
+            if not strict.get("is_complete"):
+                updates["decision_updates"] = {"passed_gate": False, "promotion_reason": "incomplete_or_failed_rows"}
+            else:
+                updates["decision_updates"] = {"passed_gate": None}
+
+        status = "completed"
+    except Exception as exc:  # noqa: BLE001
+        status = "failed"
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        _ = keep_rejected_worktrees
+        _ = keep_failed_artifacts
+
+    return {
+        "status": status,
+        "error": error,
+        "timed_out": bool(timed_out),
+        "updates": updates,
+        "cleanup_requests": cleanup_requests,
+    }
 
 def _list_markdown_files(dir_path: Path) -> list[Path]:
     if not dir_path.exists():
@@ -816,6 +1131,19 @@ def _build_baseline_context_for_node(
             sweep_results_csv = str(baseline_csv_path)
         source = "csv_self_score"
 
+    # Prefer original configured root baseline source path for depth=0 prompts,
+    # so users see the canonical baseline location rather than internal copies.
+    baseline_source_csv = ""
+    try:
+        if int(node_rec.get("depth") or 0) == 0:
+            root_obj = manifest.get("root") or {}
+            if isinstance(root_obj, dict):
+                prov = root_obj.get("root_baseline_provenance") or {}
+                if isinstance(prov, dict):
+                    baseline_source_csv = str(prov.get("source_path") or "").strip()
+    except Exception:
+        baseline_source_csv = ""
+
     nodes = manifest.get("nodes") or {}
     chain = _collect_ancestor_node_ids(manifest, str(node_id))
 
@@ -830,6 +1158,17 @@ def _build_baseline_context_for_node(
         n_depth = nrec.get("depth")
         n_parent = nrec.get("parent_node_id")
         n_baseline_csv = str(nrec.get("baseline_results_csv_path") or "").strip()
+        try:
+            if int(n_depth or 0) == 0:
+                root_obj = manifest.get("root") or {}
+                if isinstance(root_obj, dict):
+                    prov = root_obj.get("root_baseline_provenance") or {}
+                    if isinstance(prov, dict):
+                        src = str(prov.get("source_path") or "").strip()
+                        if src:
+                            n_baseline_csv = src
+        except Exception:
+            pass
         n_baseline_csv_path = Path(n_baseline_csv).expanduser() if n_baseline_csv else None
         n_idea_chain = list(nrec.get("idea_chain") or []) if isinstance(nrec.get("idea_chain"), list) else []
         applied_idea_path = n_idea_chain[-1] if n_idea_chain else None
@@ -992,9 +1331,16 @@ def _build_baseline_context_for_node(
         "node_id": str(node_id),
         "parent_node_id": node_rec.get("parent_node_id"),
         "depth": node_rec.get("depth"),
+        "node_worktree_path": str(node_rec.get("worktree_path") or ""),
+        "parent_node_worktree_path": (
+            str(((nodes.get(str(node_rec.get("parent_node_id") or "")) or {}).get("worktree_path") or ""))
+            if isinstance(nodes, dict)
+            else ""
+        ),
         "idea_chain": list(node_rec.get("idea_chain") or []) if isinstance(node_rec.get("idea_chain"), list) else [],
         "changes_applied_count": len(list(node_rec.get("idea_chain") or [])) if isinstance(node_rec.get("idea_chain"), list) else 0,
         "sweep_config_limit": sweep_config_limit,
+        "baseline_source_csv": baseline_source_csv,
         "baseline_context_source": source,
         "baseline_summary_json_path": (str(summary_path) if summary_path is not None else ""),
         "baseline_metrics": baseline_metrics,
@@ -1150,14 +1496,734 @@ def _select_global_beam(eval_recs: list[dict[str, Any]], *, beam_width: int) -> 
     return ranked[:width]
 
 
+def _conversation_id_for_node(node_id: str) -> str:
+    return f"node_{str(node_id)}"
+
+
+def _conversation_paths(*, run_root: Path, conversation_id: str) -> dict[str, Path]:
+    conv_root = _ensure_standard_run_dirs(run_root)["conversations_root"]
+    cid = str(conversation_id)
+    return {
+        "state_json_path": conv_root / f"{cid}.json",
+        "turn_log_jsonl_path": conv_root / f"{cid}.jsonl",
+        "summary_md_path": conv_root / f"{cid}_summary.md",
+    }
+
+
+def _conversation_debug_log_path(*, manifest: dict[str, Any], run_root: Path) -> Optional[Path]:
+    cfg = manifest.get("conversation_config") or {}
+    if not isinstance(cfg, dict):
+        return None
+    raw = str(cfg.get("debug_log_jsonl_path") or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = run_root / p
+    return p
+
+
+def _append_conversation_debug_log(*, manifest: dict[str, Any], run_root: Path, event: dict[str, Any]) -> None:
+    path = _conversation_debug_log_path(manifest=manifest, run_root=run_root)
+    if path is None:
+        return
+    rec = {"timestamp": _utc_now_iso(), **(event or {})}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", errors="replace") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        return
+
+
+def _read_json_if_exists(
+    path: Path,
+    *,
+    run_root: Optional[Path] = None,
+    manifest: Optional[dict[str, Any]] = None,
+    context: Optional[str] = None,
+) -> Any:
+    if not path.exists():
+        return None
+    try:
+        return _read_json(path)
+    except Exception as exc:  # noqa: BLE001
+        ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        corrupt_path = path.with_suffix(path.suffix + f".corrupt_{ts}")
+        moved = False
+        try:
+            os.replace(path, corrupt_path)
+            moved = True
+        except Exception:
+            moved = False
+
+        context_s = str(context or path)
+        if moved:
+            warn = f"[conversation] warning: invalid JSON recovered for {context_s}: {path} -> {corrupt_path} ({type(exc).__name__})"
+        else:
+            warn = f"[conversation] warning: invalid JSON for {context_s}: {path} ({type(exc).__name__})"
+        print(warn, file=sys.stderr)
+        if run_root is not None:
+            _append_tree_log(
+                run_root,
+                (
+                    f"conversation_json_recovery context={context_s}"
+                    + f" path={path}"
+                    + (f" moved_to={corrupt_path}" if moved else "")
+                    + f" error={type(exc).__name__}:{exc}"
+                ),
+            )
+        if isinstance(manifest, dict):
+            events = manifest.setdefault("events", [])
+            if isinstance(events, list):
+                events.append(
+                    {
+                        "timestamp": _utc_now_iso(),
+                        "type": "conversation_json_recovery",
+                        "context": context_s,
+                        "path": str(path),
+                        "recovered_to": (str(corrupt_path) if moved else None),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+            if run_root is not None:
+                _append_conversation_debug_log(
+                    manifest=manifest,
+                    run_root=run_root,
+                    event={
+                        "type": "conversation_json_recovery",
+                        "context": context_s,
+                        "path": str(path),
+                        "recovered_to": (str(corrupt_path) if moved else None),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                )
+        return None
+
+
+def _conversation_state_template(
+    *,
+    manifest: dict[str, Any],
+    conversation_id: str,
+    node_id: str,
+    parent_conversation_id: Optional[str],
+    fork_from_turn_id: Optional[str],
+) -> dict[str, Any]:
+    conv_cfg = manifest.get("conversation_config") or {}
+    if not isinstance(conv_cfg, dict):
+        conv_cfg = {}
+    history_window_turns = conv_cfg.get("history_window_turns", 12)
+    history_max_chars = conv_cfg.get("history_max_chars", 20000)
+    mode = str(conv_cfg.get("mode") or "auto")
+    return {
+        "schema_version": 1,
+        "conversation_id": str(conversation_id),
+        "node_id": str(node_id),
+        "parent_conversation_id": (str(parent_conversation_id) if parent_conversation_id else None),
+        "fork_from_turn_id": (str(fork_from_turn_id) if fork_from_turn_id else None),
+        "requested_mode": mode,
+        "created_at": _utc_now_iso(),
+        "updated_at": _utc_now_iso(),
+        "latest_turn_id": None,
+        "next_turn_index": 1,
+        "history_window_turns": int(history_window_turns),
+        "history_max_chars": int(history_max_chars),
+        "provider": {
+            "name": "claude_agent_sdk",
+            "supports_native_continuation": False,
+            "session_id": None,
+            "last_response_id": None,
+        },
+        "turns": [],
+        "idea_file_turn_map": {},
+    }
+
+
+def _conversation_turn_index(turn_id: Optional[str]) -> Optional[int]:
+    if turn_id is None:
+        return None
+    s = str(turn_id).strip()
+    m = re.match(r"^turn_(\d+)$", s)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _fork_state_from_parent(
+    *,
+    parent_state: dict[str, Any],
+    child_state: dict[str, Any],
+    fork_from_turn_id: Optional[str],
+) -> dict[str, Any]:
+    parent_turns = parent_state.get("turns") or []
+    if not isinstance(parent_turns, list):
+        parent_turns = []
+    copied_turns = [dict(t) for t in parent_turns if isinstance(t, dict)]
+    if fork_from_turn_id:
+        keep_to = None
+        for i, turn in enumerate(copied_turns):
+            if str(turn.get("turn_id") or "") == str(fork_from_turn_id):
+                keep_to = i
+                break
+        if keep_to is not None:
+            copied_turns = copied_turns[: keep_to + 1]
+    child_state["turns"] = copied_turns
+
+    latest_turn_id = None
+    next_turn_index = 1
+    kept_turn_ids: set[str] = set()
+    for turn in copied_turns:
+        tid = str(turn.get("turn_id") or "")
+        if not tid:
+            continue
+        latest_turn_id = tid
+        kept_turn_ids.add(tid)
+        idx = _conversation_turn_index(tid)
+        if idx is not None and idx >= next_turn_index:
+            next_turn_index = idx + 1
+    child_state["latest_turn_id"] = latest_turn_id
+    child_state["next_turn_index"] = next_turn_index
+
+    parent_map = parent_state.get("idea_file_turn_map") or {}
+    child_map: dict[str, Any] = {}
+    if isinstance(parent_map, dict):
+        for key, value in parent_map.items():
+            if isinstance(value, str) and value in kept_turn_ids:
+                child_map[str(key)] = value
+    child_state["idea_file_turn_map"] = child_map
+
+    parent_provider = parent_state.get("provider") or {}
+    if isinstance(parent_provider, dict):
+        provider = child_state.get("provider") or {}
+        if not isinstance(provider, dict):
+            provider = {}
+        provider["session_id"] = parent_provider.get("session_id")
+        provider["last_response_id"] = parent_provider.get("last_response_id")
+        provider["supports_native_continuation"] = bool(parent_provider.get("supports_native_continuation", False))
+        provider["name"] = str(parent_provider.get("name") or "claude_agent_sdk")
+        child_state["provider"] = provider
+
+    child_state["updated_at"] = _utc_now_iso()
+    return child_state
+
+
+def _ensure_node_conversation(
+    *,
+    manifest: dict[str, Any],
+    run_root: Path,
+    node_id: str,
+    parent_node_id: Optional[str],
+    fork_from_turn_id: Optional[str],
+) -> str:
+    nodes = manifest.setdefault("nodes", {})
+    if not isinstance(nodes, dict):
+        raise RuntimeError("Manifest nodes map is invalid.")
+    node = nodes.get(str(node_id))
+    if not isinstance(node, dict):
+        raise RuntimeError(f"Missing node record for conversation attach: {node_id}")
+
+    conversations = manifest.setdefault("conversations", {})
+    if not isinstance(conversations, dict):
+        conversations = {}
+        manifest["conversations"] = conversations
+
+    conversation_id = str(node.get("conversation_id") or _conversation_id_for_node(str(node_id)))
+    parent_conversation_id = None
+    if parent_node_id:
+        parent_node = nodes.get(str(parent_node_id))
+        if isinstance(parent_node, dict):
+            parent_conversation_id = str(parent_node.get("conversation_id") or _conversation_id_for_node(str(parent_node_id)))
+
+    paths = _conversation_paths(run_root=run_root, conversation_id=conversation_id)
+    conv_rec = conversations.get(conversation_id)
+    state_path = paths["state_json_path"]
+    turn_log_path = paths["turn_log_jsonl_path"]
+    summary_path = paths["summary_md_path"]
+
+    created_now = False
+    if not isinstance(conv_rec, dict):
+        created_now = True
+        conv_rec = {
+            "conversation_id": conversation_id,
+            "node_id": str(node_id),
+            "parent_conversation_id": parent_conversation_id,
+            "fork_from_turn_id": (str(fork_from_turn_id) if fork_from_turn_id else None),
+            "state_json_path": str(state_path),
+            "turn_log_jsonl_path": str(turn_log_path),
+            "summary_md_path": str(summary_path),
+            "created_at": _utc_now_iso(),
+            "updated_at": _utc_now_iso(),
+            "latest_turn_id": None,
+        }
+        conversations[conversation_id] = conv_rec
+    else:
+        conv_rec.setdefault("conversation_id", conversation_id)
+        conv_rec.setdefault("node_id", str(node_id))
+        conv_rec.setdefault("parent_conversation_id", parent_conversation_id)
+        conv_rec.setdefault("fork_from_turn_id", (str(fork_from_turn_id) if fork_from_turn_id else None))
+        conv_rec["state_json_path"] = str(state_path)
+        conv_rec["turn_log_jsonl_path"] = str(turn_log_path)
+        conv_rec["summary_md_path"] = str(summary_path)
+        conv_rec.setdefault("created_at", _utc_now_iso())
+        conv_rec["updated_at"] = _utc_now_iso()
+
+    state = _read_json_if_exists(
+        state_path,
+        run_root=run_root,
+        manifest=manifest,
+        context=f"conversation_state:{conversation_id}",
+    )
+    if not isinstance(state, dict):
+        state = _conversation_state_template(
+            manifest=manifest,
+            conversation_id=conversation_id,
+            node_id=str(node_id),
+            parent_conversation_id=parent_conversation_id,
+            fork_from_turn_id=fork_from_turn_id,
+        )
+        if parent_conversation_id:
+            parent_conv = conversations.get(parent_conversation_id)
+            if isinstance(parent_conv, dict):
+                parent_state_path = Path(str(parent_conv.get("state_json_path") or "")).expanduser()
+                parent_state = _read_json_if_exists(
+                    parent_state_path,
+                    run_root=run_root,
+                    manifest=manifest,
+                    context=f"parent_conversation_state:{parent_conversation_id}",
+                )
+                if isinstance(parent_state, dict):
+                    state = _fork_state_from_parent(
+                        parent_state=parent_state,
+                        child_state=state,
+                        fork_from_turn_id=fork_from_turn_id,
+                    )
+    else:
+        # Ensure required fields on older state shapes.
+        state.setdefault("schema_version", 1)
+        state.setdefault("conversation_id", conversation_id)
+        state.setdefault("node_id", str(node_id))
+        state.setdefault("parent_conversation_id", parent_conversation_id)
+        state.setdefault("fork_from_turn_id", (str(fork_from_turn_id) if fork_from_turn_id else None))
+        state.setdefault("requested_mode", str((manifest.get("conversation_config") or {}).get("mode") or "auto"))
+        state.setdefault("created_at", _utc_now_iso())
+        state["updated_at"] = _utc_now_iso()
+        state.setdefault("latest_turn_id", None)
+        state.setdefault("next_turn_index", 1)
+        state.setdefault("history_window_turns", int((manifest.get("conversation_config") or {}).get("history_window_turns") or 12))
+        _history_max_chars_raw = (manifest.get("conversation_config") or {}).get("history_max_chars", 20000)
+        state.setdefault("history_max_chars", int(20000 if _history_max_chars_raw is None else _history_max_chars_raw))
+        state.setdefault("provider", {})
+        if not isinstance(state.get("provider"), dict):
+            state["provider"] = {}
+        state["provider"].setdefault("name", "claude_agent_sdk")
+        state["provider"].setdefault("supports_native_continuation", False)
+        state["provider"].setdefault("session_id", None)
+        state["provider"].setdefault("last_response_id", None)
+        state.setdefault("turns", [])
+        if not isinstance(state.get("turns"), list):
+            state["turns"] = []
+        state.setdefault("idea_file_turn_map", {})
+        if not isinstance(state.get("idea_file_turn_map"), dict):
+            state["idea_file_turn_map"] = {}
+
+        # Recompute next_turn_index from observed turn ids to maintain monotonicity.
+        next_idx = 1
+        latest_turn_id = None
+        for turn in state.get("turns") or []:
+            if not isinstance(turn, dict):
+                continue
+            tid = str(turn.get("turn_id") or "")
+            if not tid:
+                continue
+            latest_turn_id = tid
+            idx = _conversation_turn_index(tid)
+            if idx is not None and idx >= next_idx:
+                next_idx = idx + 1
+        state["latest_turn_id"] = latest_turn_id
+        state["next_turn_index"] = int(max(next_idx, int(state.get("next_turn_index") or 1)))
+
+    _atomic_write_json(state_path, state)
+    if not turn_log_path.exists():
+        turn_log_path.parent.mkdir(parents=True, exist_ok=True)
+        turn_log_path.write_text("", encoding="utf-8")
+    if not summary_path.exists():
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(
+            "\n".join(
+                [
+                    f"# Conversation {conversation_id}",
+                    "",
+                    f"node_id: {node_id}",
+                    f"parent_conversation_id: {parent_conversation_id or '(none)'}",
+                    f"fork_from_turn_id: {fork_from_turn_id or '(none)'}",
+                    "",
+                    "Conversation summary placeholder.",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    latest_turn = state.get("latest_turn_id")
+    conv_rec["latest_turn_id"] = latest_turn
+    conv_rec["updated_at"] = _utc_now_iso()
+    node["conversation_id"] = conversation_id
+    node["latest_conversation_turn_id"] = latest_turn
+    if node.get("expansion_seed_turn_id") is None:
+        node["expansion_seed_turn_id"] = (str(fork_from_turn_id) if fork_from_turn_id else latest_turn)
+    if created_now and node.get("expansion_seed_turn_id") is None:
+        node["expansion_seed_turn_id"] = latest_turn
+    _append_conversation_debug_log(
+        manifest=manifest,
+        run_root=run_root,
+        event={
+            "type": "ensure_node_conversation",
+            "node_id": str(node_id),
+            "conversation_id": conversation_id,
+            "parent_conversation_id": parent_conversation_id,
+            "fork_from_turn_id": (str(fork_from_turn_id) if fork_from_turn_id else None),
+            "latest_turn_id": latest_turn,
+            "created": bool(created_now),
+            "state_json_path": str(state_path),
+            "turn_log_jsonl_path": str(turn_log_path),
+        },
+    )
+    return conversation_id
+
+
+def _sync_node_conversation_latest_turn(*, manifest: dict[str, Any], run_root: Path, node_id: str) -> Optional[str]:
+    nodes = manifest.get("nodes") or {}
+    if not isinstance(nodes, dict):
+        return None
+    node = nodes.get(str(node_id))
+    if not isinstance(node, dict):
+        return None
+    conversation_id = str(node.get("conversation_id") or "")
+    if not conversation_id:
+        return None
+    conversations = manifest.get("conversations") or {}
+    if not isinstance(conversations, dict):
+        return None
+    conv_rec = conversations.get(conversation_id)
+    if not isinstance(conv_rec, dict):
+        return None
+    state_path = Path(str(conv_rec.get("state_json_path") or "")).expanduser()
+    state = _read_json_if_exists(
+        state_path,
+        run_root=run_root,
+        manifest=manifest,
+        context=f"sync_node_latest_turn:{conversation_id}",
+    )
+    if not isinstance(state, dict):
+        return None
+    latest_turn = state.get("latest_turn_id")
+    conv_rec["latest_turn_id"] = latest_turn
+    conv_rec["updated_at"] = _utc_now_iso()
+    node["latest_conversation_turn_id"] = latest_turn
+    return str(latest_turn) if latest_turn is not None else None
+
+
+def _lookup_conversation_turn_for_idea(
+    *,
+    manifest: dict[str, Any],
+    run_root: Path,
+    conversation_id: Optional[str],
+    idea_path: Path,
+) -> Optional[str]:
+    if not conversation_id:
+        return None
+    conversations = manifest.get("conversations") or {}
+    if not isinstance(conversations, dict):
+        return None
+    conv_rec = conversations.get(str(conversation_id))
+    if not isinstance(conv_rec, dict):
+        return None
+    state_path = Path(str(conv_rec.get("state_json_path") or "")).expanduser()
+    state = _read_json_if_exists(
+        state_path,
+        run_root=run_root,
+        manifest=manifest,
+        context=f"lookup_turn_for_idea:{conversation_id}",
+    )
+    if not isinstance(state, dict):
+        return None
+
+    idea_map = state.get("idea_file_turn_map") or {}
+    if not isinstance(idea_map, dict):
+        idea_map = {}
+
+    candidates: set[str] = set()
+    candidates.add(str(idea_path))
+    try:
+        candidates.add(str(idea_path.resolve()))
+    except Exception:
+        pass
+    try:
+        candidates.add(str(idea_path.resolve().relative_to(Path.cwd().resolve())))
+    except Exception:
+        pass
+
+    def _norm(s: str) -> str:
+        return str(s).replace("\\", "/").strip().lower()
+
+    norm_candidates = {_norm(c) for c in candidates if c}
+    for key, value in idea_map.items():
+        if not isinstance(value, str):
+            continue
+        if _norm(str(key)) in norm_candidates:
+            return value
+
+    turns = state.get("turns") or []
+    if isinstance(turns, list):
+        for turn in reversed(turns):
+            if not isinstance(turn, dict):
+                continue
+            turn_id = turn.get("turn_id")
+            if not isinstance(turn_id, str):
+                continue
+            for k in ("output_idea_path", "output_idea_path_resolved", "output_idea_path_relative_to_repo"):
+                v = turn.get(k)
+                if not isinstance(v, str):
+                    continue
+                if _norm(v) in norm_candidates:
+                    return turn_id
+    return None
+
+
+def _ensure_manifest_conversation_schema(
+    *,
+    manifest: dict[str, Any],
+    run_root: Path,
+    args: argparse.Namespace,
+) -> None:
+    current_version = int(manifest.get("manifest_version") or 0)
+    if current_version < 3:
+        manifest["manifest_version"] = 3
+
+    run_config = manifest.setdefault("run_config", {})
+    if not isinstance(run_config, dict):
+        run_config = {}
+        manifest["run_config"] = run_config
+    run_config.setdefault("idea_conversation_mode", str(getattr(args, "idea_conversation_mode", "auto")))
+    run_config.setdefault("idea_history_window_turns", int(getattr(args, "idea_history_window_turns", 12)))
+    run_config.setdefault("idea_history_max_chars", int(getattr(args, "idea_history_max_chars", 20000)))
+    run_config.setdefault("max_parallel_evals", int(getattr(args, "max_parallel_evals", 1)))
+    _max_parallel_per_node = getattr(args, "max_parallel_per_node", None)
+    run_config.setdefault("max_parallel_per_node", (int(_max_parallel_per_node) if _max_parallel_per_node is not None else None))
+    run_config.setdefault("parallel_backend", str(getattr(args, "parallel_backend", "threadpool")))
+    run_config.setdefault("eval_retries", int(getattr(args, "eval_retries", 0)))
+    _eval_timeout = getattr(args, "eval_timeout_seconds", None)
+    run_config.setdefault("eval_timeout_seconds", (int(_eval_timeout) if _eval_timeout is not None else None))
+    run_config.setdefault("strict_fail_depth", bool(getattr(args, "strict_fail_depth", False)))
+
+    conversation_config = manifest.setdefault("conversation_config", {})
+    if not isinstance(conversation_config, dict):
+        conversation_config = {}
+        manifest["conversation_config"] = conversation_config
+    conversation_config.setdefault("mode", str(run_config.get("idea_conversation_mode") or "auto"))
+    conversation_config.setdefault("history_window_turns", int(run_config.get("idea_history_window_turns") or 12))
+    _idea_history_max_chars_raw = run_config.get("idea_history_max_chars", 20000)
+    conversation_config.setdefault("history_max_chars", int(20000 if _idea_history_max_chars_raw is None else _idea_history_max_chars_raw))
+    conversation_config.setdefault(
+        "debug_log_jsonl_path",
+        str(_ensure_standard_run_dirs(run_root)["conversations_root"] / "conversation_debug.jsonl"),
+    )
+
+    conversations = manifest.setdefault("conversations", {})
+    if not isinstance(conversations, dict):
+        conversations = {}
+        manifest["conversations"] = conversations
+
+    nodes = manifest.setdefault("nodes", {})
+    if not isinstance(nodes, dict):
+        nodes = {}
+        manifest["nodes"] = nodes
+    for node_id, node in list(nodes.items()):
+        if not isinstance(node, dict):
+            continue
+        node.setdefault("conversation_id", None)
+        node.setdefault("expansion_seed_turn_id", None)
+        node.setdefault("latest_conversation_turn_id", None)
+
+    evals = manifest.setdefault("evaluations", {})
+    if not isinstance(evals, dict):
+        evals = {}
+        manifest["evaluations"] = evals
+    for _, rec in list(evals.items()):
+        if not isinstance(rec, dict):
+            continue
+        rec.setdefault("idea_generation_conversation_id", None)
+        rec.setdefault("idea_generation_turn_id", None)
+
+    # Ensure one conversation per existing node so resume can continue cleanly.
+    ordered_nodes: list[tuple[int, str, dict[str, Any]]] = []
+    for node_id, node in list(nodes.items()):
+        if not isinstance(node, dict):
+            continue
+        try:
+            depth_i = int(node.get("depth") or 0)
+        except Exception:
+            depth_i = 0
+        ordered_nodes.append((depth_i, str(node_id), node))
+    ordered_nodes.sort(key=lambda item: (item[0], item[1]))
+
+    for _, node_id, node in ordered_nodes:
+        parent_node_id = node.get("parent_node_id")
+        parent_node_id_s = str(parent_node_id) if parent_node_id is not None else None
+        fork_turn_id = node.get("expansion_seed_turn_id")
+        fork_turn_id_s = str(fork_turn_id) if fork_turn_id is not None else None
+        _ensure_node_conversation(
+            manifest=manifest,
+            run_root=run_root,
+            node_id=str(node_id),
+            parent_node_id=parent_node_id_s,
+            fork_from_turn_id=fork_turn_id_s,
+        )
+
 def _manifest_write(run_root: Path, manifest: dict[str, Any]) -> None:
     manifest["updated_at"] = _utc_now_iso()
     _atomic_write_json(run_root / "manifest.json", manifest)
 
 
+def _record_scheduler_event(
+    *,
+    manifest: dict[str, Any],
+    run_root: Path,
+    event_type: str,
+    depth: int,
+    eval_id: str,
+    parent_node_id: Optional[str] = None,
+    attempt: Optional[int] = None,
+    reason: Optional[str] = None,
+) -> None:
+    events = manifest.setdefault("events", [])
+    if not isinstance(events, list):
+        events = []
+        manifest["events"] = events
+    details: dict[str, Any] = {
+        "depth": int(depth),
+        "eval_id": str(eval_id),
+    }
+    if parent_node_id is not None:
+        details["parent_node_id"] = str(parent_node_id)
+    if attempt is not None:
+        details["attempt"] = int(attempt)
+    if reason:
+        details["reason"] = str(reason)
+    events.append({"ts": _utc_now_iso(), "type": f"scheduler_{event_type}", "details": details})
+    _append_tree_log(
+        run_root,
+        "scheduler_event"
+        + f" type={event_type}"
+        + f" depth={depth}"
+        + f" eval_id={eval_id}"
+        + (f" parent_node_id={parent_node_id}" if parent_node_id else "")
+        + (f" attempt={attempt}" if attempt is not None else "")
+        + (f" reason={reason}" if reason else ""),
+    )
+
+
+def _compute_depth_progress(*, manifest: dict[str, Any], depth: int) -> dict[str, Any]:
+    depth_key = str(int(depth))
+    state = manifest.get("state") or {}
+    if not isinstance(state, dict):
+        state = {}
+    task_plan = state.get("task_plan_by_depth") or {}
+    if not isinstance(task_plan, dict):
+        task_plan = {}
+    task_records = task_plan.get(depth_key) or []
+    total_tasks = len(task_records) if isinstance(task_records, list) else 0
+
+    queued = 0
+    running = 0
+    completed = 0
+    failed = 0
+    attempts_total = 0
+
+    evals = manifest.get("evaluations") or {}
+    if isinstance(evals, dict):
+        for rec in evals.values():
+            if not isinstance(rec, dict):
+                continue
+            try:
+                depth_val = rec.get("depth")
+                rec_depth = int(-1 if depth_val is None else depth_val)
+            except Exception:
+                continue
+            if rec_depth != int(depth):
+                continue
+            status = str(rec.get("task_state") or rec.get("status") or "").lower().strip()
+            if status == "queued":
+                queued += 1
+            elif status == "running":
+                running += 1
+            elif status == "completed":
+                completed += 1
+            elif status == "failed":
+                failed += 1
+            attempts_total += int(rec.get("attempt") or 0)
+
+    requeued = 0
+    events = manifest.get("events") or []
+    if isinstance(events, list):
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            if str(ev.get("type") or "") != "scheduler_requeued":
+                continue
+            details = ev.get("details") or {}
+            if not isinstance(details, dict):
+                continue
+            try:
+                ev_depth = int(details.get("depth"))
+            except Exception:
+                continue
+            if ev_depth == int(depth):
+                requeued += 1
+
+    done = completed + failed
+    pending = max(0, total_tasks - done)
+    return {
+        "depth": int(depth),
+        "total_tasks": int(total_tasks),
+        "queued": int(queued),
+        "running": int(running),
+        "completed": int(completed),
+        "failed": int(failed),
+        "done": int(done),
+        "pending": int(pending),
+        "requeued": int(requeued),
+        "attempts_total": int(attempts_total),
+        "updated_at": _utc_now_iso(),
+    }
+
+
+def _refresh_depth_progress(*, manifest: dict[str, Any], depth: int) -> None:
+    state = manifest.setdefault("state", {})
+    if not isinstance(state, dict):
+        state = {}
+        manifest["state"] = state
+    by_depth = state.setdefault("depth_progress_by_depth", {})
+    if not isinstance(by_depth, dict):
+        by_depth = {}
+        state["depth_progress_by_depth"] = by_depth
+    by_depth[str(int(depth))] = _compute_depth_progress(manifest=manifest, depth=int(depth))
+
+
 def _tree_summary_markdown(*, run_root: Path, manifest: dict[str, Any]) -> str:
     state = manifest.get("state") or {}
     run_config = manifest.get("run_config") or {}
+    conversation_config = manifest.get("conversation_config") or {}
+    if not isinstance(conversation_config, dict):
+        conversation_config = {}
+    conversations = manifest.get("conversations") or {}
+    if not isinstance(conversations, dict):
+        conversations = {}
     nodes = manifest.get("nodes") or {}
     evals = manifest.get("evaluations") or {}
 
@@ -1213,16 +2279,57 @@ def _tree_summary_markdown(*, run_root: Path, manifest: dict[str, Any]) -> str:
     lines.append(f"- ideas_per_node: {run_config.get('ideas_per_node')}")
     lines.append(f"- max_depth: {run_config.get('max_depth')}")
     lines.append(f"- beam_width: {run_config.get('beam_width')}")
+    lines.append(f"- max_parallel_evals: {run_config.get('max_parallel_evals')}")
+    lines.append(f"- max_parallel_per_node: {run_config.get('max_parallel_per_node')}")
+    lines.append(f"- parallel_backend: {run_config.get('parallel_backend')}")
+    lines.append(f"- eval_retries: {run_config.get('eval_retries')}")
+    lines.append(f"- eval_timeout_seconds: {run_config.get('eval_timeout_seconds')}")
+    lines.append(f"- strict_fail_depth: {run_config.get('strict_fail_depth')}")
     lines.append(f"- sweep_config_limit: {run_config.get('sweep_config_limit')}")
     lines.append(f"- ideas_context_strategy: {run_config.get('ideas_context_strategy')}")
+    lines.append(f"- idea_conversation_mode: {conversation_config.get('mode')}")
+    lines.append(f"- idea_history_window_turns: {conversation_config.get('history_window_turns')}")
+    lines.append(f"- idea_history_max_chars: {conversation_config.get('history_max_chars')}")
+    lines.append(f"- conversation_debug_log_jsonl_path: {conversation_config.get('debug_log_jsonl_path')}")
     lines.append(f"- stop_reason: {state.get('stop_reason')}")
     lines.append("")
+
+    depth_progress = state.get("depth_progress_by_depth") or {}
+    if isinstance(depth_progress, dict) and depth_progress:
+        lines.append("## Depth Progress")
+        lines.append("")
+        lines.append("| depth | total_tasks | queued | running | completed | failed | done | pending | requeued | attempts_total | updated_at |")
+        lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+        for d in sorted(depth_progress.keys(), key=lambda x: int(x) if str(x).isdigit() else str(x)):
+            rec = depth_progress.get(d) or {}
+            if not isinstance(rec, dict):
+                continue
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(rec.get("depth", d)),
+                        str(rec.get("total_tasks", "")),
+                        str(rec.get("queued", "")),
+                        str(rec.get("running", "")),
+                        str(rec.get("completed", "")),
+                        str(rec.get("failed", "")),
+                        str(rec.get("done", "")),
+                        str(rec.get("pending", "")),
+                        str(rec.get("requeued", "")),
+                        str(rec.get("attempts_total", "")),
+                        str(rec.get("updated_at", "")),
+                    ]
+                )
+                + " |"
+            )
+        lines.append("")
 
     # Per-depth table.
     lines.append("## Nodes")
     lines.append("")
-    lines.append("| depth | node_id | parent | root_rank_score | root_grade | root_should_explore | parent_gate | ok/expected | candidate_rows_used | baseline_csv | candidate_csv | experiment_dir |")
-    lines.append("|---:|---:|---:|---:|---|---|---|---|---:|---|---|---|")
+    lines.append("| depth | node_id | parent | conversation_id | parent_conversation_id | latest_turn_id | root_rank_score | root_grade | root_should_explore | parent_gate | ok/expected | candidate_rows_used | baseline_csv | candidate_csv | experiment_dir |")
+    lines.append("|---:|---:|---:|---|---|---|---:|---|---|---|---|---:|---|---|---|")
     # Stable node order: by depth then node_id.
     def _node_sort_key(item: tuple[str, Any]) -> tuple[int, str]:
         nid, rec = item
@@ -1245,6 +2352,15 @@ def _tree_summary_markdown(*, run_root: Path, manifest: dict[str, Any]) -> str:
         gate = ""
         ok_expected = ""
         cand_rows = ""
+        conversation_id = str(nrec.get("conversation_id") or "")
+        conversation_latest_turn = str(nrec.get("latest_conversation_turn_id") or "")
+        parent_conversation_id = ""
+        if conversation_id:
+            conv_rec = conversations.get(conversation_id)
+            if isinstance(conv_rec, dict):
+                parent_conversation_id = str(conv_rec.get("parent_conversation_id") or "")
+                if not conversation_latest_turn:
+                    conversation_latest_turn = str(conv_rec.get("latest_turn_id") or "")
 
         if nid == "0000":
             gate = "ROOT"
@@ -1275,7 +2391,7 @@ def _tree_summary_markdown(*, run_root: Path, manifest: dict[str, Any]) -> str:
             baseline_csv = str((ev.get("parent_baseline_provenance") or {}).get("copied_to_path") or "")
 
         lines.append(
-            f"| {depth} | {nid} | {parent} | {root_rank} | {root_grade} | {root_se} | {gate} | {ok_expected} | {cand_rows} | {baseline_csv} | {cand_csv} | {exp_dir} |"
+            f"| {depth} | {nid} | {parent} | {conversation_id} | {parent_conversation_id} | {conversation_latest_turn} | {root_rank} | {root_grade} | {root_se} | {gate} | {ok_expected} | {cand_rows} | {baseline_csv} | {cand_csv} | {exp_dir} |"
         )
 
     lines.append("")
@@ -1297,6 +2413,54 @@ def _tree_summary_markdown(*, run_root: Path, manifest: dict[str, Any]) -> str:
 
     lines.append("")
     lines.append(f"_Generated at: {_utc_now_iso()}_")
+    lines.append("")
+
+    lines.append("## Evaluations")
+    lines.append("")
+    lines.append("| eval_id | depth | parent_node_id | status | task_state | attempt | started_at | finished_at | duration_s | error_type | error |")
+    lines.append("|---:|---:|---:|---|---|---:|---|---|---:|---|---|")
+    eval_items = [(str(k), v) for k, v in (evals or {}).items() if isinstance(v, dict)]
+    eval_items.sort(key=lambda item: str(item[0]))
+    for eval_id, ev in eval_items:
+        depth = ev.get("depth")
+        parent_id = ev.get("parent_node_id")
+        status = ev.get("status")
+        task_state = ev.get("task_state")
+        attempt = ev.get("attempt")
+        started_at = str(ev.get("started_at") or "")
+        finished_at = str(ev.get("finished_at") or "")
+        duration_s = ""
+        if started_at and finished_at:
+            try:
+                start_dt = _dt.datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                finish_dt = _dt.datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+                duration_s = f"{max(0.0, (finish_dt - start_dt).total_seconds()):.3f}"
+            except Exception:
+                duration_s = ""
+        error_payload = ev.get("error_payload") or {}
+        error_type = ""
+        if isinstance(error_payload, dict):
+            error_type = str(error_payload.get("error_type") or "")
+        error = str(ev.get("error") or "")
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(eval_id),
+                    str(depth),
+                    str(parent_id),
+                    str(status),
+                    str(task_state),
+                    str(attempt),
+                    started_at,
+                    finished_at,
+                    duration_s,
+                    error_type,
+                    error.replace("|", "\\|"),
+                ]
+            )
+            + " |"
+        )
     lines.append("")
     return "\n".join(lines)
 
@@ -1328,11 +2492,14 @@ def _tree_graph_markdown(*, run_root: Path, manifest: dict[str, Any]) -> str:
     state = manifest.get("state") or {}
     nodes = manifest.get("nodes") or {}
     evals = manifest.get("evaluations") or {}
+    conversations = manifest.get("conversations") or {}
 
     if not isinstance(nodes, dict):
         nodes = {}
     if not isinstance(evals, dict):
         evals = {}
+    if not isinstance(conversations, dict):
+        conversations = {}
 
     frontier = set(str(x) for x in (state.get("frontier_node_ids") or []))
 
@@ -1412,7 +2579,20 @@ def _tree_graph_markdown(*, run_root: Path, manifest: dict[str, Any]) -> str:
         ev = _eval_for_node(nrec)
         ev_id = str(ev.get("eval_id") or "") if ev else ""
         rank = _fmt_float(_rank_score(ev)) if ev else "na"
-        edge_label = _escape_mermaid_label(f"eval {ev_id}\\nrank {rank}".strip())
+        edge_lines = [f"eval {ev_id}".strip(), f"rank {rank}".strip()]
+        conv_id = str(nrec.get("conversation_id") or "")
+        conv_rec = conversations.get(conv_id) if conv_id else None
+        parent_conv_id = ""
+        fork_turn_id = ""
+        if isinstance(conv_rec, dict):
+            parent_conv_id = str(conv_rec.get("parent_conversation_id") or "")
+            fork_turn_id = str(conv_rec.get("fork_from_turn_id") or "")
+        if conv_id:
+            conv_line = f"conv {parent_conv_id or '?'}->{conv_id}"
+            if fork_turn_id:
+                conv_line += f" @{fork_turn_id}"
+            edge_lines.append(conv_line)
+        edge_label = _escape_mermaid_label("\\n".join([ln for ln in edge_lines if ln]))
         lines.append(f"  N{parent} -->|{edge_label}| N{nid}")
 
     # Styling.
@@ -1474,6 +2654,9 @@ def _validate_run(*, repo_root: Path, run_root: Path, manifest: dict[str, Any]) 
                     _issue("sha_mismatch", "Root baseline sha256 mismatch", path=str(p))
 
     nodes = manifest.get("nodes") or {}
+    conversations = manifest.get("conversations") or {}
+    if not isinstance(conversations, dict):
+        conversations = {}
     if isinstance(nodes, dict):
         for nid, nrec in nodes.items():
             if not isinstance(nrec, dict):
@@ -1495,6 +2678,18 @@ def _validate_run(*, repo_root: Path, run_root: Path, manifest: dict[str, Any]) 
                         _issue("ref_mismatch", "Node ref does not point at commit", node_id=str(nid), ref_name=str(ref_name), commit=str(commit), ref_commit=str(ref_commit))
                 except Exception as exc:  # noqa: BLE001
                     _issue("ref_error", "Failed to resolve node ref", node_id=str(nid), ref_name=str(ref_name), error=str(exc))
+
+            conv_id = str(nrec.get("conversation_id") or "").strip()
+            if conv_id:
+                conv_rec = conversations.get(conv_id)
+                if not isinstance(conv_rec, dict):
+                    _issue("state_inconsistency", "node_conversation_missing_record", node_id=str(nid), conversation_id=conv_id)
+                else:
+                    sp = conv_rec.get("state_json_path")
+                    if sp:
+                        cp = Path(str(sp)).expanduser()
+                        if not cp.exists():
+                            _issue("missing_file", "Conversation state JSON missing", node_id=str(nid), conversation_id=conv_id, path=str(cp))
 
     evals = manifest.get("evaluations") or {}
     if isinstance(evals, dict):
@@ -1796,6 +2991,8 @@ def _init_or_resume_manifest(
                 f"Manifest tree_run_id mismatch: manifest has {manifest.get('tree_run_id')!r} "
                 f"but args.tree_run_id is {args.tree_run_id!r}"
             )
+        _ensure_manifest_conversation_schema(manifest=manifest, run_root=run_root, args=args)
+        _manifest_write(run_root, manifest)
         return manifest
 
     # New run: enforce clean root tree (decision).
@@ -1838,6 +3035,9 @@ def _init_or_resume_manifest(
         "baseline_results_csv_path": str(root_baseline_copy),
         "node_ideas_dir": str(node_ideas_dir),
         "idea_chain": [],
+        "conversation_id": None,
+        "expansion_seed_turn_id": None,
+        "latest_conversation_turn_id": None,
         "artifacts": {"root_baseline_provenance": baseline_prov},
         "created_at": _utc_now_iso(),
         "status": "ready",
@@ -1845,7 +3045,7 @@ def _init_or_resume_manifest(
 
     tree_run_id = str(args.tree_run_id)
     manifest = {
-        "manifest_version": 2,
+        "manifest_version": 3,
         "tree_run_id": tree_run_id,
         "created_at": _utc_now_iso(),
         "updated_at": _utc_now_iso(),
@@ -1853,6 +3053,12 @@ def _init_or_resume_manifest(
             "ideas_per_node": int(args.ideas_per_node),
             "max_depth": int(args.max_depth),
             "beam_width": int(args.beam_width),
+            "max_parallel_evals": int(args.max_parallel_evals),
+            "max_parallel_per_node": (int(args.max_parallel_per_node) if args.max_parallel_per_node is not None else None),
+            "parallel_backend": str(args.parallel_backend),
+            "eval_retries": int(args.eval_retries),
+            "eval_timeout_seconds": (int(args.eval_timeout_seconds) if args.eval_timeout_seconds is not None else None),
+            "strict_fail_depth": bool(args.strict_fail_depth),
             "sweep_config_limit": (int(args.sweep_config_limit) if args.sweep_config_limit is not None else None),
             "max_total_idea_evals": (int(args.max_total_idea_evals) if args.max_total_idea_evals is not None else None),
             "stop_on_empty_frontier": bool(args.stop_on_empty_frontier),
@@ -1861,6 +3067,9 @@ def _init_or_resume_manifest(
             "artifact_policy": artifact_policy,
             "node_ideas_root_dir": str(paths["node_ideas_root"]),
             "ideas_context_strategy": "node_plus_ancestors",
+            "idea_conversation_mode": str(args.idea_conversation_mode),
+            "idea_history_window_turns": int(args.idea_history_window_turns),
+            "idea_history_max_chars": int(args.idea_history_max_chars),
             "agent_config_path": str(config_path),
             "agent_config_snapshot": config_obj,
             "runs_root": str(run_root.parent),
@@ -1868,6 +3077,13 @@ def _init_or_resume_manifest(
             "wt_root": str(paths["wt_root"]),
             "cand_root": str(paths["cand_root"]),
             "eval_root": str(paths["eval_root"]),
+            "conversations_root": str(paths["conversations_root"]),
+        },
+        "conversation_config": {
+            "mode": str(args.idea_conversation_mode),
+            "history_window_turns": int(args.idea_history_window_turns),
+            "history_max_chars": int(args.idea_history_max_chars),
+            "debug_log_jsonl_path": str(paths["conversations_root"] / "conversation_debug.jsonl"),
         },
         "root": {
             "root_commit": root_commit,
@@ -1885,16 +3101,35 @@ def _init_or_resume_manifest(
             "deferred_cleanup": [],
         },
         "events": [],
+        "conversations": {},
         "nodes": {node_id: node_record},
         "evaluations": {},
     }
 
-    _atomic_write_json(manifest_path, manifest)
+    _ensure_manifest_conversation_schema(manifest=manifest, run_root=run_root, args=args)
+    _ensure_node_conversation(
+        manifest=manifest,
+        run_root=run_root,
+        node_id=node_id,
+        parent_node_id=None,
+        fork_from_turn_id=None,
+    )
+    _manifest_write(run_root, manifest)
     return manifest
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(list(argv or sys.argv[1:]))
+    if int(args.idea_history_max_chars) < -1:
+        raise ValueError("--idea-history-max-chars must be -1, 0, or a positive integer.")
+    if int(args.max_parallel_evals) < 1:
+        raise ValueError("--max-parallel-evals must be >= 1.")
+    if args.max_parallel_per_node is not None and int(args.max_parallel_per_node) < 1:
+        raise ValueError("--max-parallel-per-node must be >= 1 when set.")
+    if int(args.eval_retries) < 0:
+        raise ValueError("--eval-retries must be >= 0.")
+    if args.eval_timeout_seconds is not None and int(args.eval_timeout_seconds) <= 0:
+        raise ValueError("--eval-timeout-seconds must be > 0 when set.")
     # Local import: keeps module import side-effects minimal.
     from scoring_hooks import compute_score  # type: ignore
 
@@ -1971,7 +3206,22 @@ def main(argv: list[str] | None = None) -> int:
         max_total_idea_evals = run_config.get("max_total_idea_evals")
         max_depth = int(run_config.get("max_depth") or 0)
         beam_width = int(run_config.get("beam_width") or 1)
+        max_parallel_evals = int(run_config.get("max_parallel_evals") or 1)
+        _max_parallel_per_node_raw = run_config.get("max_parallel_per_node")
+        max_parallel_per_node = (int(_max_parallel_per_node_raw) if _max_parallel_per_node_raw is not None else None)
+        parallel_backend = str(run_config.get("parallel_backend") or "threadpool")
+        eval_retries = int(run_config.get("eval_retries") or 0)
+        _eval_timeout_raw = run_config.get("eval_timeout_seconds")
+        eval_timeout_seconds = (int(_eval_timeout_raw) if _eval_timeout_raw is not None else None)
+        strict_fail_depth = bool(run_config.get("strict_fail_depth", False))
         stop_on_empty_frontier = bool(run_config.get("stop_on_empty_frontier", True))
+        conversation_config = manifest.get("conversation_config") or {}
+        if not isinstance(conversation_config, dict):
+            conversation_config = {}
+        idea_conversation_mode = str(conversation_config.get("mode") or "auto")
+        idea_history_window_turns = int(conversation_config.get("history_window_turns") or 12)
+        _idea_history_max_chars_raw = conversation_config.get("history_max_chars", 20000)
+        idea_history_max_chars = int(20000 if _idea_history_max_chars_raw is None else _idea_history_max_chars_raw)
         config_path = Path(run_config.get("agent_config_path") or args.config).resolve()
         agent_cfg = _read_json(config_path)
         if not isinstance(agent_cfg, dict):
@@ -1980,7 +3230,7 @@ def main(argv: list[str] | None = None) -> int:
 
         state = manifest.get("state") or {}
         current_depth = int(state.get("current_depth") or 0)
-        frontier = list(state.get("frontier_node_ids") or [])
+        frontier = sorted(str(x) for x in (state.get("frontier_node_ids") or []))
         _append_tree_log(run_root, f"depth_start depth={current_depth} frontier={frontier}")
 
         if current_depth >= max_depth:
@@ -2073,6 +3323,13 @@ def main(argv: list[str] | None = None) -> int:
         completed_evals = [e for e in evals.values() if isinstance(e, dict) and e.get("status") == "completed"]
 
         stop_reason = state.get("stop_reason")
+        depth_task_records: list[dict[str, Any]] = []
+        task_plan_by_depth = state.setdefault("task_plan_by_depth", {})
+        if not isinstance(task_plan_by_depth, dict):
+            task_plan_by_depth = {}
+            state["task_plan_by_depth"] = task_plan_by_depth
+        previous_depth_plan = list(task_plan_by_depth.get(str(current_depth)) or [])
+        depth_dispatch_queue: list[dict[str, Any]] = []
         for node_id in frontier:
             if stop_reason:
                 break
@@ -2093,6 +3350,29 @@ def main(argv: list[str] | None = None) -> int:
                 node_ideas_dir = _ensure_standard_run_dirs(run_root)["node_ideas_root"] / str(node_id)
                 _safe_mkdir(node_ideas_dir)
                 node["node_ideas_dir"] = str(node_ideas_dir)
+
+            parent_node_id = node.get("parent_node_id")
+            parent_node_id_s = str(parent_node_id) if parent_node_id is not None else None
+            fork_from_turn_id = node.get("expansion_seed_turn_id")
+            fork_from_turn_id_s = str(fork_from_turn_id) if fork_from_turn_id is not None else None
+            node_conversation_id = _ensure_node_conversation(
+                manifest=manifest,
+                run_root=run_root,
+                node_id=str(node_id),
+                parent_node_id=parent_node_id_s,
+                fork_from_turn_id=fork_from_turn_id_s,
+            )
+            conversations = manifest.get("conversations") or {}
+            if not isinstance(conversations, dict):
+                conversations = {}
+                manifest["conversations"] = conversations
+            node_conv = conversations.get(node_conversation_id) or {}
+            if not isinstance(node_conv, dict):
+                node_conv = {}
+            node_conv_state_raw = str(node_conv.get("state_json_path") or "").strip()
+            node_conv_turn_log_raw = str(node_conv.get("turn_log_jsonl_path") or "").strip()
+            node_conv_state_path = Path(node_conv_state_raw).expanduser() if node_conv_state_raw else None
+            node_conv_turn_log_path = Path(node_conv_turn_log_raw).expanduser() if node_conv_turn_log_raw else None
 
             context_dirs = _collect_context_idea_dirs(manifest, node_id)
             node["context_ideas_dirs"] = context_dirs
@@ -2130,6 +3410,17 @@ def main(argv: list[str] | None = None) -> int:
                             str(missing),
                         ]
                         gen_args.extend(["--baseline-context-json", str(baseline_ctx_path)])
+                        if idea_conversation_mode != "off":
+                            gen_args.extend(["--conversation-mode", str(idea_conversation_mode)])
+                            if node_conv_state_path is not None:
+                                gen_args.extend(["--conversation-state-in", str(node_conv_state_path)])
+                                gen_args.extend(["--conversation-state-out", str(node_conv_state_path)])
+                            if node_conv_turn_log_path is not None:
+                                gen_args.extend(["--emit-turn-log", str(node_conv_turn_log_path)])
+                            gen_args.extend(["--conversation-history-window-turns", str(int(idea_history_window_turns))])
+                            gen_args.extend(["--conversation-history-max-chars", str(int(idea_history_max_chars))])
+                            if fork_from_turn_id_s:
+                                gen_args.extend(["--fork-from-turn-id", str(fork_from_turn_id_s)])
                         for d in context_dirs:
                             gen_args.extend(["--context-ideas-dir", str(d)])
                         env = dict(os.environ)
@@ -2138,7 +3429,11 @@ def main(argv: list[str] | None = None) -> int:
                             raise RuntimeError(f"generate_ideas.py failed for node {node_id} (exit {rc})")
                 existing_ideas = _list_markdown_files(node_ideas_dir)
 
-            selected_ideas = existing_ideas[:desired_k]
+            latest_turn_id = _sync_node_conversation_latest_turn(manifest=manifest, run_root=run_root, node_id=str(node_id))
+            if latest_turn_id:
+                node["expansion_seed_turn_id"] = latest_turn_id
+
+            selected_ideas = sorted(existing_ideas[:desired_k], key=lambda p: str(p))
             node["generated_idea_files"] = [str(p) for p in selected_ideas]
             # Record context file hashes for reproducibility (the set included by generate_ideas is dynamic,
             # but at least persist what dirs exist and their file hashes at eval time).
@@ -2162,7 +3457,7 @@ def main(argv: list[str] | None = None) -> int:
             _manifest_write(run_root, manifest)
             lock.heartbeat()
 
-            # Evaluate each idea in deterministic filename order.
+            # Build queued eval tasks in deterministic filename order.
             for idea_path in selected_ideas:
                 # Deterministic repeat-avoidance (skip duplicate idea text within this node and vs ancestors).
                 try:
@@ -2184,6 +3479,13 @@ def main(argv: list[str] | None = None) -> int:
                     _manifest_write(run_root, manifest)
                     break
 
+                idea_generation_turn_id = _lookup_conversation_turn_for_idea(
+                    manifest=manifest,
+                    run_root=run_root,
+                    conversation_id=str(node.get("conversation_id") or ""),
+                    idea_path=idea_path,
+                )
+
                 # Skip if already evaluated for this node+idea (resume).
                 matching = []
                 for ev in evals.values():
@@ -2191,6 +3493,7 @@ def main(argv: list[str] | None = None) -> int:
                         continue
                     if ev.get("parent_node_id") == node_id and str(ev.get("idea_path") or "") == str(idea_path):
                         matching.append(ev)
+                any_completed_for_key = any(str(ev.get("status") or "") == "completed" for ev in matching)
                 # Prefer the latest eval_id for the same (node, idea).
                 existing_eval = None
                 if matching:
@@ -2198,10 +3501,14 @@ def main(argv: list[str] | None = None) -> int:
                     existing_eval = matching[-1]
 
                 if existing_eval is not None and not bool(args.rerun_evals):
-                    # Only skip completed evals. If a prior attempt failed or was interrupted,
-                    # rerun using the same eval_id/output paths to preserve determinism.
-                    if existing_eval.get("status") == "completed":
+                    # If any prior eval for this idempotency key completed, never duplicate it.
+                    if any_completed_for_key:
+                        _manifest_write(run_root, manifest)
                         continue
+                    # Prior attempts failed/interrupted/running/queued -> requeue in-place.
+                    existing_eval["idea_generation_conversation_id"] = str(node.get("conversation_id") or "")
+                    if idea_generation_turn_id:
+                        existing_eval["idea_generation_turn_id"] = idea_generation_turn_id
                     eval_id = str(existing_eval.get("eval_id"))
                     eval_rec = existing_eval
                     eval_output_root = Path(str(eval_rec.get("eval_output_root") or "")).expanduser()
@@ -2212,13 +3519,7 @@ def main(argv: list[str] | None = None) -> int:
                     if not experiment_dir:
                         experiment_dir = eval_output_root / "experiment"
                         eval_rec["experiment_dir"] = str(experiment_dir)
-                    sweep_output_dir = eval_output_root
-                    sweep_results_csv = eval_output_root / "meta_config_sweep_results.csv"
                     _safe_mkdir(experiment_dir)
-                    eval_rec["status"] = "running"
-                    eval_rec["error"] = None
-                    _manifest_write(run_root, manifest)
-                    lock.heartbeat()
                 else:
                     next_eval_num = int(state.get("next_eval_id") or 1)
                     eval_id = _format_eval_id(next_eval_num)
@@ -2226,8 +3527,6 @@ def main(argv: list[str] | None = None) -> int:
 
                     eval_output_root = _ensure_standard_run_dirs(run_root)["eval_root"] / eval_id
                     experiment_dir = eval_output_root / "experiment"
-                    sweep_output_dir = eval_output_root
-                    sweep_results_csv = eval_output_root / "meta_config_sweep_results.csv"
                     _safe_mkdir(experiment_dir)
 
                     eval_rec = {
@@ -2235,13 +3534,21 @@ def main(argv: list[str] | None = None) -> int:
                         "parent_node_id": node_id,
                         "depth": current_depth,
                         "idea_path": str(idea_path),
+                        "idea_generation_conversation_id": str(node.get("conversation_id") or ""),
+                        "idea_generation_turn_id": (str(idea_generation_turn_id) if idea_generation_turn_id else None),
                         "eval_output_root": str(eval_output_root),
                         "experiment_dir": str(experiment_dir),
                         "candidate_worktree_path": None,
                         "candidate_ref_name": _eval_ref_name(tree_run_id, eval_id),
                         "candidate_commit": None,
                         "candidate_results_csv_path": None,
-                        "status": "running",
+                        "status": "queued",
+                        "task_state": "queued",
+                        "queued_at": None,
+                        "started_at": None,
+                        "finished_at": None,
+                        "worker_pid": None,
+                        "attempt": 0,
                         "error": None,
                         "parent_relative": {},
                         "root_relative": {},
@@ -2255,223 +3562,444 @@ def main(argv: list[str] | None = None) -> int:
                         },
                     }
                     evals[eval_id] = eval_rec
-                    _manifest_write(run_root, manifest)
-                    lock.heartbeat()
 
-                # Dry-run: simulate evaluation without creating worktrees or running sweeps.
-                if bool(args.dry_run):
-                    try:
-                        artifacts_root = _ensure_standard_run_dirs(run_root)["artifacts_root"]
-                        parent_baseline_prov = _ensure_artifact_copy(
-                            run_root=run_root,
-                            source_path=node_baseline_csv_path,
-                            dest_name=f"baseline_node_{node_id}.csv",
-                        )
-                        eval_rec["parent_baseline_provenance"] = parent_baseline_prov
+                eval_rec.setdefault(
+                    "decision",
+                    {
+                        "gate_basis": "parent_relative",
+                        "rank_basis": "root_relative",
+                        "passed_gate": None,
+                        "rank_score": None,
+                        "promotion_reason": None,
+                        "primary_regressed": None,
+                    },
+                )
+                eval_rec["status"] = "queued"
+                eval_rec["task_state"] = "queued"
+                eval_rec["error"] = None
+                eval_rec.setdefault("attempt", 0)
+                queued_ts = _utc_now_iso()
+                eval_rec["queued_at"] = queued_ts
+                # Clear previous run markers when re-queuing.
+                eval_rec["started_at"] = None
+                eval_rec["finished_at"] = None
+                eval_rec["worker_pid"] = None
+                eval_rec["idea_generation_conversation_id"] = str(node.get("conversation_id") or "")
+                if idea_generation_turn_id:
+                    eval_rec["idea_generation_turn_id"] = str(idea_generation_turn_id)
 
-                        scenario = _dry_run_scenario(eval_id=eval_id)
-                        candidate_art_path = artifacts_root / f"candidate_eval_{eval_id}.csv"
-                        _dry_run_write_candidate_csv(
-                            path=candidate_art_path,
-                            config_id_limit=(int(sweep_config_limit) if sweep_config_limit is not None else None),
-                            ok=bool(scenario.get("strict_complete", True)),
-                        )
-                        cand_prov = _copy_with_provenance(source_path=candidate_art_path, dest_path=candidate_art_path)
-                        eval_rec["candidate_results_provenance"] = cand_prov
-                        eval_rec["candidate_results_csv_path"] = str(candidate_art_path)
-                        eval_rec["candidate_commit"] = node_commit
-
-                        # Strict completeness counters (simulate failures deterministically).
-                        if sweep_config_limit is not None:
-                            strict = _strict_completeness_counts(csv_path=candidate_art_path, config_id_limit=int(sweep_config_limit))
-                            eval_rec["strict_completeness"] = strict
-
-                        should_explore = bool(scenario.get("should_explore"))
-                        grade = scenario.get("grade")
-                        primary_delta = float(scenario.get("primary_delta") or 0.0)
-                        rank_score = scenario.get("rank_score")
-
-                        eval_rec["parent_relative"] = {
-                            "recommendation_summary": {
-                                "should_explore": should_explore,
-                                "grade": grade,
-                                "score": None,
-                                "reasons": ["dry_run"],
-                            },
-                            "primary_delta": primary_delta,
-                            "baseline_rows_used": (int(sweep_config_limit) if sweep_config_limit is not None else 1),
-                            "candidate_rows_used": (int(sweep_config_limit) if sweep_config_limit is not None else 1),
-                            "score": None,
-                            "summary_json_path": "",
-                        }
-                        eval_rec["root_relative"] = {
-                            "recommendation_summary": {
-                                "should_explore": should_explore,
-                                "grade": grade,
-                                "score": rank_score,
-                                "reasons": ["dry_run"],
-                            },
-                            "primary_delta": primary_delta,
-                            "baseline_rows_used": (int(sweep_config_limit) if sweep_config_limit is not None else 1),
-                            "candidate_rows_used": (int(sweep_config_limit) if sweep_config_limit is not None else 1),
-                            "score": None,
-                        }
-
-                        eval_rec["status"] = "completed"
-                        eval_rec["error"] = None
-                    except Exception as exc:  # noqa: BLE001
-                        eval_rec["status"] = "failed"
-                        eval_rec["error"] = f"{type(exc).__name__}: {exc}"
-                    finally:
-                        _manifest_write(run_root, manifest)
-                        lock.heartbeat()
-                    continue
-
-                # Candidate worktree at node commit.
-                cand_dir = _ensure_standard_run_dirs(run_root)["cand_root"] / eval_id
-                try:
-                    if cand_dir.exists():
-                        # Leftover from crash; try to remove first.
-                        try:
-                            cleanup_worktree(repo_root=repo_root, worktree_path=cand_dir)
-                        except Exception as exc:  # noqa: BLE001
-                            _queue_deferred_cleanup(manifest, path=str(cand_dir), kind="worktree", reason=str(exc))
-                            raise
-
-                    cand_info = create_candidate_worktree(
-                        repo_root=repo_root,
-                        run_root=run_root,
-                        tree_run_id=tree_run_id,
-                        eval_id=eval_id,
-                        parent_commit=node_commit,
-                    )
-                    eval_rec["candidate_worktree_path"] = cand_info["worktree_path"]
-
-                    # Run multi-agent loop in-place.
-                    env = dict(os.environ)
-                    env["AGENTIC_OUTPUT_DIR"] = str(sweep_output_dir)
-                    env["AGENTIC_RESULTS_CSV"] = str(sweep_results_csv)
-                    mar_args = [
-                        "agentic_experimentation/multi_agent_runner.py",
-                        "--in-place",
-                        "--worktree-path",
-                        str(cand_info["worktree_path"]),
-                        "--idea-path",
-                        str(idea_path),
-                        "--config",
-                        str(config_path),
-                        "--experiments-root",
-                        str(experiment_dir),
-                        "--run-id",
-                        eval_id,
-                        "--baseline-csv",
-                        str(node_baseline_csv_path),
-                        "--no-archive-ideas",
-                    ]
-                    if sweep_config_limit is not None:
-                        mar_args.extend(["--sweep-config-limit", str(int(sweep_config_limit))])
-
-                    mar_log_path = eval_output_root / "multi_agent_runner.subprocess.log"
-                    _append_tree_log(run_root, f"multi_agent_runner eval_id={eval_id} log={mar_log_path}")
-                    rc = _run_python_logged(repo_root=repo_root, args=mar_args, env=env, log_path=mar_log_path, echo=True)
-                    if rc != 0:
-                        raise RuntimeError(f"multi_agent_runner failed (exit {rc})")
-
-                    exp_dir = Path(experiment_dir) / eval_id
-                    summary_path = exp_dir / "summary.json"
-                    if not summary_path.exists():
-                        raise RuntimeError(f"Missing summary.json at {summary_path}")
-                    summary = _read_json(summary_path)
-                    if not isinstance(summary, dict):
-                        raise RuntimeError(f"Invalid summary.json at {summary_path}")
-                    approved = bool(summary.get("approved"))
-                    sweep_exit = summary.get("sweep_exit_code")
-                    candidate_csv = exp_dir / "meta_config_sweep_results.csv"
-                    if not approved or sweep_exit != 0 or not candidate_csv.exists():
-                        raise RuntimeError("Idea did not reach approved+sweep-success state; no candidate results.")
-
-                    # Commit candidate changes (required identity).
-                    cand_wt_path = Path(str(cand_info["worktree_path"]))
-                    msg = f"tree_run {tree_run_id} eval {eval_id} idea {idea_path.name}"
-                    candidate_commit = _git_commit_all(worktree_path=cand_wt_path, message=msg)
-                    eval_rec["candidate_commit"] = candidate_commit
-
-                    # Copy artifacts with provenance.
-                    parent_baseline_prov = _ensure_artifact_copy(
-                        run_root=run_root,
-                        source_path=node_baseline_csv_path,
-                        dest_name=f"baseline_node_{node_id}.csv",
-                    )
-                    cand_prov = _copy_with_provenance(
-                        source_path=candidate_csv,
-                        dest_path=_ensure_standard_run_dirs(run_root)["artifacts_root"] / f"candidate_eval_{eval_id}.csv",
-                    )
-                    eval_rec["parent_baseline_provenance"] = parent_baseline_prov
-                    eval_rec["candidate_results_provenance"] = cand_prov
-                    copied_candidate_csv = Path(str(cand_prov["copied_to_path"]))
-                    eval_rec["candidate_results_csv_path"] = str(copied_candidate_csv)
-
-                    # Scoring: parent-relative and root-relative.
-                    parent_score = compute_score(
-                        Path(str(parent_baseline_prov["copied_to_path"])),
-                        copied_candidate_csv,
-                        score_column,
-                        config_id_limit=sweep_config_limit,
-                    )
-                    root_baseline_csv = Path(str((manifest.get("root") or {}).get("root_baseline_csv_path") or "")).expanduser()
-                    root_score = compute_score(
-                        root_baseline_csv,
-                        copied_candidate_csv,
-                        score_column,
-                        config_id_limit=sweep_config_limit,
-                    )
-                    eval_rec["parent_relative"] = {
-                        "recommendation_summary": _recommendation_summary(parent_score),
-                        "primary_delta": _primary_delta(parent_score),
-                        "baseline_rows_used": parent_score.get("baseline_rows_used"),
-                        "candidate_rows_used": parent_score.get("candidate_rows_used"),
-                        "score": parent_score.get("score"),
-                        "summary_json_path": str(summary_path),
-                    }
-                    eval_rec["root_relative"] = {
-                        "recommendation_summary": _recommendation_summary(root_score),
-                        "primary_delta": _primary_delta(root_score),
-                        "baseline_rows_used": root_score.get("baseline_rows_used"),
-                        "candidate_rows_used": root_score.get("candidate_rows_used"),
-                        "score": root_score.get("score"),
-                    }
-
-                    # Strict completeness counters.
-                    if sweep_config_limit is not None:
-                        strict = _strict_completeness_counts(csv_path=copied_candidate_csv, config_id_limit=int(sweep_config_limit))
-                        eval_rec["strict_completeness"] = strict
-                        if not strict.get("is_complete"):
-                            eval_rec["decision"]["passed_gate"] = False
-                            eval_rec["decision"]["promotion_reason"] = "incomplete_or_failed_rows"
-                        else:
-                            eval_rec["decision"]["passed_gate"] = None
-
-                    eval_rec["status"] = "completed"
-                    completed_evals.append(eval_rec)
-                except Exception as exc:  # noqa: BLE001
-                    eval_rec["status"] = "failed"
-                    eval_rec["error"] = f"{type(exc).__name__}: {exc}"
-                finally:
-                    _manifest_write(run_root, manifest)
-                    lock.heartbeat()
-
-                    # Cleanup candidate worktree unless requested to keep.
-                    keep = bool(args.keep_rejected_worktrees) or (eval_rec.get("status") != "completed" and bool(args.keep_failed_artifacts))
-                    if not keep and eval_rec.get("candidate_worktree_path"):
-                        try:
-                            cleanup_worktree(repo_root=repo_root, worktree_path=Path(str(eval_rec["candidate_worktree_path"])))
-                        except Exception as exc:  # noqa: BLE001
-                            _queue_deferred_cleanup(manifest, path=str(eval_rec["candidate_worktree_path"]), kind="worktree", reason=str(exc))
-                            _manifest_write(run_root, manifest)
+                task_rec = {
+                    "eval_id": str(eval_id),
+                    "parent_node_id": str(node_id),
+                    "idea_path": str(idea_path),
+                    "depth": int(current_depth),
+                    "task_state": "queued",
+                    "queued_at": queued_ts,
+                    "started_at": None,
+                    "finished_at": None,
+                    "worker_pid": None,
+                    "attempt": int(eval_rec.get("attempt") or 0),
+                    "node_commit": node_commit,
+                    "node_baseline_csv_path": str(node_baseline_csv_path),
+                }
+                depth_task_records.append(task_rec)
+                depth_dispatch_queue.append(task_rec)
+                _record_scheduler_event(
+                    manifest=manifest,
+                    run_root=run_root,
+                    event_type="queued",
+                    depth=int(current_depth),
+                    eval_id=str(eval_id),
+                    parent_node_id=str(node_id),
+                    attempt=int(eval_rec.get("attempt") or 0),
+                )
 
             expanded_set.add(node_id)
             expanded_by_depth[str(current_depth)] = sorted(expanded_set)
             _manifest_write(run_root, manifest)
+
+        # Resume recovery: include prior queued/running tasks for this depth that were not
+        # reconstructed above (e.g., interrupted run before task reconstruction completed).
+        existing_task_eval_ids = {str(rec.get("eval_id") or "") for rec in depth_task_records}
+        for old_task in previous_depth_plan:
+            if not isinstance(old_task, dict):
+                continue
+            old_eval_id = str(old_task.get("eval_id") or "")
+            if not old_eval_id or old_eval_id in existing_task_eval_ids:
+                continue
+            old_eval = (evals or {}).get(old_eval_id)
+            if not isinstance(old_eval, dict):
+                continue
+            try:
+                old_depth = int(old_eval.get("depth") or -1)
+            except Exception:
+                continue
+            if old_depth != int(current_depth):
+                continue
+            old_parent = str(old_eval.get("parent_node_id") or "")
+            if old_parent not in frontier:
+                continue
+            if str(old_eval.get("status") or "").lower() == "completed":
+                continue
+
+            parent_node = (manifest.get("nodes") or {}).get(old_parent) or {}
+            if not isinstance(parent_node, dict):
+                continue
+            node_commit = str(parent_node.get("commit") or "")
+            node_baseline_csv_path = str(parent_node.get("baseline_results_csv_path") or "")
+            if not node_commit or not node_baseline_csv_path:
+                continue
+
+            queued_ts = _utc_now_iso()
+            old_eval["status"] = "queued"
+            old_eval["task_state"] = "queued"
+            old_eval["queued_at"] = queued_ts
+            old_eval["started_at"] = None
+            old_eval["finished_at"] = None
+            old_eval["worker_pid"] = None
+            old_eval["error"] = None
+
+            recovered = {
+                "eval_id": old_eval_id,
+                "parent_node_id": old_parent,
+                "idea_path": str(old_eval.get("idea_path") or ""),
+                "depth": int(current_depth),
+                "task_state": "queued",
+                "queued_at": queued_ts,
+                "started_at": None,
+                "finished_at": None,
+                "worker_pid": None,
+                "attempt": int(old_eval.get("attempt") or 0),
+                "node_commit": node_commit,
+                "node_baseline_csv_path": node_baseline_csv_path,
+            }
+            depth_task_records.append(recovered)
+            depth_dispatch_queue.append(recovered)
+            existing_task_eval_ids.add(old_eval_id)
+            _append_tree_log(run_root, f"depth_resume_requeue depth={current_depth} eval_id={old_eval_id}")
+            _record_scheduler_event(
+                manifest=manifest,
+                run_root=run_root,
+                event_type="requeued",
+                depth=int(current_depth),
+                eval_id=str(old_eval_id),
+                parent_node_id=str(old_parent),
+                attempt=int(old_eval.get("attempt") or 0),
+                reason="resume_recover",
+            )
+
+        task_plan_by_depth[str(current_depth)] = depth_task_records
+        if depth_task_records:
+            _append_tree_log(run_root, f"depth_task_plan depth={current_depth} queued_tasks={len(depth_task_records)}")
+        _refresh_depth_progress(manifest=manifest, depth=int(current_depth))
+        _manifest_write(run_root, manifest)
+        lock.heartbeat()
+
+        # Execute queued depth tasks (parallel coordinator + worker model).
+        if parallel_backend != "threadpool":
+            raise RuntimeError(f"Unsupported parallel backend: {parallel_backend}")
+
+        root_baseline_csv = Path(str((manifest.get("root") or {}).get("root_baseline_csv_path") or "")).expanduser()
+        completed_eval_ids = {str(rec.get("eval_id") or "") for rec in completed_evals if isinstance(rec, dict)}
+        pending_tasks = list(depth_dispatch_queue)
+        running_by_parent: dict[str, int] = {}
+        futures: dict[Any, tuple[dict[str, Any], dict[str, Any]]] = {}
+        strict_halt_depth = False
+
+        # Preflight uniqueness checks for per-eval isolation guarantees.
+        seen_output_roots: set[str] = set()
+        seen_ref_names: set[str] = set()
+        for planned in pending_tasks:
+            eval_id = str(planned.get("eval_id") or "")
+            eval_rec = (evals or {}).get(eval_id)
+            if not isinstance(eval_rec, dict):
+                continue
+            output_root = str(eval_rec.get("eval_output_root") or "")
+            ref_name = str(eval_rec.get("candidate_ref_name") or "")
+            if output_root:
+                if output_root in seen_output_roots:
+                    raise RuntimeError(f"Duplicate eval_output_root detected at depth {current_depth}: {output_root}")
+                seen_output_roots.add(output_root)
+            if ref_name:
+                if ref_name in seen_ref_names:
+                    raise RuntimeError(f"Duplicate candidate_ref_name detected at depth {current_depth}: {ref_name}")
+                seen_ref_names.add(ref_name)
+
+        def _start_task(*, planned: dict[str, Any], pool: _futures.Executor) -> None:
+            eval_id = str(planned.get("eval_id") or "")
+            node_id = str(planned.get("parent_node_id") or "")
+            idea_path = Path(str(planned.get("idea_path") or "")).expanduser()
+            node_commit = str(planned.get("node_commit") or "")
+            node_baseline_csv_path = Path(str(planned.get("node_baseline_csv_path") or "")).expanduser()
+            if not eval_id or not node_id or not node_commit or not node_baseline_csv_path.exists():
+                return
+
+            eval_rec = (evals or {}).get(eval_id)
+            if not isinstance(eval_rec, dict):
+                return
+
+            eval_output_root = Path(str(eval_rec.get("eval_output_root") or "")).expanduser()
+            if not eval_output_root:
+                eval_output_root = _ensure_standard_run_dirs(run_root)["eval_root"] / eval_id
+                eval_rec["eval_output_root"] = str(eval_output_root)
+            experiment_dir = Path(str(eval_rec.get("experiment_dir") or "")).expanduser()
+            if not experiment_dir:
+                experiment_dir = eval_output_root / "experiment"
+                eval_rec["experiment_dir"] = str(experiment_dir)
+            sweep_output_dir = eval_output_root
+            sweep_results_csv = eval_output_root / "meta_config_sweep_results.csv"
+            _safe_mkdir(experiment_dir)
+
+            eval_rec["status"] = "running"
+            eval_rec["task_state"] = "running"
+            eval_rec["attempt"] = int(eval_rec.get("attempt") or 0) + 1
+            start_ts = _utc_now_iso()
+            eval_rec["started_at"] = start_ts
+            eval_rec["worker_pid"] = int(os.getpid())
+            eval_rec["error"] = None
+            planned["task_state"] = "running"
+            planned["attempt"] = int(eval_rec.get("attempt") or 0)
+            planned["started_at"] = start_ts
+            planned["worker_pid"] = int(os.getpid())
+            _manifest_write(run_root, manifest)
+            lock.heartbeat()
+            _append_tree_log(run_root, f"eval_start eval_id={eval_id} parent_node_id={node_id}")
+            _record_scheduler_event(
+                manifest=manifest,
+                run_root=run_root,
+                event_type="started",
+                depth=int(current_depth),
+                eval_id=str(eval_id),
+                parent_node_id=str(node_id),
+                attempt=int(eval_rec.get("attempt") or 0),
+            )
+            _refresh_depth_progress(manifest=manifest, depth=int(current_depth))
+            _manifest_write(run_root, manifest)
+            lock.heartbeat()
+
+            fut = pool.submit(
+                _execute_eval_task_worker,
+                repo_root=repo_root,
+                run_root=run_root,
+                tree_run_id=tree_run_id,
+                eval_id=eval_id,
+                node_id=node_id,
+                idea_path=idea_path,
+                node_commit=node_commit,
+                node_baseline_csv_path=node_baseline_csv_path,
+                eval_output_root=eval_output_root,
+                experiment_dir=experiment_dir,
+                sweep_output_dir=sweep_output_dir,
+                sweep_results_csv=sweep_results_csv,
+                config_path=config_path,
+                sweep_config_limit=(int(sweep_config_limit) if sweep_config_limit is not None else None),
+                eval_timeout_seconds=(int(eval_timeout_seconds) if eval_timeout_seconds is not None else None),
+                score_column=score_column,
+                root_baseline_csv=root_baseline_csv,
+                dry_run=bool(args.dry_run),
+                keep_rejected_worktrees=bool(args.keep_rejected_worktrees),
+                keep_failed_artifacts=bool(args.keep_failed_artifacts),
+                compute_score_fn=compute_score,
+            )
+            futures[fut] = (planned, eval_rec)
+            running_by_parent[node_id] = running_by_parent.get(node_id, 0) + 1
+
+        def _next_dispatch_index() -> Optional[int]:
+            if not pending_tasks:
+                return None
+            if max_parallel_per_node is None:
+                return 0
+            for idx, task in enumerate(pending_tasks):
+                parent = str(task.get("parent_node_id") or "")
+                if running_by_parent.get(parent, 0) < int(max_parallel_per_node):
+                    return idx
+            return None
+
+        def _apply_worker_result(*, planned: dict[str, Any], eval_rec: dict[str, Any], result: dict[str, Any]) -> None:
+            nonlocal strict_halt_depth
+            updates = result.get("updates") or {}
+            if not isinstance(updates, dict):
+                updates = {}
+
+            for key, value in updates.items():
+                if key == "decision_updates":
+                    continue
+                eval_rec[key] = value
+
+            decision_updates = updates.get("decision_updates")
+            if isinstance(decision_updates, dict):
+                decision = eval_rec.setdefault("decision", {})
+                if isinstance(decision, dict):
+                    decision.update(decision_updates)
+
+            status_val = str(result.get("status") or "failed")
+            error_val = result.get("error")
+            timed_out = bool(result.get("timed_out", False))
+            finish_ts = _utc_now_iso()
+            eval_rec["status"] = status_val
+            eval_rec["task_state"] = status_val
+            eval_rec["finished_at"] = finish_ts
+            eval_rec["error"] = (str(error_val) if error_val else None)
+            planned["task_state"] = status_val
+            planned["finished_at"] = finish_ts
+            eval_rec["worker_pid"] = None
+            planned["worker_pid"] = None
+
+            attempt_val = int(eval_rec.get("attempt") or 0)
+            terminal_failure = False
+            if status_val != "completed":
+                can_retry = attempt_val <= int(eval_retries)
+                eval_rec["error_payload"] = {
+                    "error_type": ("TimeoutError" if timed_out else "EvalError"),
+                    "message": str(error_val or ""),
+                    "attempt": attempt_val,
+                    "max_retries": int(eval_retries),
+                    "will_retry": bool(can_retry),
+                    "timed_out": bool(timed_out),
+                }
+                if can_retry:
+                    queued_ts = _utc_now_iso()
+                    eval_rec["status"] = "queued"
+                    eval_rec["task_state"] = "queued"
+                    eval_rec["queued_at"] = queued_ts
+                    eval_rec["started_at"] = None
+                    eval_rec["finished_at"] = None
+                    eval_rec["worker_pid"] = None
+                    eval_rec["error"] = None
+                    planned["task_state"] = "queued"
+                    planned["queued_at"] = queued_ts
+                    planned["started_at"] = None
+                    planned["finished_at"] = None
+                    planned["worker_pid"] = None
+                    planned["attempt"] = int(eval_rec.get("attempt") or 0)
+                    pending_tasks.append(planned)
+                    eval_id_local = str(eval_rec.get("eval_id") or "")
+                    _append_tree_log(
+                        run_root,
+                        f"eval_requeued eval_id={eval_id_local} attempt={attempt_val} max_retries={int(eval_retries)}",
+                    )
+                    _record_scheduler_event(
+                        manifest=manifest,
+                        run_root=run_root,
+                        event_type="requeued",
+                        depth=int(current_depth),
+                        eval_id=str(eval_id_local),
+                        parent_node_id=str(eval_rec.get("parent_node_id") or ""),
+                        attempt=int(attempt_val),
+                        reason="retry",
+                    )
+                else:
+                    terminal_failure = True
+
+            for req in (result.get("cleanup_requests") or []):
+                if not isinstance(req, dict):
+                    continue
+                _queue_deferred_cleanup(
+                    manifest,
+                    path=str(req.get("path") or ""),
+                    kind=str(req.get("kind") or "unknown"),
+                    reason=str(req.get("reason") or "cleanup_failed"),
+                )
+
+            eval_id_local = str(eval_rec.get("eval_id") or "")
+            if status_val == "completed" and eval_id_local not in completed_eval_ids:
+                completed_evals.append(eval_rec)
+                completed_eval_ids.add(eval_id_local)
+
+            if terminal_failure and bool(strict_fail_depth) and not strict_halt_depth:
+                strict_halt_depth = True
+                state["stop_reason"] = "strict_depth_failure"
+                state["stop_reason_detail"] = f"eval_id={eval_id_local}"
+                now_ts = _utc_now_iso()
+                while pending_tasks:
+                    skipped = pending_tasks.pop(0)
+                    skipped_eval_id = str(skipped.get("eval_id") or "")
+                    skipped_rec = (evals or {}).get(skipped_eval_id)
+                    skipped["task_state"] = "failed"
+                    skipped["finished_at"] = now_ts
+                    if isinstance(skipped_rec, dict):
+                        skipped_rec["status"] = "failed"
+                        skipped_rec["task_state"] = "failed"
+                        skipped_rec["finished_at"] = now_ts
+                        skipped_rec["error"] = "strict_fail_depth: skipped after terminal failure at same depth"
+                        skipped_rec["error_payload"] = {
+                            "error_type": "StrictDepthFailure",
+                            "message": "Skipped because strict_fail_depth halted remaining tasks at depth.",
+                            "attempt": int(skipped_rec.get("attempt") or 0),
+                            "max_retries": int(eval_retries),
+                            "will_retry": False,
+                            "timed_out": False,
+                        }
+                        _record_scheduler_event(
+                            manifest=manifest,
+                            run_root=run_root,
+                            event_type="failed",
+                            depth=int(current_depth),
+                            eval_id=str(skipped_eval_id),
+                            parent_node_id=str(skipped_rec.get("parent_node_id") or ""),
+                            attempt=int(skipped_rec.get("attempt") or 0),
+                            reason="strict_fail_depth_skipped",
+                        )
+
+            if status_val == "completed":
+                _record_scheduler_event(
+                    manifest=manifest,
+                    run_root=run_root,
+                    event_type="completed",
+                    depth=int(current_depth),
+                    eval_id=str(eval_id_local),
+                    parent_node_id=str(eval_rec.get("parent_node_id") or ""),
+                    attempt=int(eval_rec.get("attempt") or 0),
+                )
+            elif terminal_failure:
+                _record_scheduler_event(
+                    manifest=manifest,
+                    run_root=run_root,
+                    event_type="failed",
+                    depth=int(current_depth),
+                    eval_id=str(eval_id_local),
+                    parent_node_id=str(eval_rec.get("parent_node_id") or ""),
+                    attempt=int(eval_rec.get("attempt") or 0),
+                    reason=("timeout" if timed_out else "terminal_failure"),
+                )
+
+            _refresh_depth_progress(manifest=manifest, depth=int(current_depth))
+            _manifest_write(run_root, manifest)
+            lock.heartbeat()
+            _append_tree_log(run_root, f"eval_done eval_id={eval_id_local} status={status_val}")
+
+        with _futures.ThreadPoolExecutor(max_workers=int(max_parallel_evals)) as pool:
+            while pending_tasks or futures:
+                while len(futures) < int(max_parallel_evals):
+                    next_idx = _next_dispatch_index()
+                    if next_idx is None:
+                        break
+                    planned = pending_tasks.pop(next_idx)
+                    _start_task(planned=planned, pool=pool)
+
+                if not futures:
+                    break
+
+                done, _ = _futures.wait(list(futures.keys()), return_when=_futures.FIRST_COMPLETED)
+                for fut in done:
+                    planned, eval_rec = futures.pop(fut)
+                    parent_id = str(planned.get("parent_node_id") or "")
+                    if parent_id:
+                        running_by_parent[parent_id] = max(0, running_by_parent.get(parent_id, 1) - 1)
+                        if running_by_parent[parent_id] == 0:
+                            running_by_parent.pop(parent_id, None)
+
+                    try:
+                        result = fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        result = {
+                            "status": "failed",
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "updates": {},
+                            "cleanup_requests": [],
+                        }
+
+                    _apply_worker_result(planned=planned, eval_rec=eval_rec, result=result)
 
         # Phase 4: decide promotions and advance the frontier (global beam).
         stop_reason = state.get("stop_reason")
@@ -2497,6 +4025,7 @@ def main(argv: list[str] | None = None) -> int:
                 if str(rec.get("parent_node_id") or "") not in frontier_set:
                     continue
                 depth_eval_recs.append(rec)
+            depth_eval_recs = sorted(depth_eval_recs, key=lambda rec: str(rec.get("eval_id") or ""))
 
             _append_tree_log(
                 run_root,
@@ -2566,6 +4095,11 @@ def main(argv: list[str] | None = None) -> int:
                     parent_rel = rec.get("parent_relative") or {}
                     if isinstance(parent_rel, dict) and parent_rel.get("summary_json_path"):
                         promotion_summary_path = str(parent_rel["summary_json_path"])
+                    parent_seed_turn_id = str(
+                        parent_node.get("expansion_seed_turn_id")
+                        or parent_node.get("latest_conversation_turn_id")
+                        or ""
+                    ).strip()
 
                     node_record = {
                         "node_id": new_node_id,
@@ -2578,6 +4112,9 @@ def main(argv: list[str] | None = None) -> int:
                         "baseline_summary_json_path": promotion_summary_path,
                         "node_ideas_dir": str(node_ideas_dir),
                         "idea_chain": idea_chain,
+                        "conversation_id": None,
+                        "expansion_seed_turn_id": (parent_seed_turn_id or None),
+                        "latest_conversation_turn_id": None,
                         "created_at": _utc_now_iso(),
                         "status": "ready",
                         "artifacts": {
@@ -2586,6 +4123,14 @@ def main(argv: list[str] | None = None) -> int:
                         },
                     }
                     nodes[new_node_id] = node_record
+                    _ensure_node_conversation(
+                        manifest=manifest,
+                        run_root=run_root,
+                        node_id=new_node_id,
+                        parent_node_id=parent_node_id,
+                        fork_from_turn_id=(parent_seed_turn_id or None),
+                    )
+                    _sync_node_conversation_latest_turn(manifest=manifest, run_root=run_root, node_id=new_node_id)
                     promoted_node_ids.append(new_node_id)
 
                     decision["promoted_to_node_id"] = new_node_id

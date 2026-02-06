@@ -100,10 +100,64 @@ Skipped duplicates are recorded under `nodes[<node_id>].dedupe.skipped` in `mani
 - `--keep-rejected-worktrees`: keep candidate worktrees (otherwise they're pruned)
 - `--keep-failed-artifacts`: keep failed eval artifacts (otherwise they're pruned)
 
+### Idea conversation continuation
+
+These flags control branch-aware idea-generation memory:
+
+- `--idea-conversation-mode off|auto|native|replay`
+  - `off`: no conversation continuity.
+  - `auto`: prefer provider-native continuation if available, otherwise replay branch memory.
+  - `native`: force provider-native continuation.
+  - `replay`: force prompt replay of compact summary + recent turns.
+- `--idea-history-window-turns N`: max recent turns to replay (`replay`/`auto` fallback).
+- `--idea-history-max-chars C`: replay memory char budget.
+  - `-1`: unbounded replay memory block.
+  - `0`: disable replay memory block.
+  - `>0`: bounded replay memory block size.
+
+Conversation lineage model:
+
+- One conversation per node (`conversation_id` usually `node_<node_id>`).
+- Child conversations fork from the parent node checkpoint turn (`fork_from_turn_id`).
+- Sibling branches are isolated; each branch continues from its own conversation file.
+
+Where conversation artifacts live:
+
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/conversations/<conversation_id>.json`
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/conversations/<conversation_id>.jsonl`
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/conversations/<conversation_id>_summary.md`
+- Optional debug event log:
+  - `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/conversations/conversation_debug.jsonl`
+  - path also recorded in `manifest.json` at `conversation_config.debug_log_jsonl_path`.
+
 ### Locking / crash safety
 
 - `--lock-stale-seconds S`: treat a run lock as stale after S seconds without heartbeat
 - `--force`: take over an existing lock (records a lock takeover event)
+
+### Mode examples
+
+Disable continuation:
+
+```powershell
+python agentic_experimentation/tree_runner.py --tree-run-id 20260206_090000 --idea-conversation-mode off
+```
+
+Default branch continuation (`auto`):
+
+```powershell
+python agentic_experimentation/tree_runner.py --tree-run-id 20260206_090000 --idea-conversation-mode auto
+```
+
+Force replay memory:
+
+```powershell
+python agentic_experimentation/tree_runner.py `
+  --tree-run-id 20260206_090000 `
+  --idea-conversation-mode replay `
+  --idea-history-window-turns 16 `
+  --idea-history-max-chars 24000
+```
 
 ---
 
@@ -136,6 +190,7 @@ Check these first to understand what the tree thinks happened:
 - `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/VALIDATION_REPORT.md`: integrity checks (missing paths, sha256 mismatches, frontier/expanded consistency, etc.)
 - `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/run.lock.json`: lock + heartbeat metadata (useful if you hit a stale/active lock error)
 - `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/tree_runner.log`: append-only orchestration log for `tree_runner.py` itself
+- `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/conversations/conversation_debug.jsonl`: conversation recovery/attach/fork debug events (if configured)
 
 Tip: `tree_runner.py` prints a small JSON summary to stdout at the end of each invocation. If you want a persistent record of that, capture stdout/stderr when you run it.
 
@@ -301,3 +356,13 @@ Open `VALIDATION_REPORT.md` in the run folder. It can flag:
 - artifacts not under `artifacts/`
 - sha256 mismatches for copied artifacts
 - frontier/expanded inconsistencies in the manifest state
+
+### Conversation issues
+
+- If a conversation JSON is partially written/corrupt, runner/idea generation recover it to `*.corrupt_<timestamp>` and continue from a fresh state.
+- Recovery events are recorded in:
+  - `manifest.json -> events[]` (`type=conversation_json_recovery`)
+  - `conversations/conversation_debug.jsonl`
+- `--idea-conversation-mode auto` currently falls back to replay in most runs unless provider-native continuation capability is explicitly available in conversation state.
+- If you need deterministic behavior, use `--idea-conversation-mode replay`.
+- If you need no history injection at all, use `--idea-conversation-mode off`.

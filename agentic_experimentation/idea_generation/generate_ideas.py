@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -11,10 +12,11 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 _IDEA_FILE_RE = re.compile(r"^(?P<num>\d{3})_(?P<name>.+)\.md$", re.IGNORECASE)
+_DEFAULT_HISTORY_MAX_CHARS = 20000
 
 
 def _read_text(path: Path) -> str:
@@ -36,6 +38,385 @@ def _read_json_file(path: Path) -> Any:
 
 def _now_tag() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
+
+
+def _utc_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256((value or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+def _atomic_write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8", errors="replace")
+    os.replace(tmp, path)
+
+
+def _append_jsonl(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", errors="replace") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def _normalize_conversation_mode(raw: Optional[str]) -> str:
+    value = str(raw or "off").strip().lower()
+    if value in {"off", "auto", "native", "replay"}:
+        return value
+    return "off"
+
+
+def _normalize_history_max_chars(raw: Any, *, default: int = _DEFAULT_HISTORY_MAX_CHARS) -> int:
+    if raw is None:
+        return int(default)
+    try:
+        value = int(raw)
+    except Exception:
+        return int(default)
+    if value < -1:
+        return int(default)
+    return value
+
+
+def _state_history_max_chars(state: dict[str, Any], *, default: int = _DEFAULT_HISTORY_MAX_CHARS) -> int:
+    return _normalize_history_max_chars(state.get("history_max_chars"), default=default)
+
+
+def _default_conversation_state(*, requested_mode: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "conversation_id": None,
+        "created_at": _utc_now_iso(),
+        "updated_at": _utc_now_iso(),
+        "requested_mode": requested_mode,
+        "latest_turn_id": None,
+        "next_turn_index": 1,
+        "fork_from_turn_id": None,
+        "history_window_turns": 12,
+        "history_max_chars": _DEFAULT_HISTORY_MAX_CHARS,
+        "compact_summary_text": "",
+        "compact_summary_updated_at": None,
+        "provider": {
+            "name": "claude_agent_sdk",
+            "supports_native_continuation": False,
+            "session_id": None,
+            "last_response_id": None,
+        },
+        "turns": [],
+        "idea_file_turn_map": {},
+        "operation_id_turn_map": {},
+    }
+
+
+def _load_conversation_state(path: Path, *, requested_mode: str) -> dict[str, Any]:
+    if path.exists():
+        try:
+            parsed = _read_json_file(path)
+        except Exception as exc:  # noqa: BLE001
+            corrupt_path = path.with_suffix(path.suffix + f".corrupt_{_now_tag()}")
+            try:
+                os.replace(path, corrupt_path)
+                print(
+                    f"[conversation] warning: invalid state JSON recovered: {path} -> {corrupt_path} ({type(exc).__name__})",
+                    file=sys.stderr,
+                )
+            except Exception:
+                print(
+                    f"[conversation] warning: invalid state JSON (unable to move): {path} ({type(exc).__name__})",
+                    file=sys.stderr,
+                )
+            parsed = None
+        if isinstance(parsed, dict):
+            state = dict(parsed)
+        else:
+            state = _default_conversation_state(requested_mode=requested_mode)
+    else:
+        state = _default_conversation_state(requested_mode=requested_mode)
+
+    state.setdefault("schema_version", 1)
+    state.setdefault("created_at", _utc_now_iso())
+    state["updated_at"] = _utc_now_iso()
+    state["requested_mode"] = requested_mode
+    state.setdefault("latest_turn_id", None)
+    state.setdefault("next_turn_index", 1)
+    state.setdefault("fork_from_turn_id", None)
+    state.setdefault("history_window_turns", 12)
+    state.setdefault("history_max_chars", _DEFAULT_HISTORY_MAX_CHARS)
+    state["history_max_chars"] = _normalize_history_max_chars(state.get("history_max_chars"), default=_DEFAULT_HISTORY_MAX_CHARS)
+    state.setdefault("compact_summary_text", "")
+    state.setdefault("compact_summary_updated_at", None)
+    state.setdefault("provider", {})
+    if not isinstance(state["provider"], dict):
+        state["provider"] = {}
+    state["provider"].setdefault("name", "claude_agent_sdk")
+    state["provider"].setdefault("supports_native_continuation", False)
+    state["provider"].setdefault("session_id", None)
+    state["provider"].setdefault("last_response_id", None)
+    state.setdefault("turns", [])
+    if not isinstance(state["turns"], list):
+        state["turns"] = []
+    state.setdefault("idea_file_turn_map", {})
+    if not isinstance(state["idea_file_turn_map"], dict):
+        state["idea_file_turn_map"] = {}
+    state.setdefault("operation_id_turn_map", {})
+    if not isinstance(state["operation_id_turn_map"], dict):
+        state["operation_id_turn_map"] = {}
+
+    # Ensure next_turn_index stays monotonic when resuming.
+    try:
+        next_idx = int(state.get("next_turn_index") or 1)
+    except Exception:
+        next_idx = 1
+    if next_idx < 1:
+        next_idx = 1
+    for t in state["turns"]:
+        if not isinstance(t, dict):
+            continue
+        tid = str(t.get("turn_id") or "")
+        m = re.match(r"^turn_(\d+)$", tid)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        if idx >= next_idx:
+            next_idx = idx + 1
+        op_id = str(t.get("operation_id") or "").strip()
+        if not op_id:
+            op_id = _derive_operation_id_from_turn(t)
+            t["operation_id"] = op_id
+        if op_id and tid:
+            state["operation_id_turn_map"][op_id] = tid
+    state["next_turn_index"] = next_idx
+    return state
+
+
+def _conversation_next_turn_id(state: dict[str, Any]) -> str:
+    idx = int(state.get("next_turn_index") or 1)
+    turn_id = f"turn_{idx:04d}"
+    state["next_turn_index"] = idx + 1
+    return turn_id
+
+
+def _derive_operation_id_from_turn(turn: dict[str, Any]) -> str:
+    prompt_hash = str(turn.get("prompt_hash") or "").strip()
+    out_rel = str(turn.get("output_idea_path_relative_to_repo") or "").strip()
+    if not out_rel:
+        out_rel = str(turn.get("output_idea_path_resolved") or "").strip()
+    if not out_rel:
+        out_rel = str(turn.get("output_idea_path") or "").strip()
+    if prompt_hash and out_rel:
+        return _sha256_text(f"{prompt_hash}|{out_rel}")
+    out_hash = str(turn.get("output_hash") or "").strip()
+    return _sha256_text(f"{out_hash}|{out_rel}")
+
+
+def _clip_text(value: str, *, max_chars: int) -> str:
+    txt = str(value or "")
+    if max_chars < 0:
+        return txt
+    if max_chars == 0:
+        return ""
+    if len(txt) <= max_chars:
+        return txt
+    return txt[: max(0, max_chars - 17)] + "\n...[truncated]..."
+
+
+def _turn_summary_line(turn: dict[str, Any]) -> str:
+    tid = str(turn.get("turn_id") or "?")
+    title = str(turn.get("output_title") or "").strip()
+    out_path = str(turn.get("output_idea_path_relative_to_repo") or turn.get("output_idea_path") or "").strip()
+    if not title:
+        if out_path:
+            title = Path(out_path).name
+        else:
+            title = "idea"
+    output_hash = str(turn.get("output_hash") or "").strip()
+    output_hash_short = output_hash[:10] if output_hash else "n/a"
+    if out_path:
+        return f"- {tid}: {title} ({out_path}) output_hash={output_hash_short}"
+    return f"- {tid}: {title} output_hash={output_hash_short}"
+
+
+def _build_compact_summary_from_turns(*, turns: list[dict[str, Any]], max_chars: int) -> str:
+    if not turns:
+        return ""
+    if max_chars == 0:
+        return ""
+    header = "Earlier branch history summary (oldest -> newest):\n"
+    lines = [_turn_summary_line(t) for t in turns if isinstance(t, dict)]
+    if not lines:
+        return ""
+    if max_chars < 0:
+        return header + "\n".join(lines)
+    body_lines: list[str] = []
+    current = header
+    for line in reversed(lines):
+        candidate = current + line + "\n"
+        if len(candidate) > max_chars:
+            continue
+        body_lines.insert(0, line)
+        current = candidate
+    if not body_lines:
+        fallback = _clip_text(lines[-1], max_chars=max(0, max_chars - len(header)))
+        return header + fallback
+    return header + "\n".join(body_lines)
+
+
+def _merge_compact_summary(*, existing: str, new_chunk: str, max_chars: int) -> str:
+    if not new_chunk:
+        return _clip_text(existing or "", max_chars=max_chars)
+    if not existing:
+        return _clip_text(new_chunk, max_chars=max_chars)
+    merged = (existing.rstrip() + "\n" + new_chunk.strip()).strip()
+    return _clip_text(merged, max_chars=max_chars)
+
+
+def _compact_conversation_state(
+    *,
+    state: dict[str, Any],
+    keep_recent_turns: int,
+    summary_max_chars: int,
+) -> None:
+    turns = state.get("turns") or []
+    if not isinstance(turns, list):
+        turns = []
+    keep = max(int(keep_recent_turns), 1)
+    if len(turns) <= keep:
+        return
+
+    dropped = [t for t in turns[:-keep] if isinstance(t, dict)]
+    kept = [t for t in turns[-keep:] if isinstance(t, dict)]
+    state["turns"] = kept
+    if kept and isinstance(kept[-1], dict):
+        state["latest_turn_id"] = kept[-1].get("turn_id")
+    else:
+        state["latest_turn_id"] = None
+
+    existing_summary = str(state.get("compact_summary_text") or "")
+    summary_half_budget = -1 if summary_max_chars < 0 else max(summary_max_chars // 2, 0)
+    dropped_summary = _build_compact_summary_from_turns(turns=dropped, max_chars=summary_half_budget)
+    state["compact_summary_text"] = _merge_compact_summary(
+        existing=existing_summary,
+        new_chunk=dropped_summary,
+        max_chars=summary_max_chars,
+    )
+    state["compact_summary_updated_at"] = _utc_now_iso()
+
+
+def _find_turn_index_by_operation_id(state: dict[str, Any], operation_id: str) -> Optional[int]:
+    turns = state.get("turns") or []
+    if not isinstance(turns, list):
+        return None
+    for i, turn in enumerate(turns):
+        if not isinstance(turn, dict):
+            continue
+        if str(turn.get("operation_id") or "") == str(operation_id):
+            return i
+    return None
+
+
+def _render_conversation_replay_block(
+    *,
+    conversation_state: dict[str, Any],
+    max_turns: int,
+    max_chars: int,
+) -> str:
+    turns = conversation_state.get("turns") or []
+    if not isinstance(turns, list) or not turns:
+        return ""
+
+    try:
+        max_turns_i = max(0, int(max_turns))
+    except Exception:
+        max_turns_i = 0
+    if max_turns_i <= 0:
+        return ""
+    if max_chars == 0:
+        return ""
+
+    filtered_turns = [t for t in turns if isinstance(t, dict)]
+    if not filtered_turns:
+        return ""
+    turns_slice = filtered_turns[-max_turns_i:]
+    older_turns = filtered_turns[:-max_turns_i] if len(filtered_turns) > max_turns_i else []
+
+    compact_summary = str(conversation_state.get("compact_summary_text") or "").strip()
+    summary_half_budget = -1 if max_chars < 0 else max(max_chars // 2, 0)
+    if older_turns:
+        summary_from_older = _build_compact_summary_from_turns(
+            turns=older_turns,
+            max_chars=summary_half_budget,
+        )
+        compact_summary = _merge_compact_summary(
+            existing=compact_summary,
+            new_chunk=summary_from_older,
+            max_chars=summary_half_budget,
+        )
+    conversation_state["compact_summary_text"] = compact_summary
+    conversation_state["compact_summary_updated_at"] = _utc_now_iso()
+
+    blocks: list[str] = []
+    for turn in turns_slice:
+        tid = str(turn.get("turn_id") or "")
+        ts = str(turn.get("timestamp") or "")
+        out_path = str(turn.get("output_idea_path") or "")
+        out_text = str(turn.get("output_text") or "")
+        blocks.append(
+            "\n".join(
+                [
+                    f"[{tid}] {ts}".rstrip(),
+                    (f"output_idea_path: {out_path}" if out_path else "output_idea_path: (unknown)"),
+                    "assistant_output:",
+                    out_text.strip(),
+                ]
+            ).strip()
+        )
+
+    header = "\n".join(
+        [
+            "===== IDEA CONVERSATION MEMORY (REPLAY) =====",
+            "Use this for continuity with prior idea-generation turns in this branch.",
+            "Prefer non-duplicate ideas and build on prior reasoning where useful.",
+            "",
+        ]
+    )
+
+    summary_block = ""
+    if compact_summary:
+        summary_block = "\n".join(["compact_summary:", compact_summary.strip()]).strip()
+
+    base = header
+    if summary_block:
+        base = (header + summary_block + "\n\n")
+    if max_chars > 0 and len(base) > max_chars:
+        clipped = _clip_text(summary_block, max_chars=max(0, max_chars - len(header) - 32))
+        base = header + clipped + "\n\n"
+
+    # Keep newest content under budget; trim oldest first.
+    selected: list[str] = []
+    current = base
+    for block in reversed(blocks):
+        candidate = current + ("\n\n" if selected else "") + block
+        if max_chars > 0 and len(candidate) > max_chars:
+            continue
+        selected.insert(0, block)
+        current = candidate
+    if not selected:
+        # Always include at least one recent turn (truncated) for continuity.
+        if max_chars > 0 and len(base) >= max_chars:
+            # Prioritize one recent turn over summary text when budget is tight.
+            base = header
+        last_budget = -1 if max_chars < 0 else max(0, max_chars - len(base) - 64)
+        last = _clip_text(blocks[-1], max_chars=last_budget)
+        if not str(last).strip():
+            first_line = str(blocks[-1]).splitlines()[0] if str(blocks[-1]).splitlines() else "[latest turn]"
+            if max_chars < 0 or len(base + first_line) <= max_chars:
+                last = first_line
+        selected = [last]
+
+    body = "\n\n".join(selected)
+    return (base + body + "\n===== END IDEA CONVERSATION MEMORY =====\n").strip() + "\n"
 
 
 def _write_debug_log(*, resolved_cli_path: str, cwd: Path, model: Optional[str], prompt_len: int, stderr_lines: List[str], exc: Exception) -> Path:
@@ -84,6 +465,97 @@ def _resolve_repo_root(start: Path) -> Path:
         if (p / "META_MODEL_GUIDE.md").exists() and (p / "adaptive_vol_momentum.py").exists():
             return p
     return start.resolve()
+
+
+def _resolve_context_source_root(*, repo_root: Path, baseline_ctx: Optional[dict[str, Any]]) -> Path:
+    """
+    Pick the location that represents the latest model state for context file paths:
+    - root/original node -> repo root
+    - expanded nodes -> node worktree path (or parent-node worktree fallback)
+    """
+    if not isinstance(baseline_ctx, dict):
+        return repo_root
+
+    depth = baseline_ctx.get("depth")
+    try:
+        depth_i = int(depth) if depth is not None else None
+    except Exception:
+        depth_i = None
+
+    node_wt = str(baseline_ctx.get("node_worktree_path") or "").strip()
+    parent_wt = str(baseline_ctx.get("parent_node_worktree_path") or "").strip()
+
+    if depth_i == 0:
+        return repo_root
+
+    for raw in (node_wt, parent_wt):
+        if not raw:
+            continue
+        p = Path(raw).expanduser()
+        if p.exists() and p.is_dir():
+            return p
+
+    # Fallback: derive from manifest if tree identifiers are present.
+    tree_run_id = str(baseline_ctx.get("tree_run_id") or "").strip()
+    node_id = str(baseline_ctx.get("node_id") or "").strip()
+    if tree_run_id and node_id:
+        manifest_path = (
+            repo_root
+            / "agentic_experimentation"
+            / "worktrees"
+            / "tree_runs"
+            / tree_run_id
+            / "manifest.json"
+        )
+        if manifest_path.exists():
+            try:
+                manifest = _read_json_file(manifest_path)
+            except Exception:
+                manifest = None
+            if isinstance(manifest, dict):
+                nodes = manifest.get("nodes") or {}
+                if isinstance(nodes, dict):
+                    nrec = nodes.get(node_id) or {}
+                    if isinstance(nrec, dict):
+                        p = Path(str(nrec.get("worktree_path") or "")).expanduser()
+                        if p.exists() and p.is_dir():
+                            return p
+
+    return repo_root
+
+
+def _render_meta_model_context_block(*, repo_root: Path, baseline_ctx: Optional[dict[str, Any]]) -> str:
+    context_root = _resolve_context_source_root(repo_root=repo_root, baseline_ctx=baseline_ctx)
+    files: list[tuple[str, str, Path]] = [
+        (
+            "META_MODEL_GUIDE.md",
+            "High-level guide for the meta model design, assumptions, and workflow.",
+            context_root / "META_MODEL_GUIDE.md",
+        ),
+        (
+            "adaptive_vol_momentum.py",
+            "Primary meta model implementation and sweep/backtest driver.",
+            context_root / "adaptive_vol_momentum.py",
+        ),
+        (
+            "scoring.py",
+            "Performance scoring and summary metric computation utilities.",
+            context_root / "scoring.py",
+        ),
+        (
+            "selection.py",
+            "Selection logic used to choose top strategies/models each period.",
+            context_root / "selection.py",
+        ),
+    ]
+
+    lines: list[str] = []
+    lines.append("===== META MODEL CONTEXT =====")
+    for name, desc, path in files:
+        lines.append(name)
+        lines.append(f" - description: {desc}")
+        lines.append(f" - location: {path}")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _collect_idea_files(ideas_dir: Path, completed_dir: Path) -> List[Path]:
@@ -191,6 +663,44 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="Override config.json cli_path (path to Claude Code CLI).",
     )
+    parser.add_argument(
+        "--conversation-state-in",
+        default=None,
+        help="Optional JSON path for conversation state input (for branch continuation).",
+    )
+    parser.add_argument(
+        "--conversation-state-out",
+        default=None,
+        help="Optional JSON path for conversation state output.",
+    )
+    parser.add_argument(
+        "--conversation-mode",
+        default="off",
+        choices=["off", "auto", "native", "replay"],
+        help="Conversation continuation mode.",
+    )
+    parser.add_argument(
+        "--fork-from-turn-id",
+        default=None,
+        help="Optional parent checkpoint turn id used when this branch was forked.",
+    )
+    parser.add_argument(
+        "--emit-turn-log",
+        default=None,
+        help="Optional JSONL path to append per-turn metadata records.",
+    )
+    parser.add_argument(
+        "--conversation-history-window-turns",
+        type=int,
+        default=None,
+        help="Max recent conversation turns to replay when continuation is enabled.",
+    )
+    parser.add_argument(
+        "--conversation-history-max-chars",
+        type=int,
+        default=None,
+        help="Replay memory char budget (-1 = unbounded, 0 = disable replay memory, None = default).",
+    )
     return parser.parse_args(argv)
 
 
@@ -219,11 +729,25 @@ def _render_baseline_context_block(*, baseline_ctx: dict[str, Any], repo_root: P
         baseline_metrics = {}
 
     sweep_results_csv = str(baseline_ctx.get("sweep_results_csv") or "").strip()
+    baseline_source_csv = str(baseline_ctx.get("baseline_source_csv") or "").strip()
     avg_plots_dir = str(baseline_ctx.get("avg_trade_return_plots_dir") or "").strip()
 
     lines: list[str] = []
     lines.append("-----------------------")
     lines.append("")
+
+    def _display_path(raw: str) -> str:
+        s = str(raw or "").strip()
+        if not s:
+            return ""
+        p = Path(s).expanduser()
+        if not p.is_absolute():
+            return s
+        try:
+            rel = p.resolve().relative_to(repo_root.resolve())
+            return str(rel).replace("/", "\\")
+        except Exception:
+            return str(p)
 
     tree_run_id = str(baseline_ctx.get("tree_run_id") or "").strip()
     node_id = str(baseline_ctx.get("node_id") or "").strip()
@@ -269,22 +793,18 @@ def _render_baseline_context_block(*, baseline_ctx: dict[str, Any], repo_root: P
 
     col_defs = docs_root / "meta_config_sweep_results_columns.txt"
     overview_doc = docs_root / "avg_trade_return_plots" / "README.txt"
-    schema_files = [
-        docs_root / "avg_trade_return_plots" / "core_metrics_config.txt",
-        docs_root / "avg_trade_return_plots" / "relative_metrics_config.txt",
-        docs_root / "avg_trade_return_plots" / "trade_metrics_config.txt",
-        docs_root / "avg_trade_return_plots" / "stability_metrics_config.txt",
-        docs_root / "avg_trade_return_plots" / "significance_metrics_config.txt",
-    ]
 
     # 1) Sweep results table (per node).
     agentic_output_root = str(baseline_ctx.get("agentic_output_root") or "").strip()
-    sweep_exists = Path(sweep_results_csv).expanduser().exists() if sweep_results_csv else False
+    is_initial_root = bool(depth_i == 0 and not parent_node_id)
+    root_baseline_display = baseline_source_csv if baseline_source_csv else sweep_results_csv
+    sweep_display = root_baseline_display if is_initial_root else sweep_results_csv
+    sweep_exists = Path(sweep_display).expanduser().exists() if sweep_display else False
     lines.append("Output: meta_config_sweep_results.csv")
     lines.append("- What it stores: Per-config sweep results; each row is one meta-model backtest for a single parameter set (`config_id`).")
     lines.append("- Used for: Comparing parameter sets and computing the averaged metrics/deltas used to judge/promote ideas.")
-    lines.append("- Location (current node): " + (sweep_results_csv if sweep_results_csv else "(unknown / not available)"))
-    if agentic_output_root:
+    lines.append("- Location (current node): " + (_display_path(sweep_display) if sweep_display else "(unknown / not available)"))
+    if not is_initial_root and agentic_output_root:
         lines.append(f"- Location (pattern): {Path(agentic_output_root) / 'run_0' / 'meta_config_sweep_results.csv'}")
     else:
         lines.append("- Location (pattern): <agentic_output_root>/run_0/meta_config_sweep_results.csv")
@@ -295,100 +815,110 @@ def _render_baseline_context_block(*, baseline_ctx: dict[str, Any], repo_root: P
     lines.append("- Granularity: 1 CSV per node/run; rows are per parameter set tested (`config_id`).")
     lines.append("")
 
-    # 2) Per-config diagnostics (per node, per config_id).
+    # 2) Per-config diagnostics (per node, per config_id) — available only
+    # after candidate idea sweeps have been executed.
     avg_exists = Path(avg_plots_dir).expanduser().exists() if avg_plots_dir else False
     lines.append("Output: avg_trade_return_plots/")
-    lines.append("- What it stores: Per-parameter-set diagnostics (plots + row-metric CSVs) for a node/run.")
-    lines.append("- Used for: Deep-diving into *why* a specific config improved/regressed (distributions, drawdowns, stability, significance, trade quality).")
-    lines.append("- Location (current node): " + (avg_plots_dir if avg_plots_dir else "(unknown / not available)"))
-    if agentic_output_root:
-        lines.append(f"- Location (pattern): {Path(agentic_output_root) / 'run_0' / 'avg_trade_return_plots'}")
-    else:
+    if not avg_exists:
+        lines.append("- Availability: not available yet for this node.")
+        lines.append("- Why: these diagnostics are produced only after running a candidate idea sweep.")
+        lines.append("- Location (current node): (not generated yet)")
         lines.append("- Location (pattern): <agentic_output_root>/run_0/avg_trade_return_plots/")
-    lines.append(f"- Exists (current node path): {str(bool(avg_exists)).lower()}")
-    lines.append(f"- Overview doc: {overview_doc} (exists={str(bool(overview_doc.exists())).lower()})")
-    lines.append("- Naming convention: Files are per `config_id` and suffixed `_config_000`, `_config_001`, ... matching `meta_config_sweep_results.csv` rows.")
-    lines.append("- Per-config artifacts (each is one file per `config_id`):")
+        lines.append(f"- Overview doc: {overview_doc} (exists={str(bool(overview_doc.exists())).lower()})")
+        lines.append("- Note: once available, files are per `config_id` with suffixes `_config_000`, `_config_001`, ...")
+        lines.append("")
+    else:
+        lines.append("- What it stores: Per-parameter-set diagnostics (plots + row-metric CSVs) for a node/run.")
+        lines.append("- Used for: Deep-diving into *why* a specific config improved/regressed (distributions, drawdowns, stability, significance, trade quality).")
+        lines.append("- Location (current node): " + (avg_plots_dir if avg_plots_dir else "(unknown / not available)"))
+        if agentic_output_root:
+            lines.append(f"- Location (pattern): {Path(agentic_output_root) / 'run_0' / 'avg_trade_return_plots'}")
+        else:
+            lines.append("- Location (pattern): <agentic_output_root>/run_0/avg_trade_return_plots/")
+        lines.append(f"- Exists (current node path): {str(bool(avg_exists)).lower()}")
+        lines.append(f"- Overview doc: {overview_doc} (exists={str(bool(overview_doc.exists())).lower()})")
+        lines.append("- Naming convention: Files are per `config_id` and suffixed `_config_000`, `_config_001`, ... matching `meta_config_sweep_results.csv` rows.")
+        lines.append("- Per-config artifacts (each is one file per `config_id`):")
 
-    schema_by_prefix: Dict[str, Path] = {
-        "core_metrics_config": docs_root / "avg_trade_return_plots" / "core_metrics_config.txt",
-        "relative_metrics_config": docs_root / "avg_trade_return_plots" / "relative_metrics_config.txt",
-        "trade_metrics_config": docs_root / "avg_trade_return_plots" / "trade_metrics_config.txt",
-        "stability_metrics_config": docs_root / "avg_trade_return_plots" / "stability_metrics_config.txt",
-        "significance_metrics_config": docs_root / "avg_trade_return_plots" / "significance_metrics_config.txt",
-    }
+        schema_by_prefix: Dict[str, Path] = {
+            "core_metrics_config": docs_root / "avg_trade_return_plots" / "core_metrics_config.txt",
+            "relative_metrics_config": docs_root / "avg_trade_return_plots" / "relative_metrics_config.txt",
+            "trade_metrics_config": docs_root / "avg_trade_return_plots" / "trade_metrics_config.txt",
+            "stability_metrics_config": docs_root / "avg_trade_return_plots" / "stability_metrics_config.txt",
+            "significance_metrics_config": docs_root / "avg_trade_return_plots" / "significance_metrics_config.txt",
+        }
 
-    lines.append("  Artifact: avg_trade_return_config_XXX.png (PNG)")
-    lines.append("  - Shows: average return per trade over time (all_models vs topN).")
-    lines.append("  - Use it to: check whether improvements are consistent across periods or concentrated in a few regimes.")
+        lines.append("  Artifact: avg_trade_return_config_XXX.png (PNG)")
+        lines.append("  - Shows: average return per trade over time (all_models vs topN).")
+        lines.append("  - Use it to: check whether improvements are consistent across periods or concentrated in a few regimes.")
 
-    lines.append("  Artifact: trade_quality_hist_config_XXX.png (PNG)")
-    lines.append("  - Shows: histogram of average return per trade across periods (all_models vs topN).")
-    lines.append("  - Use it to: see distribution shifts and whether downside tail risk worsened.")
+        lines.append("  Artifact: trade_quality_hist_config_XXX.png (PNG)")
+        lines.append("  - Shows: histogram of average return per trade across periods (all_models vs topN).")
+        lines.append("  - Use it to: see distribution shifts and whether downside tail risk worsened.")
 
-    lines.append("  Artifact: trade_quality_rollmean_config_XXX.png (PNG)")
-    lines.append("  - Shows: rolling mean of average return per trade (all_models vs topN).")
-    lines.append("  - Use it to: see stability of trade-quality improvements through time.")
+        lines.append("  Artifact: trade_quality_rollmean_config_XXX.png (PNG)")
+        lines.append("  - Shows: rolling mean of average return per trade (all_models vs topN).")
+        lines.append("  - Use it to: see stability of trade-quality improvements through time.")
 
-    lines.append("  Artifact: equity_ratio_config_XXX.png (PNG)")
-    lines.append("  - Shows: equity ratio over time (equity_topN / equity_all).")
-    lines.append("  - Use it to: see whether topN compounds faster than the baseline universe.")
+        lines.append("  Artifact: equity_ratio_config_XXX.png (PNG)")
+        lines.append("  - Shows: equity ratio over time (equity_topN / equity_all).")
+        lines.append("  - Use it to: see whether topN compounds faster than the baseline universe.")
 
-    lines.append("  Artifact: rolling_sharpe_sortino_config_XXX.png (PNG)")
-    lines.append("  - Shows: rolling Sharpe and Sortino for period returns (all_models vs topN).")
-    lines.append("  - Use it to: verify risk-adjusted improvements are not just point-estimate noise.")
+        lines.append("  Artifact: rolling_sharpe_sortino_config_XXX.png (PNG)")
+        lines.append("  - Shows: rolling Sharpe and Sortino for period returns (all_models vs topN).")
+        lines.append("  - Use it to: verify risk-adjusted improvements are not just point-estimate noise.")
 
-    lines.append("  Artifact: rolling_outperformance_config_XXX.png (PNG)")
-    lines.append("  - Shows: rolling outperformance rate (fraction of periods topN_return > all_models_return).")
-    lines.append("  - Use it to: distinguish frequent small wins vs rare big wins.")
+        lines.append("  Artifact: rolling_outperformance_config_XXX.png (PNG)")
+        lines.append("  - Shows: rolling outperformance rate (fraction of periods topN_return > all_models_return).")
+        lines.append("  - Use it to: distinguish frequent small wins vs rare big wins.")
 
-    lines.append("  Artifact: drawdown_curves_config_XXX.png (PNG)")
-    lines.append("  - Shows: drawdown curves from equity peaks (all_models vs topN).")
-    lines.append("  - Use it to: inspect max drawdown depth and duration behavior.")
+        lines.append("  Artifact: drawdown_curves_config_XXX.png (PNG)")
+        lines.append("  - Shows: drawdown curves from equity peaks (all_models vs topN).")
+        lines.append("  - Use it to: inspect max drawdown depth and duration behavior.")
 
-    lines.append("  Artifact: return_hist_config_XXX.png (PNG)")
-    lines.append("  - Shows: histogram (and optional KDE) of period returns (all_models vs topN).")
-    lines.append("  - Use it to: compare central tendency and tails of per-period returns.")
+        lines.append("  Artifact: return_hist_config_XXX.png (PNG)")
+        lines.append("  - Shows: histogram (and optional KDE) of period returns (all_models vs topN).")
+        lines.append("  - Use it to: compare central tendency and tails of per-period returns.")
 
-    lines.append("  Artifact: return_delta_hist_config_XXX.png (PNG)")
-    lines.append("  - Shows: histogram of deltas (topN_return - all_models_return).")
-    lines.append("  - Use it to: see whether outperformance is broad-based vs driven by a few periods.")
+        lines.append("  Artifact: return_delta_hist_config_XXX.png (PNG)")
+        lines.append("  - Shows: histogram of deltas (topN_return - all_models_return).")
+        lines.append("  - Use it to: see whether outperformance is broad-based vs driven by a few periods.")
 
-    lines.append("  Artifact: return_scatter_config_XXX.png (PNG)")
-    lines.append("  - Shows: scatter of (all_models_return, topN_return) with y=x line and quadrant axes.")
-    lines.append("  - Use it to: identify regimes where meta-selection helps or hurts (e.g., baseline<0 while topN>0).")
+        lines.append("  Artifact: return_scatter_config_XXX.png (PNG)")
+        lines.append("  - Shows: scatter of (all_models_return, topN_return) with y=x line and quadrant axes.")
+        lines.append("  - Use it to: identify regimes where meta-selection helps or hurts (e.g., baseline<0 while topN>0).")
 
-    lines.append("  Artifact: core_metrics_config_XXX.csv (CSV)")
-    lines.append("  - Stores: core performance metrics for all_models and topN (Sharpe/Sortino/Calmar/drawdowns/etc).")
-    schema = schema_by_prefix["core_metrics_config"]
-    lines.append(f"  - Column definitions: {schema} (exists={str(bool(schema.exists())).lower()})")
-    lines.append("  - Use it to: get a compact numeric summary for one config_id.")
+        lines.append("  Artifact: core_metrics_config_XXX.csv (CSV)")
+        lines.append("  - Stores: core performance metrics for all_models and topN (Sharpe/Sortino/Calmar/drawdowns/etc).")
+        schema = schema_by_prefix["core_metrics_config"]
+        lines.append(f"  - Column definitions: {schema} (exists={str(bool(schema.exists())).lower()})")
+        lines.append("  - Use it to: get a compact numeric summary for one config_id.")
 
-    lines.append("  Artifact: relative_metrics_config_XXX.csv (CSV)")
-    lines.append("  - Stores: relative edge metrics (deltas, capture ratios, equity ratio) for topN vs all_models.")
-    schema = schema_by_prefix["relative_metrics_config"]
-    lines.append(f"  - Column definitions: {schema} (exists={str(bool(schema.exists())).lower()})")
-    lines.append("  - Use it to: diagnose how the edge is achieved (frequency vs magnitude, capture, etc).")
+        lines.append("  Artifact: relative_metrics_config_XXX.csv (CSV)")
+        lines.append("  - Stores: relative edge metrics (deltas, capture ratios, equity ratio) for topN vs all_models.")
+        schema = schema_by_prefix["relative_metrics_config"]
+        lines.append(f"  - Column definitions: {schema} (exists={str(bool(schema.exists())).lower()})")
+        lines.append("  - Use it to: diagnose how the edge is achieved (frequency vs magnitude, capture, etc).")
 
-    lines.append("  Artifact: stability_metrics_config_XXX.csv (CSV)")
-    lines.append("  - Stores: rolling-window stability metrics for all_models, topN, and the delta series.")
-    schema = schema_by_prefix["stability_metrics_config"]
-    lines.append(f"  - Column definitions: {schema} (exists={str(bool(schema.exists())).lower()})")
-    lines.append("  - Use it to: find weak stability (bad rolling mins, long losing streaks, etc).")
+        lines.append("  Artifact: stability_metrics_config_XXX.csv (CSV)")
+        lines.append("  - Stores: rolling-window stability metrics for all_models, topN, and the delta series.")
+        schema = schema_by_prefix["stability_metrics_config"]
+        lines.append(f"  - Column definitions: {schema} (exists={str(bool(schema.exists())).lower()})")
+        lines.append("  - Use it to: find weak stability (bad rolling mins, long losing streaks, etc).")
 
-    lines.append("  Artifact: trade_metrics_config_XXX.csv (CSV)")
-    lines.append("  - Stores: trade-quality metrics computed from avg-return-per-trade series (plus relative deltas).")
-    schema = schema_by_prefix["trade_metrics_config"]
-    lines.append(f"  - Column definitions: {schema} (exists={str(bool(schema.exists())).lower()})")
-    lines.append("  - Use it to: check if improvements come from better per-period trade outcomes and consistency.")
+        lines.append("  Artifact: trade_metrics_config_XXX.csv (CSV)")
+        lines.append("  - Stores: trade-quality metrics computed from avg-return-per-trade series (plus relative deltas).")
+        schema = schema_by_prefix["trade_metrics_config"]
+        lines.append(f"  - Column definitions: {schema} (exists={str(bool(schema.exists())).lower()})")
+        lines.append("  - Use it to: check if improvements come from better per-period trade outcomes and consistency.")
 
-    lines.append("  Artifact: significance_metrics_config_XXX.csv (CSV)")
-    lines.append("  - Stores: t-test, sign test, and bootstrap metrics for the delta series (topN_return - all_models_return).")
-    schema = schema_by_prefix["significance_metrics_config"]
-    lines.append(f"  - Column definitions: {schema} (exists={str(bool(schema.exists())).lower()})")
-    lines.append("  - Use it to: sanity-check whether deltas look statistically meaningful.")
-    lines.append("- Granularity: 1 directory per node/run; inside it, many files per parameter set tested (`config_id`).")
-    lines.append("")
+        lines.append("  Artifact: significance_metrics_config_XXX.csv (CSV)")
+        lines.append("  - Stores: t-test, sign test, and bootstrap metrics for the delta series (topN_return - all_models_return).")
+        schema = schema_by_prefix["significance_metrics_config"]
+        lines.append(f"  - Column definitions: {schema} (exists={str(bool(schema.exists())).lower()})")
+        lines.append("  - Use it to: sanity-check whether deltas look statistically meaningful.")
+        lines.append("- Granularity: 1 directory per node/run; inside it, many files per parameter set tested (`config_id`).")
+        lines.append("")
 
     lines.append("- Guidance: consult docs first; open only the minimum files needed.")
     lines.append("")
@@ -539,81 +1069,21 @@ def _validate_idea_output(markdown: str) -> None:
 def _bundle_context(
     *,
     prompt_template: str,
-    meta_model_guide: str,
-    driver_code: str,
-    idea_files: List[Path],
+    meta_model_context_block: str,
     max_context_chars: int,
 ) -> str:
-    def _render_idea(p: Path) -> str:
-        return "\n".join(["", f"### {p.name}", _read_text(p).rstrip()])
-
-    guide_block = meta_model_guide.rstrip()
-    driver_block = driver_code.rstrip()
-
     base_parts: List[str] = [
         prompt_template.strip(),
         "",
-        "===== REPO CONTEXT (READ-ONLY) =====",
-        "",
-        "----- FILE: META_MODEL_GUIDE.md -----",
-        guide_block,
-        "",
-        "----- FILE: adaptive_vol_momentum.py -----",
-        "```python",
-        driver_block,
-        "```",
-        "",
-        "----- PRIOR IDEAS (DO NOT DUPLICATE) -----",
+        meta_model_context_block.rstrip(),
     ]
 
-    idea_blocks = [_render_idea(p) for p in idea_files]
-
-    def _assemble(ideas: List[str]) -> str:
-        return ("\n".join(base_parts + ideas).strip() + "\n")
-
-    # 1) Try with all prior ideas.
-    prompt = _assemble(idea_blocks)
-    if len(prompt) <= max_context_chars:
-        return prompt
-
-    # 2) Drop oldest prior ideas until it fits (possibly dropping all).
-    trimmed_blocks = idea_blocks[:]
-    while trimmed_blocks and len(_assemble(trimmed_blocks)) > max_context_chars:
-        trimmed_blocks.pop(0)
-    prompt = _assemble(trimmed_blocks)
-    if len(prompt) <= max_context_chars:
-        if trimmed_blocks != idea_blocks:
-            prompt += "\n[NOTE: Dropped some older prior ideas to fit context limit]\n"
-        return prompt
-
-    # 3) Still too large: truncate the guide first, then the driver code if needed.
-    def _truncate_to_budget(text: str, budget: int, note: str) -> str:
-        if budget <= 0:
-            return f"[TRUNCATED {note} TO FIT CONTEXT LIMIT]"
-        if len(text) <= budget:
-            return text
-        return text[:budget].rstrip() + f"\n\n[TRUNCATED {note} TO FIT CONTEXT LIMIT]"
-
-    # Reserve space for the non-guide/non-driver scaffolding.
-    scaffolding = _assemble([])  # base_parts only (already includes full guide/driver right now)
-    # Recompute scaffolding with empty guide/driver placeholders to estimate fixed overhead.
-    overhead_parts = base_parts[:]
-    overhead_parts[overhead_parts.index(guide_block)] = ""
-    overhead_parts[overhead_parts.index(driver_block)] = ""
-    overhead = ("\n".join(overhead_parts).strip() + "\n")
-    budget_total = max_context_chars - len(overhead)
-
-    guide_budget = max(0, int(budget_total * 0.7))
-    driver_budget = max(0, budget_total - guide_budget)
-
-    truncated_guide = _truncate_to_budget(guide_block, guide_budget, "META_MODEL_GUIDE.md")
-    truncated_driver = _truncate_to_budget(driver_block, driver_budget, "adaptive_vol_momentum.py")
-
-    base_parts_trunc = base_parts[:]
-    base_parts_trunc[base_parts_trunc.index(guide_block)] = truncated_guide
-    base_parts_trunc[base_parts_trunc.index(driver_block)] = truncated_driver
-
-    return ("\n".join(base_parts_trunc).strip() + "\n")
+    base_only = ("\n".join(base_parts).strip() + "\n")
+    if len(base_only) <= max_context_chars:
+        return base_only
+    note = "\n[NOTE: Prompt truncated to fit context limit]\n"
+    budget = max(0, max_context_chars - len(note))
+    return base_only[:budget].rstrip() + note
 
 
 @dataclass(frozen=True)
@@ -688,13 +1158,47 @@ def _extract_final_text(messages: List[object]) -> str:
     return ""
 
 
+def _extract_provider_metadata(messages: List[object]) -> dict[str, Optional[str]]:
+    response_id: Optional[str] = None
+    session_id: Optional[str] = None
+
+    for msg in reversed(messages):
+        if isinstance(msg, dict):
+            if response_id is None:
+                value = msg.get("response_id") or msg.get("id")
+                if isinstance(value, str) and value.strip():
+                    response_id = value.strip()
+            if session_id is None:
+                value = msg.get("session_id")
+                if isinstance(value, str) and value.strip():
+                    session_id = value.strip()
+        else:
+            if response_id is None:
+                try:
+                    value = getattr(msg, "response_id", None) or getattr(msg, "id", None)
+                except Exception:
+                    value = None
+                if isinstance(value, str) and value.strip():
+                    response_id = value.strip()
+            if session_id is None:
+                try:
+                    value = getattr(msg, "session_id", None)
+                except Exception:
+                    value = None
+                if isinstance(value, str) and value.strip():
+                    session_id = value.strip()
+        if response_id and session_id:
+            break
+    return {"response_id": response_id, "session_id": session_id}
+
+
 async def _run_claude_agent_sdk_once(
     *,
     prompt: str,
     model: Optional[str],
     cwd: Path,
     cli_path: Optional[str],
-) -> str:
+) -> dict[str, Any]:
     try:
         from claude_agent_sdk import ClaudeAgentOptions, query  # type: ignore
     except Exception as exc:  # noqa: BLE001
@@ -786,7 +1290,12 @@ async def _run_claude_agent_sdk_once(
             f"Debug log saved to: {log_path}"
         ) from exc
 
-    return _extract_final_text(messages).strip()
+    meta = _extract_provider_metadata(messages)
+    return {
+        "text": _extract_final_text(messages).strip(),
+        "provider_response_id": meta.get("response_id"),
+        "provider_session_id": meta.get("session_id"),
+    }
 
 
 def main() -> int:
@@ -825,8 +1334,6 @@ def main() -> int:
         phoenix_tracer = None
 
     prompt_path = agentic_root / "prompts" / "idea_generator" / "idea_generator_prompt.txt"
-    guide_path = repo_root / "META_MODEL_GUIDE.md"
-    driver_path = repo_root / "adaptive_vol_momentum.py"
     ideas_dir = _resolve_cli_path(repo_root, args.ideas_dir) or (agentic_root / "ideas")
     completed_dir = _resolve_cli_path(repo_root, args.completed_dir) or (ideas_dir / "completed")
 
@@ -840,16 +1347,17 @@ def main() -> int:
             context_dirs.append(p)
 
     prompt_template = _read_text(prompt_path)
-    meta_model_guide = _read_text(guide_path)
-    driver_code = _read_text(driver_path)
+    baseline_raw: Optional[dict[str, Any]] = None
 
     if args.baseline_context_json:
         baseline_path = _resolve_cli_path(repo_root, args.baseline_context_json) or Path(str(args.baseline_context_json)).expanduser().resolve()
-        baseline_raw = _read_json_file(baseline_path)
+        parsed = _read_json_file(baseline_path)
+        baseline_raw = parsed if isinstance(parsed, dict) else None
         if not isinstance(baseline_raw, dict):
             raise ValueError(f"--baseline-context-json must contain a JSON object: {baseline_path}")
         baseline_block = _render_baseline_context_block(baseline_ctx=baseline_raw, repo_root=repo_root)
         prompt_template = prompt_template.rstrip() + "\n\n" + baseline_block
+    meta_model_context_block = _render_meta_model_context_block(repo_root=repo_root, baseline_ctx=baseline_raw)
 
     created: List[Path] = []
     next_num = _next_idea_number(ideas_dir, completed_dir)
@@ -858,6 +1366,37 @@ def main() -> int:
     max_context_chars = int(args.max_context_chars) if args.max_context_chars is not None else int(cfg.max_context_chars)
     model = args.model if args.model is not None else cfg.model
     cli_path = args.cli_path if args.cli_path is not None else cfg.cli_path
+
+    requested_conv_mode = _normalize_conversation_mode(args.conversation_mode)
+    conv_state_in: Optional[Path] = _resolve_cli_path(repo_root, args.conversation_state_in) if args.conversation_state_in else None
+    conv_state_out: Optional[Path] = _resolve_cli_path(repo_root, args.conversation_state_out) if args.conversation_state_out else None
+    emit_turn_log: Optional[Path] = _resolve_cli_path(repo_root, args.emit_turn_log) if args.emit_turn_log else None
+    if conv_state_out is None and conv_state_in is not None:
+        conv_state_out = conv_state_in
+
+    conversation_enabled = requested_conv_mode != "off"
+    conversation_state: Optional[dict[str, Any]] = None
+    if conversation_enabled:
+        if conv_state_out is None:
+            raise ValueError("Conversation continuation mode requires --conversation-state-out (or --conversation-state-in).")
+        load_path = conv_state_in or conv_state_out
+        conversation_state = _load_conversation_state(load_path, requested_mode=requested_conv_mode)
+        if args.fork_from_turn_id:
+            conversation_state["fork_from_turn_id"] = str(args.fork_from_turn_id)
+        if args.conversation_history_window_turns is not None:
+            conversation_state["history_window_turns"] = max(0, int(args.conversation_history_window_turns))
+        if args.conversation_history_max_chars is not None:
+            history_max_chars = int(args.conversation_history_max_chars)
+            if history_max_chars < -1:
+                raise ValueError("--conversation-history-max-chars must be -1, 0, or a positive integer.")
+            conversation_state["history_max_chars"] = history_max_chars
+        _compact_conversation_state(
+            state=conversation_state,
+            keep_recent_turns=max(1, int(conversation_state.get("history_window_turns") or 12)),
+            summary_max_chars=_state_history_max_chars(conversation_state),
+        )
+        # Persist early so interrupted runs still expose conversation metadata.
+        _atomic_write_json(conv_state_out, conversation_state)
 
     run_span_cm = contextlib.nullcontext()
     if phoenix_tracer is not None:
@@ -870,6 +1409,7 @@ def main() -> int:
                         "context_ideas_dirs": json.dumps([str(p) for p in context_dirs], ensure_ascii=False),
                         "baseline_context_json": (str(args.baseline_context_json) if args.baseline_context_json else ""),
                         "repo_root": str(repo_root),
+                        "conversation_mode": requested_conv_mode,
                     },
                 )
     with run_span_cm as run_span:
@@ -877,16 +1417,26 @@ def main() -> int:
             phoenix_obs.set_openinference_kind(run_span, "CHAIN")
 
         for _ in range(count):
-            # Re-scan each loop so the newly written idea becomes context for the next call.
-            prior_idea_files = _collect_idea_files_from_dirs(context_dirs)
-
             prompt = _bundle_context(
                 prompt_template=prompt_template,
-                meta_model_guide=meta_model_guide,
-                driver_code=driver_code,
-                idea_files=prior_idea_files,
+                meta_model_context_block=meta_model_context_block,
                 max_context_chars=int(max_context_chars),
             )
+            mode_used = "off"
+            if conversation_enabled and isinstance(conversation_state, dict):
+                mode_used = requested_conv_mode
+                provider_supports_native = bool((conversation_state.get("provider") or {}).get("supports_native_continuation"))
+                if requested_conv_mode in {"auto", "native"} and not provider_supports_native:
+                    mode_used = "replay"
+                if mode_used == "replay":
+                    replay_block = _render_conversation_replay_block(
+                        conversation_state=conversation_state,
+                        max_turns=int(conversation_state.get("history_window_turns") or 12),
+                        max_chars=_state_history_max_chars(conversation_state),
+                    )
+                    if replay_block:
+                        prompt = prompt.rstrip() + "\n\n" + replay_block
+            prompt_hash = _sha256_text(prompt)
 
             prompt_dump_dir = Path(__file__).resolve().parent / ".idea_generation_logs"
             prompt_dump_path = prompt_dump_dir / f"prompt_{_now_tag()}_{next_num:03d}.txt"
@@ -923,7 +1473,7 @@ def main() -> int:
                         phoenix_obs.set_io(llm_span, input_text=prompt)
 
                     try:
-                        idea_md = asyncio.run(
+                        llm_result = asyncio.run(
                             _run_claude_agent_sdk_once(
                                 prompt=prompt,
                                 model=model,
@@ -936,7 +1486,7 @@ def main() -> int:
                         # If a model was specified, retry once with default model to reduce friction.
                         if model is None:
                             raise
-                        idea_md = asyncio.run(
+                        llm_result = asyncio.run(
                             _run_claude_agent_sdk_once(
                                 prompt=prompt,
                                 model=None,
@@ -944,6 +1494,7 @@ def main() -> int:
                                 cli_path=cli_path,
                             )
                         )
+                    idea_md = str(llm_result.get("text") or "")
 
                     if phoenix_obs is not None and llm_span is not None:
                         phoenix_obs.set_io(llm_span, output_text=idea_md)
@@ -967,6 +1518,98 @@ def main() -> int:
                 _write_text(out_path, idea_md.rstrip() + "\n")
                 created.append(out_path)
 
+                if conversation_enabled and isinstance(conversation_state, dict):
+                    out_abs = str(out_path.resolve())
+                    try:
+                        out_rel = str(out_path.resolve().relative_to(repo_root.resolve()))
+                    except Exception:
+                        out_rel = str(out_path)
+                    operation_id = _sha256_text(f"{prompt_hash}|{out_rel}")
+                    turns_list = conversation_state.setdefault("turns", [])
+                    if not isinstance(turns_list, list):
+                        turns_list = []
+                        conversation_state["turns"] = turns_list
+                    operation_map = conversation_state.setdefault("operation_id_turn_map", {})
+                    if not isinstance(operation_map, dict):
+                        operation_map = {}
+                        conversation_state["operation_id_turn_map"] = operation_map
+                    existing_turn_id = str(operation_map.get(operation_id) or "").strip()
+                    existing_idx = _find_turn_index_by_operation_id(conversation_state, operation_id)
+                    if existing_idx is not None:
+                        existing_turn = conversation_state["turns"][existing_idx]
+                        existing_turn_id_from_row = ""
+                        if isinstance(existing_turn, dict):
+                            existing_turn_id_from_row = str(existing_turn.get("turn_id") or "").strip()
+                        turn_id = existing_turn_id_from_row or existing_turn_id or _conversation_next_turn_id(conversation_state)
+                    else:
+                        turn_id = existing_turn_id if existing_turn_id else _conversation_next_turn_id(conversation_state)
+                    turn = {
+                        "turn_id": turn_id,
+                        "operation_id": operation_id,
+                        "timestamp": _utc_now_iso(),
+                        "mode_requested": requested_conv_mode,
+                        "mode_used": mode_used,
+                        "fork_from_turn_id": conversation_state.get("fork_from_turn_id"),
+                        "prompt_path": str(prompt_dump_path),
+                        "prompt_hash": prompt_hash,
+                        "prompt_chars": len(prompt),
+                        "model": str(model) if model else None,
+                        "output_idea_path": str(out_path),
+                        "output_idea_path_resolved": out_abs,
+                        "output_idea_path_relative_to_repo": out_rel,
+                        "output_hash": _sha256_text(idea_md),
+                        "output_title": title or None,
+                        "output_text": idea_md,
+                        "provider_session_id": llm_result.get("provider_session_id"),
+                        "provider_response_id": llm_result.get("provider_response_id"),
+                    }
+                    turn_action = "appended"
+                    if existing_idx is not None:
+                        conversation_state["turns"][existing_idx] = turn
+                        turn_action = "upserted"
+                    elif existing_turn_id:
+                        # Idempotent retry for an operation already compacted out of `turns`.
+                        turn_action = "reused_compacted"
+                    else:
+                        conversation_state["turns"].append(turn)
+                    operation_map[operation_id] = turn_id
+                    conversation_state["latest_turn_id"] = turn_id
+                    conversation_state["updated_at"] = _utc_now_iso()
+                    idea_file_turn_map = conversation_state.setdefault("idea_file_turn_map", {})
+                    if isinstance(idea_file_turn_map, dict):
+                        idea_file_turn_map[str(out_path)] = turn_id
+                        idea_file_turn_map[out_abs] = turn_id
+                        idea_file_turn_map[out_rel] = turn_id
+                    provider = conversation_state.setdefault("provider", {})
+                    if isinstance(provider, dict):
+                        provider["last_response_id"] = llm_result.get("provider_response_id")
+                        if llm_result.get("provider_session_id"):
+                            provider["session_id"] = llm_result.get("provider_session_id")
+                    _compact_conversation_state(
+                        state=conversation_state,
+                        keep_recent_turns=max(1, int(conversation_state.get("history_window_turns") or 12)),
+                        summary_max_chars=_state_history_max_chars(conversation_state),
+                    )
+                    if conv_state_out is not None:
+                        _atomic_write_json(conv_state_out, conversation_state)
+                    if emit_turn_log is not None:
+                        _append_jsonl(
+                            emit_turn_log,
+                            {
+                                "turn_id": turn_id,
+                                "timestamp": turn["timestamp"],
+                                "mode_used": mode_used,
+                                "prompt_hash": prompt_hash,
+                                "prompt_chars": len(prompt),
+                                "output_idea_path": str(out_path),
+                                "output_hash": turn["output_hash"],
+                                "provider_session_id": llm_result.get("provider_session_id"),
+                                "provider_response_id": llm_result.get("provider_response_id"),
+                                "turn_action": turn_action,
+                                "operation_id": operation_id,
+                            },
+                        )
+
                 if phoenix_obs is not None and idea_span is not None:
                     phoenix_obs.set_attrs(idea_span, {"output_path": str(out_path)})
                     phoenix_obs.set_io(idea_span, output_text=idea_md)
@@ -980,6 +1623,14 @@ def main() -> int:
             phoenix_obs.force_flush()
         except Exception:  # noqa: BLE001
             pass
+    if conversation_enabled and isinstance(conversation_state, dict) and conv_state_out is not None:
+        _compact_conversation_state(
+            state=conversation_state,
+            keep_recent_turns=max(1, int(conversation_state.get("history_window_turns") or 12)),
+            summary_max_chars=_state_history_max_chars(conversation_state),
+        )
+        conversation_state["updated_at"] = _utc_now_iso()
+        _atomic_write_json(conv_state_out, conversation_state)
     return 0
 
 
