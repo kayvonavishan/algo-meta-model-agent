@@ -1,0 +1,25 @@
+You are Codex CLI running in this repository. Perform a self-check against the plan and fix any missing steps by editing the repository in-place.
+
+You are working in a git worktree where prior edits from earlier rounds are already present.
+
+Plan:
+{plan_text}
+
+Current cumulative diff (for reference only):
+{prev_diff_text}
+
+Instructions:
+- Verify each concrete plan step is fully implemented in code.
+- If any step is missing or only partially implemented, make the minimal edits required to complete it.
+- If everything is already complete, make no changes.
+
+Rules:
+- You are operating inside a git worktree (the current working directory). Use only relative paths like `config.py` / `scoring.py` / `tests/...`; do NOT use absolute `C:\...` paths.
+- Make changes directly on disk in this worktree. Do not ask for confirmation; proceed with reasonable defaults.
+- Do NOT update documentation or process artifacts (README files, `AGENTS_README.md`, PR notes, changelogs, checklists). Ignore any such steps if they appear in the plan.
+- Do NOT create or modify unit tests (no new files under `tests/`, no changes to existing tests) unless the idea explicitly asks for tests.
+- This must be incremental: assume prior edits are present in the worktree.
+- Keep changes small, runnable, and consistent with the existing code style.
+- Add only necessary imports; avoid refactors or formatting changes outside the touched code.
+- When finished, respond with a brief summary of what changed (no code blocks, no diffs).
+- If any part of the plan is still not implemented, or implemented differently than what is specified in the plan, you must respond with why this is.

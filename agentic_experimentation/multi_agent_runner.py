@@ -770,6 +770,7 @@ async def _main_async():
     planner_files_path = _resolve_path(context_repo_root, prompts_cfg.get("planner_repo_files"))
     coder_prompt_path = _resolve_path(context_repo_root, prompts_cfg.get("coder"))
     coder_fix_prompt_path = _resolve_path(context_repo_root, prompts_cfg.get("coder_fix")) or coder_prompt_path
+    coder_self_check_prompt_path = _resolve_path(context_repo_root, prompts_cfg.get("coder_self_check"))
     coder_system_path = _resolve_path(context_repo_root, prompts_cfg.get("coder_system"))
     coder_files_path = _resolve_path(context_repo_root, prompts_cfg.get("coder_repo_files"))
     reviewer_prompt_path = _resolve_path(context_repo_root, prompts_cfg.get("reviewer"))
@@ -934,6 +935,20 @@ async def _main_async():
             if max_review_rounds is None:
                 max_review_rounds = config.get("max_review_rounds", 2)
             max_review_rounds = int(max_review_rounds)
+            coder_self_check_rounds = config.get("coder_self_check_rounds", None)
+            if coder_self_check_rounds is None:
+                coder_self_check_rounds = 1 if coder_self_check_prompt_path else 0
+            try:
+                coder_self_check_rounds = int(coder_self_check_rounds)
+            except Exception:
+                coder_self_check_rounds = 0
+            if coder_self_check_rounds < 0:
+                coder_self_check_rounds = 0
+            if coder_self_check_rounds and not coder_self_check_prompt_path:
+                logging.getLogger(__name__).warning(
+                    "coder_self_check_rounds set but prompts.coder_self_check is missing; disabling self-check."
+                )
+                coder_self_check_rounds = 0
 
             review_rounds = []
             diff_text = ""
@@ -1050,6 +1065,94 @@ async def _main_async():
                 diff_path = log_dir / f"diff_round_{round_idx}.diff"
                 _write_text(diff_path, diff_text)
 
+                if coder_self_check_rounds:
+                    if diff_text.strip():
+                        _write_text(log_dir / f"diff_round_{round_idx}_pre_self_check.diff", diff_text)
+                    for pass_idx in range(1, coder_self_check_rounds + 1):
+                        self_check_prompt = _render_prompt(
+                            _read_text(coder_self_check_prompt_path),
+                            idea_text=idea_text,
+                            plan_text=plan_text,
+                            repo_context=coder_context,
+                            prev_diff_text=diff_text,
+                            meta_model_context=meta_model_context,
+                        )
+                        self_check_prompt_path = log_dir / f"coder_self_check_prompt_round_{round_idx}_pass_{pass_idx}.txt"
+                        _write_text(self_check_prompt_path, self_check_prompt)
+                        self_check_output = ""
+                        if args.dry_run_llm:
+                            self_check_output = "(dry-run) skipped Codex self-check edits."
+                        else:
+                            _ensure_trace_processor_registered()
+                            round_tag = f"{round_idx}_selfcheck_{pass_idx}"
+                            with _tracing_scope(
+                                exp_dir=log_dir,
+                                run_id=run_id,
+                                step="coder_self_check",
+                                round_idx=round_tag,
+                            ):
+                                codex_span_cm = contextlib.nullcontext()
+                                if phoenix_tracer is not None:
+                                    codex_span_cm = phoenix_tracer.start_as_current_span(
+                                        "agentic.codex_self_check",
+                                        attributes={
+                                            "run_id": run_id,
+                                            "step": "coder_self_check",
+                                            "round_idx": round_tag,
+                                            "backend": coder_backend,
+                                            "worktree_path": str(worktree_path),
+                                            "coder_self_check_prompt_path": str(self_check_prompt_path),
+                                            "codex_session_id": str(codex_session_id) if codex_session_id else None,
+                                        },
+                                    )
+                                with codex_span_cm as codex_span:
+                                    if phoenix_obs is not None and codex_span is not None:
+                                        phoenix_obs.set_openinference_kind(codex_span, "TOOL")
+                                        phoenix_obs.set_attrs(codex_span, {"tool.name": "codex"})
+                                        phoenix_obs.set_text(codex_span, "system_prompt", coder_system or "")
+
+                                    if coder_backend in ("cli", "cli_session", "codex_cli", "codex-cli"):
+                                        full_prompt = ""
+                                        if codex_session_id is None:
+                                            full_prompt = (coder_system or "").strip()
+                                            if full_prompt:
+                                                full_prompt += "\n\n"
+                                        full_prompt += (self_check_prompt or "").strip() + "\n"
+                                        if phoenix_obs is not None and codex_span is not None:
+                                            phoenix_obs.set_io(codex_span, input_text=full_prompt)
+                                        self_check_output, codex_session_id = await _codex_cli_edit_repo(
+                                            worktree_path=worktree_path,
+                                            prompt=full_prompt,
+                                            exp_dir=exp_dir,
+                                            round_idx=round_tag,
+                                            session_id=codex_session_id,
+                                            codex_cli_cfg=config.get("codex_cli"),
+                                        )
+                                    else:
+                                        if phoenix_obs is not None and codex_span is not None:
+                                            phoenix_obs.set_io(codex_span, input_text=self_check_prompt)
+                                        self_check_output, codex_session_id = await _codex_mcp_edit_repo(
+                                            worktree_path=worktree_path,
+                                            codex_mcp_cfg=codex_mcp_cfg,
+                                            agent_cfg=config.get("agents", {}).get("coder", {}),
+                                            system_prompt=coder_system,
+                                            user_prompt=self_check_prompt,
+                                            max_turns=max_turns,
+                                            session_id=codex_session_id,
+                                        )
+
+                                    if phoenix_obs is not None and codex_span is not None:
+                                        phoenix_obs.set_attrs(
+                                            codex_span,
+                                            {"codex_session_id": str(codex_session_id) if codex_session_id else None},
+                                        )
+                                        phoenix_obs.set_io(codex_span, output_text=self_check_output)
+
+                        self_check_output_path = log_dir / f"coder_self_check_output_round_{round_idx}_pass_{pass_idx}.txt"
+                        _write_text(self_check_output_path, self_check_output)
+                        diff_text = _git_diff_with_untracked(worktree_path)
+                        _write_text(diff_path, diff_text)
+
                 if run_span is not None:
                     try:
                         run_span.add_event(
@@ -1108,7 +1211,7 @@ async def _main_async():
                     plan_text=plan_text,
                     patch_text=diff_text,
                     repo_context=reviewer_context,
-                    meta_model_guide=meta_model_guide,
+                    meta_model_context=meta_model_context,
                     review_round_idx=round_idx,
                     baseline_issues=(baseline_review_issues or "(none)"),
                 )

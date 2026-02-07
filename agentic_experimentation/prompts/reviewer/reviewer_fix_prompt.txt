@@ -17,6 +17,9 @@ Idea:
 Plan:
 {plan_text}
 
+Meta model context:
+{meta_model_context}
+
 Diff:
 {patch_text}
 
@@ -26,4 +29,3 @@ ISSUES:
 - <only unresolved baseline issues, or leave empty if none>
 NOTES:
 - <optional notes about whether baseline issues are fixed; no new issues>
-

@@ -27,6 +27,9 @@ Idea:
 Plan:
 {plan_text}
 
+Meta model context:
+{meta_model_context}
+
 Diff:
 {patch_text}
 
