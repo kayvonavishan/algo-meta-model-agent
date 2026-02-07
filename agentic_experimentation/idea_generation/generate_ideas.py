@@ -1248,15 +1248,10 @@ def _extract_idea_sections(markdown: str) -> Optional[str]:
         head = lines[0].strip()
         tail = lines[1:]
         if tail:
-            return f"{label}: {head}
-" + "
-".join(tail)
+            return f"{label}: {head}\n" + "\n".join(tail)
         return f"{label}: {head}"
 
-    return "
-
-".join(_format_section(label) for label in required).strip() + "
-"
+    return "\n\n".join(_format_section(label) for label in required).strip() + "\n"
 
 
 def _clean_idea_output(raw: str) -> str:
@@ -1268,8 +1263,7 @@ def _clean_idea_output(raw: str) -> str:
     extracted = _extract_idea_sections(cleaned)
     if extracted:
         return extracted
-    return trimmed.strip() + "
-" if trimmed else ""
+    return trimmed.strip() + "\n" if trimmed else ""
 
 
 def _validate_idea_output(markdown: str) -> None:
