@@ -233,6 +233,7 @@ Idea generation logs are consolidated here:
   - `generate_ideas.subprocess.node_<node_id>.log` (stdout/stderr from `generate_ideas.py`)
   - `prompts/` (prompt dumps)
   - `claude_debug/` (Claude SDK debug logs)
+  - `raw/` (raw Claude Agent SDK message captures per idea; disable with `--no-idea-log-raw-messages`)
 
 ### 4) LLM debug logs (OpenAI direct calls)
 

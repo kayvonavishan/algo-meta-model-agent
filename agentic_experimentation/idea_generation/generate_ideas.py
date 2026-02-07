@@ -61,6 +61,57 @@ def _append_jsonl(path: Path, obj: dict[str, Any]) -> None:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
+def _to_jsonable(value: Any, *, depth: int = 0, max_depth: int = 8) -> Any:
+    if depth >= max_depth:
+        return str(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v, depth=depth + 1, max_depth=max_depth) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_jsonable(v, depth=depth + 1, max_depth=max_depth) for v in value]
+    try:
+        return _to_jsonable(getattr(value, "__dict__"), depth=depth + 1, max_depth=max_depth)
+    except Exception:
+        return str(value)
+
+
+def _write_raw_llm_messages(
+    *,
+    idea_number: int,
+    prompt_path: Path,
+    model: Optional[str],
+    node_id: Optional[str],
+    conversation_id: Optional[str],
+    turn_id: Optional[str],
+    provider_session_id: Optional[str],
+    provider_response_id: Optional[str],
+    provider_metadata_debug: Optional[dict[str, Any]],
+    raw_messages: Any,
+) -> Path:
+    raw_dir = _idea_log_root() / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    suffix = _now_tag()
+    name = f"claude_sdk_messages_{idea_number:03d}_{suffix}.jsonl"
+    path = raw_dir / name
+    record = {
+        "ts": _utc_now_iso(),
+        "provider": "claude_agent_sdk",
+        "model": str(model) if model else None,
+        "idea_number": int(idea_number),
+        "prompt_path": str(prompt_path),
+        "node_id": str(node_id) if node_id else None,
+        "conversation_id": str(conversation_id) if conversation_id else None,
+        "turn_id": str(turn_id) if turn_id else None,
+        "provider_session_id": provider_session_id,
+        "provider_response_id": provider_response_id,
+        "provider_metadata_debug": provider_metadata_debug or {},
+        "raw_messages": _to_jsonable(raw_messages),
+    }
+    _append_jsonl(path, record)
+    return path
+
+
 def _normalize_conversation_mode(raw: Optional[str]) -> str:
     value = str(raw or "off").strip().lower()
     if value in {"off", "auto", "native", "replay"}:
@@ -777,6 +828,13 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="Replay memory char budget (-1 = unbounded, 0 = disable replay memory, None = default).",
     )
+    parser.add_argument(
+        "--idea-log-raw-messages",
+        dest="idea_log_raw_messages",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Log raw Claude Agent SDK messages for each idea (default: on). Use --no-idea-log-raw-messages to disable.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1135,6 +1193,58 @@ def _parse_idea_title(markdown: str) -> str:
     return ""
 
 
+def _strip_agent_markup(text: str) -> str:
+    cleaned = re.sub(r"<function_calls>.*?</function_calls>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<thinking>.*?</thinking>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"(?im)^\\s*</?function_calls>\\s*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\\s*</?thinking>\\s*$", "", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _extract_idea_sections(markdown: str) -> Optional[str]:
+    label_re = re.compile(r"^\\s*(?:\\*\\*)?\\s*(IDEA|RATIONALE|REQUIRED_CHANGES)\\s*:\\s*(?:\\*\\*)?\\s*(.*)$", re.IGNORECASE)
+    sections: dict[str, list[str]] = {}
+    current: Optional[str] = None
+    for line in markdown.splitlines():
+        match = label_re.match(line)
+        if match:
+            label = match.group(1).upper()
+            current = label
+            sections.setdefault(label, [])
+            remainder = match.group(2).strip()
+            if remainder:
+                sections[label].append(remainder)
+            continue
+        if current:
+            sections[current].append(line)
+    required = ("IDEA", "RATIONALE", "REQUIRED_CHANGES")
+    if not all(label in sections for label in required):
+        return None
+
+    def _format_section(label: str) -> str:
+        lines = sections.get(label, [])
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if not lines:
+            return f"{label}:"
+        head = lines[0].strip()
+        tail = lines[1:]
+        if tail:
+            return f"{label}: {head}\n" + "\n".join(tail)
+        return f"{label}: {head}"
+
+    return "\n\n".join(_format_section(label) for label in required).strip() + "\n"
+
+
+def _clean_idea_output(raw: str) -> str:
+    cleaned = _strip_agent_markup(raw or "")
+    extracted = _extract_idea_sections(cleaned)
+    return extracted if extracted else (cleaned.strip() + "\n" if cleaned else "")
+
+
 def _validate_idea_output(markdown: str) -> None:
     required = ("IDEA:", "RATIONALE:", "REQUIRED_CHANGES:")
     missing = [k for k in required if k not in markdown]
@@ -1317,6 +1427,7 @@ async def _run_claude_agent_sdk_once(
     continue_conversation: bool = False,
     resume_session_id: Optional[str] = None,
     fork_session: bool = False,
+    capture_raw_messages: bool = False,
 ) -> dict[str, Any]:
     try:
         from claude_agent_sdk import ClaudeAgentOptions, query  # type: ignore
@@ -1419,6 +1530,7 @@ async def _run_claude_agent_sdk_once(
         "provider_response_id": meta.get("response_id"),
         "provider_session_id": meta.get("session_id"),
         "provider_metadata_debug": meta_debug,
+        "raw_messages": messages if capture_raw_messages else None,
     }
 
 
@@ -1495,6 +1607,7 @@ def main() -> int:
     conv_state_in: Optional[Path] = _resolve_cli_path(repo_root, args.conversation_state_in) if args.conversation_state_in else None
     conv_state_out: Optional[Path] = _resolve_cli_path(repo_root, args.conversation_state_out) if args.conversation_state_out else None
     emit_turn_log: Optional[Path] = _resolve_cli_path(repo_root, args.emit_turn_log) if args.emit_turn_log else None
+    log_raw_messages = bool(getattr(args, "idea_log_raw_messages", True))
     if conv_state_out is None and conv_state_in is not None:
         conv_state_out = conv_state_in
 
@@ -1610,6 +1723,7 @@ def main() -> int:
                                 continue_conversation=bool(native_params.get("continue_conversation", False)),
                                 resume_session_id=native_params.get("resume_session_id"),
                                 fork_session=bool(native_params.get("fork_session", False)),
+                                capture_raw_messages=log_raw_messages,
                             )
                         )
                     except RuntimeError:
@@ -1626,10 +1740,12 @@ def main() -> int:
                                 continue_conversation=bool(native_params.get("continue_conversation", False)),
                                 resume_session_id=native_params.get("resume_session_id"),
                                 fork_session=bool(native_params.get("fork_session", False)),
+                                capture_raw_messages=log_raw_messages,
                             )
                         )
-                    idea_md = str(llm_result.get("text") or "")
+                    idea_md = _clean_idea_output(str(llm_result.get("text") or ""))
                     provider_meta_debug = llm_result.get("provider_metadata_debug") or {}
+                    raw_messages = llm_result.get("raw_messages")
 
                     if phoenix_obs is not None and llm_span is not None:
                         phoenix_obs.set_io(llm_span, output_text=idea_md)
@@ -1653,6 +1769,7 @@ def main() -> int:
                 _write_text(out_path, idea_md.rstrip() + "\n")
                 created.append(out_path)
 
+                turn_id_for_log: Optional[str] = None
                 if conversation_enabled and isinstance(conversation_state, dict):
                     out_abs = str(out_path.resolve())
                     try:
@@ -1678,6 +1795,7 @@ def main() -> int:
                         turn_id = existing_turn_id_from_row or existing_turn_id or _conversation_next_turn_id(conversation_state)
                     else:
                         turn_id = existing_turn_id if existing_turn_id else _conversation_next_turn_id(conversation_state)
+                    turn_id_for_log = turn_id
                     turn = {
                         "turn_id": turn_id,
                         "operation_id": operation_id,
@@ -1753,6 +1871,20 @@ def main() -> int:
                                 "operation_id": operation_id,
                             },
                         )
+
+                if log_raw_messages and raw_messages is not None:
+                    _write_raw_llm_messages(
+                        idea_number=next_num,
+                        prompt_path=prompt_dump_path,
+                        model=model,
+                        node_id=(str(baseline_raw.get("node_id")) if isinstance(baseline_raw, dict) else None),
+                        conversation_id=(str(conversation_state.get("conversation_id")) if isinstance(conversation_state, dict) else None),
+                        turn_id=turn_id_for_log,
+                        provider_session_id=llm_result.get("provider_session_id"),
+                        provider_response_id=llm_result.get("provider_response_id"),
+                        provider_metadata_debug=(provider_meta_debug if isinstance(provider_meta_debug, dict) else None),
+                        raw_messages=raw_messages,
+                    )
 
                 if phoenix_obs is not None and idea_span is not None:
                     phoenix_obs.set_attrs(idea_span, {"output_path": str(out_path)})

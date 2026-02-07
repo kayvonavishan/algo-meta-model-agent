@@ -75,6 +75,38 @@ def _resolve_log_dir(exp_dir: Path) -> Path:
     return p
 
 
+def _render_meta_model_context_block(context_root: Path) -> str:
+    files = [
+        (
+            "META_MODEL_GUIDE.md",
+            "High-level guide for the meta model design, assumptions, and workflow.",
+            context_root / "META_MODEL_GUIDE.md",
+        ),
+        (
+            "adaptive_vol_momentum.py",
+            "Primary meta model implementation and sweep/backtest driver.",
+            context_root / "adaptive_vol_momentum.py",
+        ),
+        (
+            "scoring.py",
+            "Performance scoring and summary metric computation utilities.",
+            context_root / "scoring.py",
+        ),
+        (
+            "selection.py",
+            "Selection logic used to choose top strategies/models each period.",
+            context_root / "selection.py",
+        ),
+    ]
+
+    lines = ["===== META MODEL CONTEXT ====="]
+    for name, desc, path in files:
+        lines.append(name)
+        lines.append(f" - description: {desc}")
+        lines.append(f" - location: {path}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def _read_jsonl_objects(path):  # noqa: ANN001
     items = []
     if not path:
@@ -711,6 +743,7 @@ async def _main_async():
     if not meta_model_guide_path.exists():
         raise RuntimeError(f"Missing required meta model guide at {meta_model_guide_path}")
     meta_model_guide = _read_text(meta_model_guide_path)
+    meta_model_context = _render_meta_model_context_block(context_repo_root)
 
     if not baseline_csv.exists():
         raise RuntimeError(f"Baseline CSV not found at {baseline_csv}. Run with --refresh-baseline.")
@@ -840,7 +873,7 @@ async def _main_async():
                 _read_text(planner_prompt_path),
                 idea_text=idea_text,
                 repo_context=planner_context,
-                meta_model_guide=meta_model_guide,
+                meta_model_context=meta_model_context,
             )
             planner_prompt_path = log_dir / "planner_prompt.txt"
             _write_text(planner_prompt_path, planner_prompt)
@@ -922,7 +955,7 @@ async def _main_async():
                     review_text=review_text,
                     review_issues=review_issues,
                     prev_diff_text=diff_text,
-                    meta_model_guide=meta_model_guide,
+                    meta_model_context=meta_model_context,
                 )
                 coder_prompt_path = log_dir / f"coder_prompt_round_{round_idx}.txt"
                 _write_text(coder_prompt_path, coder_prompt)

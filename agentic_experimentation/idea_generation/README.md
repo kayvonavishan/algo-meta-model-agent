@@ -23,6 +23,12 @@ If runs still fail with "Command failed with exit code 1", check:
 - standalone usage: `agentic_experimentation/logs/idea_generation/claude_debug/`
 - tree runner usage: `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/logs/idea_generation/claude_debug/`
 
+Raw Claude SDK message captures are written by default to:
+- standalone usage: `agentic_experimentation/logs/idea_generation/raw/`
+- tree runner usage: `agentic_experimentation/worktrees/tree_runs/<tree_run_id>/logs/idea_generation/raw/`
+
+Disable with `--no-idea-log-raw-messages`.
+
 ## Requirements
 
 - `claude-agent-sdk` installed (it bundles the Claude Code runtime).

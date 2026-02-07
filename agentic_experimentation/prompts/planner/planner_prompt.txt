@@ -6,8 +6,8 @@ Idea:
 Repository context:
 {repo_context}
 
-Below is a document defining the current architecture of the meta model:
-{meta_model_guide}
+Meta model context:
+{meta_model_context}
 
 Important constraints:
 - Do NOT include documentation tasks (README updates, PR descriptions, changelogs, PR checklists, review requests, “code hygiene” notes, or other process/communication steps). Only include concrete code changes needed to implement the idea correctly.
