@@ -21,6 +21,11 @@ Scope:
 - Only REJECT for correctness/safety problems, missing required changes, or patches that will not run/apply.
 - Do not require any changes that were not in the initial plan.
 
+Reviewer guidance:
+- The code changes you see were made in two steps. First the coder makes the changes. Then, once complete, the coder checks a second time to make sure it is correct.
+- The section below includes notes from the coder from both the initial change, and the subsequent self check.
+- If the code deviates from the plan, the coder may explain why in those summaries. You must verify the explanation against the diff and the actual code changes.
+
 Idea:
 {idea_text}
 
@@ -29,6 +34,9 @@ Plan:
 
 Meta model context:
 {meta_model_context}
+
+Coder/self-check notes:
+{agent_notes}
 
 Diff:
 {patch_text}

@@ -61,6 +61,51 @@ def _truncate_for_phoenix(text: str) -> str:
     return s[:max_chars] + "\n... [truncated]\n"
 
 
+def _extract_content_field(text: str) -> str:
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    try:
+        obj = json.loads(s)
+    except Exception:
+        obj = None
+    if isinstance(obj, dict):
+        content = obj.get("content")
+        if content is not None:
+            return str(content).strip()
+    if isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, dict) and "content" in item:
+                return str(item.get("content") or "").strip()
+    for line in s.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and "content" in obj:
+            return str(obj.get("content") or "").strip()
+    return s
+
+
+def _format_agent_notes(*, coder_content: str, self_check_contents: list[str]) -> str:
+    lines: list[str] = []
+    coder_content = (coder_content or "").strip()
+    if coder_content:
+        lines.append("Coder summary (from agent output `content` field):")
+        lines.append(coder_content)
+    if self_check_contents:
+        for idx, text in enumerate(self_check_contents, start=1):
+            t = (text or "").strip()
+            if not t:
+                continue
+            lines.append(f"Self-check summary pass {idx} (from agent output `content` field):")
+            lines.append(t)
+    return "\n".join(lines).strip()
+
+
 def _resolve_log_dir(exp_dir: Path) -> Path:
     raw = os.environ.get("AGENTIC_EVAL_LOG_DIR") or os.environ.get("AGENTIC_LOG_DIR") or ""
     raw = str(raw).strip()
@@ -953,6 +998,7 @@ async def _main_async():
             review_rounds = []
             diff_text = ""
             coder_output = ""
+            self_check_outputs: list[str] = []
             review_text = ""
             review_issues = ""
             baseline_review_issues = ""
@@ -1150,6 +1196,7 @@ async def _main_async():
 
                         self_check_output_path = log_dir / f"coder_self_check_output_round_{round_idx}_pass_{pass_idx}.txt"
                         _write_text(self_check_output_path, self_check_output)
+                        self_check_outputs.append(self_check_output)
                         diff_text = _git_diff_with_untracked(worktree_path)
                         _write_text(diff_path, diff_text)
 
@@ -1205,6 +1252,17 @@ async def _main_async():
                     )
                     continue
 
+                coder_content = _extract_content_field(coder_output)
+                self_check_contents: list[str] = []
+                if coder_self_check_rounds:
+                    self_check_contents = [_extract_content_field(x) for x in (self_check_outputs or [])]
+                agent_notes = _format_agent_notes(
+                    coder_content=coder_content,
+                    self_check_contents=self_check_contents,
+                )
+                if not agent_notes:
+                    agent_notes = "(none)"
+
                 review_prompt = _render_prompt(
                     _read_text(reviewer_prompt_path if round_idx == 0 else reviewer_fix_prompt_path),
                     idea_text=idea_text,
@@ -1214,6 +1272,7 @@ async def _main_async():
                     meta_model_context=meta_model_context,
                     review_round_idx=round_idx,
                     baseline_issues=(baseline_review_issues or "(none)"),
+                    agent_notes=agent_notes,
                 )
                 reviewer_prompt_path = log_dir / f"reviewer_prompt_round_{round_idx}.txt"
                 _write_text(reviewer_prompt_path, review_prompt)
