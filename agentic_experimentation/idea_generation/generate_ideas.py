@@ -1202,8 +1202,23 @@ def _strip_agent_markup(text: str) -> str:
     return cleaned.strip()
 
 
+def _trim_to_first_label(text: str) -> str:
+    if not text:
+        return ""
+    match = re.search(
+        r"(?im)^\s*(?:[-*\d]+[\).]?\s+)?(?:\*\*)?\s*IDEA\s*:",
+        text,
+    )
+    if match:
+        return text[match.start():].lstrip()
+    return text
+
+
 def _extract_idea_sections(markdown: str) -> Optional[str]:
-    label_re = re.compile(r"^\\s*(?:\\*\\*)?\\s*(IDEA|RATIONALE|REQUIRED_CHANGES)\\s*:\\s*(?:\\*\\*)?\\s*(.*)$", re.IGNORECASE)
+    label_re = re.compile(
+        r"^\s*(?:[-*\d]+[\).]?\s+)?(?:\*\*)?\s*(IDEA|RATIONALE|REQUIRED_CHANGES)\s*:\s*(?:\*\*)?\s*(.*)$",
+        re.IGNORECASE,
+    )
     sections: dict[str, list[str]] = {}
     current: Optional[str] = None
     for line in markdown.splitlines():
@@ -1233,16 +1248,28 @@ def _extract_idea_sections(markdown: str) -> Optional[str]:
         head = lines[0].strip()
         tail = lines[1:]
         if tail:
-            return f"{label}: {head}\n" + "\n".join(tail)
+            return f"{label}: {head}
+" + "
+".join(tail)
         return f"{label}: {head}"
 
-    return "\n\n".join(_format_section(label) for label in required).strip() + "\n"
+    return "
+
+".join(_format_section(label) for label in required).strip() + "
+"
 
 
 def _clean_idea_output(raw: str) -> str:
     cleaned = _strip_agent_markup(raw or "")
+    trimmed = _trim_to_first_label(cleaned)
+    extracted = _extract_idea_sections(trimmed)
+    if extracted:
+        return extracted
     extracted = _extract_idea_sections(cleaned)
-    return extracted if extracted else (cleaned.strip() + "\n" if cleaned else "")
+    if extracted:
+        return extracted
+    return trimmed.strip() + "
+" if trimmed else ""
 
 
 def _validate_idea_output(markdown: str) -> None:
