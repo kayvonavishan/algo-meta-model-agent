@@ -64,6 +64,20 @@ def compute_efficiency_ratio(returns: pd.DataFrame) -> pd.Series:
     return eff.clip(-1.0, 1.0)
 
 
+def compute_win_rate(returns: pd.DataFrame, lookback: int) -> np.ndarray:
+    """
+    Compute rolling win-rate (fraction of positive returns) over lookback window.
+    Returns matrix of shape (n_models, T) with values in [0, 1].
+    """
+    if lookback <= 0:
+        raise ValueError("lookback must be positive.")
+    positive = returns.gt(0).astype(float)
+    positive = positive.where(returns.notna())
+    win_rate = positive.rolling(window=lookback, min_periods=1).mean()
+    win_rate = win_rate.fillna(0.0)
+    return win_rate.to_numpy().T
+
+
 def map_z_to_alpha(z: float, cfg: MetaConfig) -> float:
     if np.isnan(z):
         return 0.5 * (cfg.alpha_low + cfg.alpha_high)
@@ -365,14 +379,17 @@ def compute_scores_for_ticker_v2(
         # 6) Empirical delta (no ML)
         D = np.zeros_like(Q, dtype=float)
         D[:, 1:] = Q[:, 1:] - Q[:, :-1]
-    
+
         # 6b) Efficiency ratio (momentum smoothness) over a rolling window
+        returns_t = None
         eff_norm = None
+        win_norm = None
+        if cfg.efficiency_weight != 0 or cfg.win_rate_weight != 0:
+            returns_t = sorted_matrix.T
         if cfg.efficiency_weight != 0:
             eff_lookback = cfg.momentum_lookback if cfg.enable_momentum_lookback else T
             if eff_lookback <= 0:
                 eff_lookback = max(1, T)
-            returns_t = sorted_matrix.T
             net = returns_t.rolling(window=eff_lookback, min_periods=1).sum()
             path = returns_t.abs().rolling(window=eff_lookback, min_periods=1).sum()
             counts = returns_t.rolling(window=eff_lookback, min_periods=1).count()
@@ -381,10 +398,17 @@ def compute_scores_for_ticker_v2(
             eff = eff.where(counts > 0, 0.0)
             eff = eff.fillna(0.0).clip(-1.0, 1.0)
             eff_norm = ((eff + 1.0) * 0.5).clip(0.0, 1.0).to_numpy().T
-    
+        if cfg.win_rate_weight != 0:
+            wr_lookback = cfg.momentum_lookback if cfg.enable_momentum_lookback else T
+            if wr_lookback <= 0:
+                wr_lookback = max(1, T)
+            win_norm = compute_win_rate(returns_t, wr_lookback)
+
         base_forecast = M + cfg.delta_weight * D
         if eff_norm is not None:
             base_forecast = base_forecast + cfg.efficiency_weight * eff_norm
+        if win_norm is not None:
+            base_forecast = base_forecast + cfg.win_rate_weight * win_norm
     
         # 7) Ticker-local baseline
         if cfg.baseline_method == "mean":
