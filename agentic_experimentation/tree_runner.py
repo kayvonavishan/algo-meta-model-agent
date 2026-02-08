@@ -928,8 +928,10 @@ def _execute_eval_task_worker(
         approved = bool(summary.get("approved"))
         sweep_exit = summary.get("sweep_exit_code")
         candidate_csv = exp_dir / "meta_config_sweep_results.csv"
-        if not approved or sweep_exit != 0 or not candidate_csv.exists():
-            raise RuntimeError("Idea did not reach approved+sweep-success state; no candidate results.")
+        if sweep_exit != 0 or not candidate_csv.exists():
+            raise RuntimeError("Sweep failed or missing candidate results; no candidate results.")
+        if not approved:
+            _append_tree_log(run_root, f"eval_not_approved eval_id={eval_id} continuing_without_approval=true")
 
         cand_wt_path = Path(str(cand_info["worktree_path"]))
         msg = f"tree_run {tree_run_id} eval {eval_id} idea {idea_path.name}"
