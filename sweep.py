@@ -70,7 +70,6 @@ def build_config_grid_v1(n_configs: int = 100, seed: int = 42) -> List[Dict[str,
     risk_lookbacks = [10, 20, 30]
     cvar_alphas = [0.05, 0.10, 0.15]
     cvar_risk_aversions = [0.5, 0.75, 1.0]
-
     grid = {
         "vol_window": _stratified_values(vol_windows, n_configs, rng),
         "alpha_pair": _stratified_values(alpha_pairs, n_configs, rng),

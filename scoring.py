@@ -411,6 +411,16 @@ def compute_scores_for_ticker_v2(
             M = _adaptive_momentum_recursive(Q, alpha_t)
 
         # M shape: (n_models, T) adaptive momentum per period.
+
+        rank_persist_norm = None
+        if cfg.rank_persistence_weight != 0:
+            rp_L = min(cfg.rank_persistence_lookback, T)
+            if rp_L >= 2:
+                above_median = (Q > 0.5).astype(float)
+                above_median = np.where(np.isnan(Q), np.nan, above_median)
+                Q_above_df = pd.DataFrame(above_median.T)
+                rank_persist = Q_above_df.rolling(window=rp_L, min_periods=2).mean().to_numpy().T
+                rank_persist_norm = percentile_ranks_across_models_v2(rank_persist, axis=0)
     
         mom_sharpe_norm = None
         if cfg.momentum_sharpe_weight != 0:
@@ -461,6 +471,8 @@ def compute_scores_for_ticker_v2(
             base_forecast = base_forecast + cfg.win_rate_weight * win_norm
         if mom_sharpe_norm is not None:
             base_forecast = base_forecast + cfg.momentum_sharpe_weight * mom_sharpe_norm
+        if rank_persist_norm is not None:
+            base_forecast = base_forecast + cfg.rank_persistence_weight * rank_persist_norm
     
         # 7) Ticker-local baseline
         if cfg.baseline_method == "mean":

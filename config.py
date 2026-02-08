@@ -24,6 +24,8 @@ class MetaConfig:
     win_rate_weight: float = 0.08    # fraction of positive-return periods bonus
     momentum_sharpe_weight: float = 0.10  # volatility-adjusted momentum weight
     momentum_sharpe_lookback: int = 8     # lookback in Q periods (percentile-rank series), not raw returns
+    rank_persistence_weight: float = 0.06  # weight for rank persistence signal
+    rank_persistence_lookback: int = 8     # lookback window for rank persistence
     
     # Confidence (training-free)
     conf_lookback: int = 12
