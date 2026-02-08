@@ -1187,9 +1187,22 @@ def _slugify(title: str, *, max_len: int = 60) -> str:
 
 
 def _parse_idea_title(markdown: str) -> str:
-    for line in markdown.splitlines():
-        if line.strip().startswith("IDEA:"):
-            return line.split("IDEA:", 1)[1].strip()
+    title_re = re.compile(
+        r"^\s*(?:[-*\d]+[\).]?\s+)?(?:\*\*|#+\s*)?\s*IDEA\s*(?:[:\-–—]\s*)?(.*)$",
+        re.IGNORECASE,
+    )
+    lines = markdown.splitlines()
+    for idx, line in enumerate(lines):
+        match = title_re.match(line)
+        if not match:
+            continue
+        remainder = match.group(1).strip()
+        if remainder:
+            return remainder
+        # If the IDEA label is on its own line, use the next non-empty line as title.
+        for nxt in lines[idx + 1 :]:
+            if nxt.strip():
+                return nxt.strip()
     return ""
 
 
@@ -1206,7 +1219,7 @@ def _trim_to_first_label(text: str) -> str:
     if not text:
         return ""
     match = re.search(
-        r"(?im)^\s*(?:[-*\d]+[\).]?\s+)?(?:\*\*)?\s*IDEA\s*:",
+        r"(?im)^\s*(?:[-*\d]+[\).]?\s+)?(?:\*\*|#+\s*)?\s*IDEA\s*(?:[:\-–—]|$)",
         text,
     )
     if match:
@@ -1216,7 +1229,7 @@ def _trim_to_first_label(text: str) -> str:
 
 def _extract_idea_sections(markdown: str) -> Optional[str]:
     label_re = re.compile(
-        r"^\s*(?:[-*\d]+[\).]?\s+)?(?:\*\*)?\s*(IDEA|RATIONALE|REQUIRED_CHANGES)\s*:\s*(?:\*\*)?\s*(.*)$",
+        r"^\s*(?:[-*\d]+[\).]?\s+)?(?:\*\*|#+\s*)?\s*(IDEA|RATIONALE|REQUIRED_CHANGES)\s*(?:[:\-–—]\s*)?(?:\*\*)?\s*(.*)$",
         re.IGNORECASE,
     )
     sections: dict[str, list[str]] = {}
@@ -1357,11 +1370,11 @@ def _extract_final_text(messages: List[object]) -> str:
             parts = [_coerce_text(item, depth + 1) for item in value]
             return "".join(p for p in parts if p)
         if isinstance(value, dict):
-            for key in ("text", "content", "message", "value"):
+            for key in ("text", "content", "message", "value", "structured_output", "output"):
                 if key in value:
                     return _coerce_text(value.get(key), depth + 1)
             return ""
-        for attr in ("text", "content", "message", "value"):
+        for attr in ("text", "content", "message", "value", "structured_output", "output"):
             try:
                 attr_val = getattr(value, attr, None)
             except Exception:  # noqa: BLE001
@@ -1377,11 +1390,19 @@ def _extract_final_text(messages: List[object]) -> str:
             result = None
         if isinstance(result, str) and result.strip():
             return result
+        if result is not None:
+            result_text = _coerce_text(result)
+            if result_text.strip():
+                return result_text
 
         if isinstance(msg, dict):
             result2 = msg.get("result")
             if isinstance(result2, str) and result2.strip():
                 return result2
+            if result2 is not None:
+                result2_text = _coerce_text(result2)
+                if result2_text.strip():
+                    return result2_text
             content2 = _coerce_text(msg.get("content") or msg.get("message"))
             if content2.strip():
                 return content2
@@ -1808,7 +1829,31 @@ def main() -> int:
                     if phoenix_obs is not None and llm_span is not None:
                         phoenix_obs.set_io(llm_span, output_text=idea_md)
 
-                _validate_idea_output(idea_md)
+                try:
+                    _validate_idea_output(idea_md)
+                except ValueError as exc:
+                    debug_path: Optional[Path] = None
+                    if idea_md:
+                        debug_dir = _idea_log_root() / "invalid_outputs"
+                        debug_dir.mkdir(parents=True, exist_ok=True)
+                        debug_path = debug_dir / f"invalid_output_{_now_tag()}_{next_num:03d}.txt"
+                        _write_text(debug_path, idea_md)
+                    if log_raw_messages and raw_messages is not None:
+                        _write_raw_llm_messages(
+                            idea_number=next_num,
+                            prompt_path=prompt_dump_path,
+                            model=model,
+                            node_id=(str(baseline_raw.get("node_id")) if isinstance(baseline_raw, dict) else None),
+                            conversation_id=(str(conversation_state.get("conversation_id")) if isinstance(conversation_state, dict) else None),
+                            turn_id=None,
+                            provider_session_id=llm_result.get("provider_session_id"),
+                            provider_response_id=llm_result.get("provider_response_id"),
+                            provider_metadata_debug=(provider_meta_debug if isinstance(provider_meta_debug, dict) else None),
+                            raw_messages=raw_messages,
+                        )
+                    if debug_path is not None:
+                        raise ValueError(f"{exc} (debug: {debug_path})") from exc
+                    raise
 
                 title = _parse_idea_title(idea_md)
                 slug = _slugify(title)
