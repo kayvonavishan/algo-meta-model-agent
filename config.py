@@ -20,6 +20,7 @@ class MetaConfig:
     momentum_lookback: int = 12
     enable_momentum_lookback: bool = True  # when True, truncate adaptive momentum to last N periods
     delta_weight: float = 0.20       # small (0.05-0.3)
+    efficiency_weight: float = 0.10  # momentum smoothness bonus
     
     # Confidence (training-free)
     conf_lookback: int = 12

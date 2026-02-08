@@ -49,6 +49,21 @@ def rolling_zscore_v2(series: np.ndarray, window: int) -> np.ndarray:
         return z
 
 
+def compute_efficiency_ratio(returns: pd.DataFrame) -> pd.Series:
+    """
+    Efficiency ratio: net return / sum(abs(returns)) per strategy.
+    Values are clipped to [-1, 1]; empty or flat series map to 0.
+    """
+    net = returns.sum(axis=0, skipna=True)
+    path = returns.abs().sum(axis=0, skipna=True)
+    counts = returns.count(axis=0)
+    eff = net / path
+    eff = eff.where(path != 0.0, 0.0)
+    eff = eff.where(counts > 0, 0.0)
+    eff = eff.fillna(0.0)
+    return eff.clip(-1.0, 1.0)
+
+
 def map_z_to_alpha(z: float, cfg: MetaConfig) -> float:
     if np.isnan(z):
         return 0.5 * (cfg.alpha_low + cfg.alpha_high)
@@ -350,7 +365,26 @@ def compute_scores_for_ticker_v2(
         # 6) Empirical delta (no ML)
         D = np.zeros_like(Q, dtype=float)
         D[:, 1:] = Q[:, 1:] - Q[:, :-1]
+    
+        # 6b) Efficiency ratio (momentum smoothness) over a rolling window
+        eff_norm = None
+        if cfg.efficiency_weight != 0:
+            eff_lookback = cfg.momentum_lookback if cfg.enable_momentum_lookback else T
+            if eff_lookback <= 0:
+                eff_lookback = max(1, T)
+            returns_t = sorted_matrix.T
+            net = returns_t.rolling(window=eff_lookback, min_periods=1).sum()
+            path = returns_t.abs().rolling(window=eff_lookback, min_periods=1).sum()
+            counts = returns_t.rolling(window=eff_lookback, min_periods=1).count()
+            eff = net.divide(path)
+            eff = eff.where(path != 0.0, 0.0)
+            eff = eff.where(counts > 0, 0.0)
+            eff = eff.fillna(0.0).clip(-1.0, 1.0)
+            eff_norm = ((eff + 1.0) * 0.5).clip(0.0, 1.0).to_numpy().T
+    
         base_forecast = M + cfg.delta_weight * D
+        if eff_norm is not None:
+            base_forecast = base_forecast + cfg.efficiency_weight * eff_norm
     
         # 7) Ticker-local baseline
         if cfg.baseline_method == "mean":
