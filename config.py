@@ -22,6 +22,8 @@ class MetaConfig:
     delta_weight: float = 0.20       # small (0.05-0.3)
     efficiency_weight: float = 0.10  # momentum smoothness bonus
     win_rate_weight: float = 0.08    # fraction of positive-return periods bonus
+    momentum_sharpe_weight: float = 0.10  # volatility-adjusted momentum weight
+    momentum_sharpe_lookback: int = 8     # lookback in Q periods (percentile-rank series), not raw returns
     
     # Confidence (training-free)
     conf_lookback: int = 12

@@ -365,6 +365,7 @@ def compute_scores_for_ticker_v2(
         alpha_t = ema_smooth(alpha_raw, cfg.alpha_smooth)
     
         # 4) Percentile ranks per period across models
+        # Q shape: (n_models, T) with time axis last (most recent at end).
         Q = percentile_ranks_across_models_v2(R, axis=0)
     
         # 5) Adaptive EWMA momentum on Q (time-varying alpha)
@@ -375,7 +376,23 @@ def compute_scores_for_ticker_v2(
                 M = _adaptive_momentum_window(Q, alpha_t, cfg.momentum_lookback)
         else:
             M = _adaptive_momentum_recursive(Q, alpha_t)
+
+        # M shape: (n_models, T) adaptive momentum per period.
     
+        mom_sharpe_norm = None
+        if cfg.momentum_sharpe_weight != 0:
+            L = min(cfg.momentum_sharpe_lookback, Q.shape[1])
+            if L >= 2:
+                Q_df = pd.DataFrame(Q)
+                mom_vol = Q_df.rolling(
+                    window=L,
+                    axis=1,
+                    min_periods=2,
+                ).std(ddof=1).to_numpy()
+                mom_vol[~np.isfinite(mom_vol)] = np.inf
+                mom_sharpe = M / (mom_vol + 1e-6)
+                mom_sharpe_norm = percentile_ranks_across_models_v2(mom_sharpe, axis=0)
+
         # 6) Empirical delta (no ML)
         D = np.zeros_like(Q, dtype=float)
         D[:, 1:] = Q[:, 1:] - Q[:, :-1]
@@ -409,6 +426,8 @@ def compute_scores_for_ticker_v2(
             base_forecast = base_forecast + cfg.efficiency_weight * eff_norm
         if win_norm is not None:
             base_forecast = base_forecast + cfg.win_rate_weight * win_norm
+        if mom_sharpe_norm is not None:
+            base_forecast = base_forecast + cfg.momentum_sharpe_weight * mom_sharpe_norm
     
         # 7) Ticker-local baseline
         if cfg.baseline_method == "mean":
