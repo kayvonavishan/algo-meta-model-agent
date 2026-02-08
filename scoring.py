@@ -434,6 +434,21 @@ def compute_scores_for_ticker_v2(
             baseline = np.nanmean(base_forecast, axis=0)
         else:
             baseline = np.nanmedian(base_forecast, axis=0)
+        if cfg.regime_baseline_adjust > 0:
+            forecast_std = np.nanstd(base_forecast, axis=0)
+            L = min(cfg.regime_dispersion_lookback, len(forecast_std))
+            if L >= 2:
+                fs_series = pd.Series(forecast_std, dtype=float)
+                roll = fs_series.rolling(window=L, min_periods=2)
+                roll_mean = roll.mean().to_numpy()
+                roll_std = roll.std(ddof=1).to_numpy()
+                z_regime = (forecast_std - roll_mean) / (roll_std + 1e-8)
+                baseline_shift = cfg.regime_baseline_adjust * np.clip(z_regime, -1.5, 1.5)
+                baseline_shift = np.where(np.isfinite(baseline_shift), baseline_shift, 0.0)
+                if isinstance(baseline, pd.Series):
+                    baseline = baseline + pd.Series(baseline_shift, index=baseline.index)
+                else:
+                    baseline = baseline + baseline_shift
         rel = base_forecast - baseline
     
         # 8) Confidence (training-free)

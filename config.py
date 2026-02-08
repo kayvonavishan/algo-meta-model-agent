@@ -37,6 +37,8 @@ class MetaConfig:
     
     # Baseline
     baseline_method: str = "median"  # "median" or "mean"
+    regime_baseline_adjust: float = 0.10  # 0 disables regime adjustment
+    regime_dispersion_lookback: int = 6  # lookback for regime dispersion z-score
     
     # Redundancy control (optional)
     enable_uniqueness_weighting: bool = True
