@@ -330,6 +330,33 @@ def downside_cvar_matrix_v2(
         return out
 
 
+def _compute_downside_volatility_penalty(
+    R: np.ndarray,
+    lookback: int,
+    threshold_z: float,
+    weight: float,
+) -> np.ndarray | None:
+    if weight <= 0:
+        return None
+    if lookback <= 0:
+        return None
+    T = R.shape[1]
+    L = min(lookback, T)
+    if L < 2:
+        return None
+    R_negative = np.where(R < 0, R, np.nan)
+    R_neg_df = pd.DataFrame(R_negative.T)
+    downside_std = R_neg_df.rolling(window=L, min_periods=2).std(ddof=1).to_numpy().T
+    ds_series = pd.DataFrame(downside_std.T)
+    roll_mean = ds_series.rolling(window=L, min_periods=2).mean().to_numpy().T
+    roll_std_ds = ds_series.rolling(window=L, min_periods=2).std(ddof=1).to_numpy().T
+    z_downside = (downside_std - roll_mean) / (roll_std_ds + 1e-8)
+    excess_z = np.maximum(0, z_downside - threshold_z)
+    penalty = weight * excess_z
+    penalty = np.where(np.isfinite(penalty), penalty, 0.0)
+    return penalty
+
+
 def compute_scores_for_ticker_v2(
     returns_matrix: pd.DataFrame,
     cfg: MetaConfig,
@@ -344,6 +371,12 @@ def compute_scores_for_ticker_v2(
         periods = list(sorted_matrix.columns)
         R = sorted_matrix.to_numpy(dtype=float)
         n_models, T = R.shape
+        downside_vol_pen = _compute_downside_volatility_penalty(
+            R,
+            cfg.downside_vol_lookback,
+            cfg.downside_vol_threshold_z,
+            cfg.downside_vol_cap_weight,
+        )
     
         # 1) Per-period dispersion (within ticker) using MAD
         counts = np.sum(~np.isnan(R), axis=0)
@@ -479,6 +512,8 @@ def compute_scores_for_ticker_v2(
         uniq_w = compute_uniqueness_weights(returns_matrix, cfg).to_numpy(dtype=float)
     
         SCORE = (rel * CONF) - risk_pen
+        if downside_vol_pen is not None:
+            SCORE = SCORE - downside_vol_pen
         SCORE = (uniq_w[:, None] * SCORE)
         scores_df = pd.DataFrame(SCORE, index=models, columns=periods)
     

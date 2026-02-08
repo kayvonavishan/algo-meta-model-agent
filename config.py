@@ -34,6 +34,11 @@ class MetaConfig:
     cvar_alpha: float = 0.10         # tail depth
     cvar_risk_aversion: float = 0.75 # penalty strength
     cvar_window_stride: int = 1      # downsample within CVaR lookback window (1 = exact)
+
+    # Downside volatility cap
+    downside_vol_cap_weight: float = 0.12  # 0 disables downside volatility cap
+    downside_vol_lookback: int = 8
+    downside_vol_threshold_z: float = 1.0
     
     # Baseline
     baseline_method: str = "median"  # "median" or "mean"
@@ -55,3 +60,11 @@ class MetaConfig:
 
     # Sweep / reporting
     scorecard_every: Optional[int] = 10  # build scorecard every N configs during sweep (None = disable)
+
+    def __post_init__(self) -> None:
+        if self.downside_vol_cap_weight < 0:
+            self.downside_vol_cap_weight = 0.0
+        if self.downside_vol_lookback < 2:
+            self.downside_vol_lookback = 2
+        if self.downside_vol_threshold_z < 0:
+            self.downside_vol_threshold_z = 0.0
