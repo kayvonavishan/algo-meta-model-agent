@@ -1343,9 +1343,33 @@ def _load_config(config_path: Path) -> IdeaGenConfig:
 
 def _extract_final_text(messages: List[object]) -> str:
     """
-    The Agent SDK yields a stream of message objects; in examples, the final response is available on `.result`.
-    Fall back to a best-effort string conversion if the SDK changes message shapes.
+    The Agent SDK yields a stream of message objects; the final response may appear on
+    `.result` or inside `.content` blocks depending on SDK version. Fall back to a
+    best-effort string conversion if message shapes change.
     """
+
+    def _coerce_text(value: object, depth: int = 0) -> str:
+        if depth > 4 or value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts = [_coerce_text(item, depth + 1) for item in value]
+            return "".join(p for p in parts if p)
+        if isinstance(value, dict):
+            for key in ("text", "content", "message", "value"):
+                if key in value:
+                    return _coerce_text(value.get(key), depth + 1)
+            return ""
+        for attr in ("text", "content", "message", "value"):
+            try:
+                attr_val = getattr(value, attr, None)
+            except Exception:  # noqa: BLE001
+                attr_val = None
+            if attr_val is not None:
+                return _coerce_text(attr_val, depth + 1)
+        return ""
+
     for msg in reversed(messages):
         try:
             result = getattr(msg, "result", None)
@@ -1358,6 +1382,19 @@ def _extract_final_text(messages: List[object]) -> str:
             result2 = msg.get("result")
             if isinstance(result2, str) and result2.strip():
                 return result2
+            content2 = _coerce_text(msg.get("content") or msg.get("message"))
+            if content2.strip():
+                return content2
+
+        content = _coerce_text(getattr(msg, "content", None))
+        if content.strip():
+            return content
+        message = _coerce_text(getattr(msg, "message", None))
+        if message.strip():
+            return message
+        text = _coerce_text(getattr(msg, "text", None))
+        if text.strip():
+            return text
 
     # Last resort: stringify the last message.
     if messages:
