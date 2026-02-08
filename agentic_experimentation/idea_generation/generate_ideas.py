@@ -791,6 +791,31 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Override config.json cli_path (path to Claude Code CLI).",
     )
     parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=None,
+        help="Override config.json max_turns (Claude Code max turns per idea).",
+    )
+    parser.add_argument(
+        "--tools",
+        default=None,
+        help=(
+            "Tools preset or comma-separated tool list. "
+            "Use 'default' or 'claude_code' to enable Claude Code tools, "
+            "or 'none' to disable tools."
+        ),
+    )
+    parser.add_argument(
+        "--allowed-tools",
+        default=None,
+        help="Comma or space-separated allowlist of tool names (e.g., \"Read,LS\").",
+    )
+    parser.add_argument(
+        "--disallowed-tools",
+        default=None,
+        help="Comma or space-separated denylist of tool names.",
+    )
+    parser.add_argument(
         "--conversation-state-in",
         default=None,
         help="Optional JSON path for conversation state input (for branch continuation).",
@@ -1312,6 +1337,47 @@ class IdeaGenConfig:
     model: Optional[str]
     max_context_chars: int
     cli_path: Optional[str]
+    max_turns: int
+    tools: Optional[object]
+    allowed_tools: list[str]
+    disallowed_tools: list[str]
+
+
+def _parse_tool_list(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        items = []
+        for item in raw:
+            s = str(item or "").strip()
+            if s:
+                items.append(s)
+        return items
+    if isinstance(raw, str):
+        parts = re.split(r"[,\s]+", raw.strip())
+        return [p for p in parts if p]
+    return []
+
+
+def _tools_preset() -> dict[str, str]:
+    return {"type": "preset", "preset": "claude_code"}
+
+
+def _parse_tools_spec(raw: Any) -> Optional[object]:
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        if str(raw.get("type") or "").strip().lower() == "preset":
+            return raw
+        return raw
+    if isinstance(raw, list):
+        return _parse_tool_list(raw)
+    value = str(raw).strip()
+    if not value or value.lower() in {"none", "off", "false"}:
+        return []
+    if value.lower() in {"default", "claude_code", "claude-code"}:
+        return _tools_preset()
+    return _parse_tool_list(value)
 
 
 def _load_config(config_path: Path) -> IdeaGenConfig:
@@ -1331,6 +1397,10 @@ def _load_config(config_path: Path) -> IdeaGenConfig:
     model = raw.get("model", None)
     max_context_chars = raw.get("max_context_chars", 200_000)
     cli_path = raw.get("cli_path", None)
+    max_turns = raw.get("max_turns", 1)
+    tools = raw.get("tools", None)
+    allowed_tools = raw.get("allowed_tools", [])
+    disallowed_tools = raw.get("disallowed_tools", [])
 
     if not isinstance(count, int) or count <= 0:
         raise ValueError("config.count must be a positive integer.")
@@ -1345,12 +1415,22 @@ def _load_config(config_path: Path) -> IdeaGenConfig:
             "config.cli_path must point to an executable (e.g., claude.exe), not a shell script (.cmd/.bat/.ps1). "
             "Set it to null to use the SDK-bundled claude.exe copy."
         )
+    try:
+        max_turns_i = int(max_turns)
+    except Exception:
+        max_turns_i = 1
+    if max_turns_i < 1:
+        max_turns_i = 1
 
     return IdeaGenConfig(
         count=count,
         model=(model.strip() if isinstance(model, str) else None),
         max_context_chars=max_context_chars,
         cli_path=(cli_path.strip() if isinstance(cli_path, str) else None),
+        max_turns=max_turns_i,
+        tools=_parse_tools_spec(tools),
+        allowed_tools=_parse_tool_list(allowed_tools),
+        disallowed_tools=_parse_tool_list(disallowed_tools),
     )
 
 
@@ -1503,6 +1583,10 @@ async def _run_claude_agent_sdk_once(
     model: Optional[str],
     cwd: Path,
     cli_path: Optional[str],
+    max_turns: int,
+    tools: Optional[object],
+    allowed_tools: list[str],
+    disallowed_tools: list[str],
     continue_conversation: bool = False,
     resume_session_id: Optional[str] = None,
     fork_session: bool = False,
@@ -1565,15 +1649,15 @@ async def _run_claude_agent_sdk_once(
     options = ClaudeAgentOptions(
         model=model,
         cwd=str(cwd),
-        max_turns=1,
+        max_turns=max_turns,
         cli_path=resolved_cli_path,
         continue_conversation=bool(continue_conversation),
         resume=(str(resume_session_id) if resume_session_id else None),
         fork_session=bool(fork_session),
         stderr=_on_stderr,
-        # For this use-case, we want pure text generation (no filesystem/shell/web tools).
-        tools=[],
-        allowed_tools=[],
+        tools=tools,
+        allowed_tools=list(allowed_tools or []),
+        disallowed_tools=list(disallowed_tools or []),
         # Ensure we never block on interactive permission prompts.
         permission_mode="bypassPermissions",
         # Force CLI debug logs to stderr so we can capture root-cause when it exits early.
@@ -1681,6 +1765,14 @@ def main() -> int:
     max_context_chars = int(args.max_context_chars) if args.max_context_chars is not None else int(cfg.max_context_chars)
     model = args.model if args.model is not None else cfg.model
     cli_path = args.cli_path if args.cli_path is not None else cfg.cli_path
+    max_turns = int(args.max_turns) if args.max_turns is not None else int(cfg.max_turns)
+    tools = _parse_tools_spec(args.tools) if args.tools is not None else cfg.tools
+    allowed_tools = _parse_tool_list(args.allowed_tools) if args.allowed_tools is not None else list(cfg.allowed_tools)
+    disallowed_tools = _parse_tool_list(args.disallowed_tools) if args.disallowed_tools is not None else list(cfg.disallowed_tools)
+    if tools is None and (allowed_tools or disallowed_tools):
+        tools = _tools_preset()
+    if max_turns < 1:
+        max_turns = 1
 
     requested_conv_mode = _normalize_conversation_mode(args.conversation_mode)
     conv_state_in: Optional[Path] = _resolve_cli_path(repo_root, args.conversation_state_in) if args.conversation_state_in else None
@@ -1799,6 +1891,10 @@ def main() -> int:
                                 model=model,
                                 cwd=run_cwd,
                                 cli_path=cli_path,
+                                max_turns=max_turns,
+                                tools=tools,
+                                allowed_tools=allowed_tools,
+                                disallowed_tools=disallowed_tools,
                                 continue_conversation=bool(native_params.get("continue_conversation", False)),
                                 resume_session_id=native_params.get("resume_session_id"),
                                 fork_session=bool(native_params.get("fork_session", False)),
@@ -1816,6 +1912,10 @@ def main() -> int:
                                 model=None,
                                 cwd=run_cwd,
                                 cli_path=cli_path,
+                                max_turns=max_turns,
+                                tools=tools,
+                                allowed_tools=allowed_tools,
+                                disallowed_tools=disallowed_tools,
                                 continue_conversation=bool(native_params.get("continue_conversation", False)),
                                 resume_session_id=native_params.get("resume_session_id"),
                                 fork_session=bool(native_params.get("fork_session", False)),

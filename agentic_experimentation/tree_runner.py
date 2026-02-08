@@ -174,6 +174,30 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Replay memory char budget (-1 = unbounded, 0 = disable replay memory).",
     )
     parser.add_argument(
+        "--idea-max-turns",
+        type=int,
+        default=6,
+        help="Max turns for Claude Code idea generation (used when tools are enabled).",
+    )
+    parser.add_argument(
+        "--idea-tools",
+        default="claude_code",
+        help=(
+            "Tools preset or comma-separated tool list for idea generation. "
+            "Use 'default' or 'claude_code' to enable Claude Code tools, or 'none' to disable."
+        ),
+    )
+    parser.add_argument(
+        "--idea-allowed-tools",
+        default="Read",
+        help="Comma or space-separated allowlist of tool names for idea generation (e.g., \"Read,LS\").",
+    )
+    parser.add_argument(
+        "--idea-disallowed-tools",
+        default="",
+        help="Comma or space-separated denylist of tool names for idea generation.",
+    )
+    parser.add_argument(
         "--dedupe-scope",
         choices=["node_plus_ancestors", "global", "none"],
         default="node_plus_ancestors",
@@ -202,6 +226,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 def _utc_now_iso() -> str:
     return _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+
+
+def _normalize_tool_arg(raw: str) -> str:
+    parts = [p for p in re.split(r"[,\s]+", str(raw or "").strip()) if p]
+    return ",".join(parts)
 
 
 def _sha256_file(path: Path) -> str:
@@ -2175,6 +2204,10 @@ def _ensure_manifest_conversation_schema(
     run_config.setdefault("idea_conversation_mode", str(getattr(args, "idea_conversation_mode", "auto")))
     run_config.setdefault("idea_history_window_turns", int(getattr(args, "idea_history_window_turns", 12)))
     run_config.setdefault("idea_history_max_chars", int(getattr(args, "idea_history_max_chars", 20000)))
+    run_config.setdefault("idea_max_turns", int(getattr(args, "idea_max_turns", 6)))
+    run_config.setdefault("idea_tools", str(getattr(args, "idea_tools", "claude_code")))
+    run_config.setdefault("idea_allowed_tools", str(getattr(args, "idea_allowed_tools", "Read")))
+    run_config.setdefault("idea_disallowed_tools", str(getattr(args, "idea_disallowed_tools", "")))
     run_config.setdefault("max_parallel_evals", int(getattr(args, "max_parallel_evals", 1)))
     run_config.setdefault("dry_run", bool(getattr(args, "dry_run", False)))
     _max_parallel_per_node = getattr(args, "max_parallel_per_node", None)
@@ -2471,6 +2504,10 @@ def _tree_summary_markdown(*, run_root: Path, manifest: dict[str, Any]) -> str:
     lines.append(f"- idea_conversation_mode: {conversation_config.get('mode')}")
     lines.append(f"- idea_history_window_turns: {conversation_config.get('history_window_turns')}")
     lines.append(f"- idea_history_max_chars: {conversation_config.get('history_max_chars')}")
+    lines.append(f"- idea_max_turns: {run_config.get('idea_max_turns')}")
+    lines.append(f"- idea_tools: {run_config.get('idea_tools')}")
+    lines.append(f"- idea_allowed_tools: {run_config.get('idea_allowed_tools')}")
+    lines.append(f"- idea_disallowed_tools: {run_config.get('idea_disallowed_tools')}")
     lines.append(f"- conversation_debug_log_jsonl_path: {conversation_config.get('debug_log_jsonl_path')}")
     lines.append(f"- stop_reason: {state.get('stop_reason')}")
     lines.append("")
@@ -3324,6 +3361,10 @@ def _init_or_resume_manifest(
             "idea_conversation_mode": str(args.idea_conversation_mode),
             "idea_history_window_turns": int(args.idea_history_window_turns),
             "idea_history_max_chars": int(args.idea_history_max_chars),
+            "idea_max_turns": int(args.idea_max_turns),
+            "idea_tools": str(args.idea_tools),
+            "idea_allowed_tools": str(args.idea_allowed_tools),
+            "idea_disallowed_tools": str(args.idea_disallowed_tools),
             "agent_config_path": str(config_path),
             "agent_config_snapshot": config_obj,
             "runs_root": str(run_root.parent),
@@ -3675,6 +3716,18 @@ def main(argv: list[str] | None = None) -> int:
                             str(missing),
                         ]
                         gen_args.extend(["--baseline-context-json", str(baseline_ctx_path)])
+                        idea_max_turns = int(run_config.get("idea_max_turns") or 1)
+                        idea_tools = str(run_config.get("idea_tools") or "").strip()
+                        idea_allowed_tools = str(run_config.get("idea_allowed_tools") or "").strip()
+                        idea_disallowed_tools = str(run_config.get("idea_disallowed_tools") or "").strip()
+                        if idea_max_turns > 0:
+                            gen_args.extend(["--max-turns", str(idea_max_turns)])
+                        if idea_tools:
+                            gen_args.extend(["--tools", idea_tools])
+                        if idea_allowed_tools:
+                            gen_args.extend(["--allowed-tools", _normalize_tool_arg(idea_allowed_tools)])
+                        if idea_disallowed_tools:
+                            gen_args.extend(["--disallowed-tools", _normalize_tool_arg(idea_disallowed_tools)])
                         if idea_conversation_mode != "off":
                             gen_args.extend(["--conversation-mode", str(idea_conversation_mode)])
                             if node_conv_state_path is not None:
