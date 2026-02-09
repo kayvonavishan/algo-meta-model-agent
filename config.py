@@ -26,6 +26,9 @@ class MetaConfig:
     momentum_sharpe_lookback: int = 8     # lookback in Q periods (percentile-rank series), not raw returns
     rank_persistence_weight: float = 0.06  # weight for rank persistence signal
     rank_persistence_lookback: int = 8     # lookback window for rank persistence
+    hit_asymmetry_weight: float = 0.06  # weight for hit rate asymmetry signal
+    hit_asymmetry_lookback: int = 10  # lookback window for asymmetric hit rates
+    hit_asymmetry_threshold: float = 0.75  # percentile threshold for "top" performance
     
     # Confidence (training-free)
     conf_lookback: int = 12

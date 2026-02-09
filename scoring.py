@@ -436,6 +436,33 @@ def compute_scores_for_ticker_v2(
                 mom_sharpe = M / (mom_vol + 1e-6)
                 mom_sharpe_norm = percentile_ranks_across_models_v2(mom_sharpe, axis=0)
 
+        hit_asym_norm = None
+        if cfg.hit_asymmetry_weight != 0:
+            ha_L = min(cfg.hit_asymmetry_lookback, T)
+            if ha_L >= 4:
+                Q_df = pd.DataFrame(Q.T)
+                R_df = pd.DataFrame(R.T)
+                cs_median = R_df.median(axis=1)
+                is_bad_period = cs_median < 0
+                is_good_period = cs_median >= 0
+                is_top = Q_df > cfg.hit_asymmetry_threshold
+
+                top_and_bad = (is_top.T & is_bad_period).T.astype(float)
+                bad_count = is_bad_period.astype(float)
+                roll_top_bad = top_and_bad.rolling(window=ha_L, min_periods=2).sum()
+                roll_bad = bad_count.rolling(window=ha_L, min_periods=2).sum()
+                hit_rate_bad = roll_top_bad.div(roll_bad.where(roll_bad > 0), axis=0).fillna(0.0)
+
+                top_and_good = (is_top.T & is_good_period).T.astype(float)
+                good_count = is_good_period.astype(float)
+                roll_top_good = top_and_good.rolling(window=ha_L, min_periods=2).sum()
+                roll_good = good_count.rolling(window=ha_L, min_periods=2).sum()
+                hit_rate_good = roll_top_good.div(roll_good.where(roll_good > 0), axis=0).fillna(0.0)
+
+                asymmetry = hit_rate_bad / (hit_rate_good + 0.01)
+                asymmetry = asymmetry.clip(0.0, 5.0)
+                hit_asym_norm = percentile_ranks_across_models_v2(asymmetry.to_numpy().T, axis=0)
+
         # 6) Empirical delta (no ML)
         D = np.zeros_like(Q, dtype=float)
         D[:, 1:] = Q[:, 1:] - Q[:, :-1]
@@ -473,6 +500,8 @@ def compute_scores_for_ticker_v2(
             base_forecast = base_forecast + cfg.momentum_sharpe_weight * mom_sharpe_norm
         if rank_persist_norm is not None:
             base_forecast = base_forecast + cfg.rank_persistence_weight * rank_persist_norm
+        if hit_asym_norm is not None:
+            base_forecast = base_forecast + cfg.hit_asymmetry_weight * hit_asym_norm
     
         # 7) Ticker-local baseline
         if cfg.baseline_method == "mean":
