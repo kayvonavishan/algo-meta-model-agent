@@ -17,6 +17,7 @@
   "max_review_rounds": 1,
   "coder_self_check_rounds": 1,
   "sweep_config_limit": 25,
+  "eval_start_stagger_seconds": 120.0,
   "proceed_on_max_review_rounds": true,
   "skip_reviewer": true,
   "prompts": {

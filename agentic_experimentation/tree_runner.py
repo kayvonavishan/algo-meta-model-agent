@@ -67,6 +67,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Optional fairness cap for concurrent eval tasks per parent node.",
     )
     parser.add_argument(
+        "--eval-start-stagger-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Optional stagger delay between eval launches (seconds). "
+            "First eval starts immediately; each subsequent launch waits this delay. "
+            "If omitted, defaults to agent_config.json:eval_start_stagger_seconds (fallback=0)."
+        ),
+    )
+    parser.add_argument(
         "--parallel-backend",
         choices=["threadpool"],
         default="threadpool",
@@ -301,6 +311,26 @@ def _default_idea_max_turns(*, repo_root: Path) -> int:
     except Exception:
         return 6
     return max(1, value)
+
+
+def _default_eval_start_stagger_seconds(*, repo_root: Path, config_arg: str) -> float:
+    cfg_path = (repo_root / str(config_arg)).resolve() if not Path(str(config_arg)).is_absolute() else Path(str(config_arg)).resolve()
+    try:
+        raw = _read_json(cfg_path)
+    except Exception:
+        return 0.0
+    if not isinstance(raw, dict):
+        return 0.0
+    tree_runner_cfg = raw.get("tree_runner")
+    if isinstance(tree_runner_cfg, dict) and "eval_start_stagger_seconds" in tree_runner_cfg:
+        value = tree_runner_cfg.get("eval_start_stagger_seconds")
+    else:
+        value = raw.get("eval_start_stagger_seconds", 0.0)
+    try:
+        parsed = float(value)
+    except Exception:
+        return 0.0
+    return (parsed if parsed >= 0 else 0.0)
 
 
 def _run_git(repo_root: Path, args: list[str]) -> str:
@@ -2433,6 +2463,8 @@ def _ensure_manifest_conversation_schema(
     run_config.setdefault("idea_allowed_tools", str(getattr(args, "idea_allowed_tools", "Read")))
     run_config.setdefault("idea_disallowed_tools", str(getattr(args, "idea_disallowed_tools", "")))
     run_config.setdefault("max_parallel_evals", int(getattr(args, "max_parallel_evals", 1)))
+    _eval_stagger_arg = getattr(args, "eval_start_stagger_seconds", None)
+    run_config.setdefault("eval_start_stagger_seconds", float(0.0 if _eval_stagger_arg is None else _eval_stagger_arg))
     run_config.setdefault("dry_run", bool(getattr(args, "dry_run", False)))
     _max_parallel_per_node = getattr(args, "max_parallel_per_node", None)
     run_config.setdefault("max_parallel_per_node", (int(_max_parallel_per_node) if _max_parallel_per_node is not None else None))
@@ -2718,6 +2750,7 @@ def _tree_summary_markdown(*, run_root: Path, manifest: dict[str, Any]) -> str:
     lines.append(f"- max_depth: {run_config.get('max_depth')}")
     lines.append(f"- beam_width: {run_config.get('beam_width')}")
     lines.append(f"- max_parallel_evals: {run_config.get('max_parallel_evals')}")
+    lines.append(f"- eval_start_stagger_seconds: {run_config.get('eval_start_stagger_seconds')}")
     lines.append(f"- max_parallel_per_node: {run_config.get('max_parallel_per_node')}")
     lines.append(f"- parallel_backend: {run_config.get('parallel_backend')}")
     lines.append(f"- eval_retries: {run_config.get('eval_retries')}")
@@ -3585,6 +3618,7 @@ def _init_or_resume_manifest(
             "max_depth": int(args.max_depth),
             "beam_width": int(args.beam_width),
             "max_parallel_evals": int(args.max_parallel_evals),
+            "eval_start_stagger_seconds": float(args.eval_start_stagger_seconds),
             "max_parallel_per_node": (int(args.max_parallel_per_node) if args.max_parallel_per_node is not None else None),
             "parallel_backend": str(args.parallel_backend),
             "eval_retries": int(args.eval_retries),
@@ -3684,6 +3718,13 @@ def main(argv: list[str] | None = None) -> int:
     from scoring_hooks import compute_score  # type: ignore
 
     repo_root = _resolve_repo_root(Path(__file__).resolve())
+    if args.eval_start_stagger_seconds is None:
+        args.eval_start_stagger_seconds = _default_eval_start_stagger_seconds(
+            repo_root=repo_root,
+            config_arg=str(args.config),
+        )
+    if float(args.eval_start_stagger_seconds) < 0:
+        raise ValueError("--eval-start-stagger-seconds must be >= 0.")
     if args.idea_max_turns is None:
         args.idea_max_turns = _default_idea_max_turns(repo_root=repo_root)
     if int(args.idea_max_turns) < 1:
@@ -3766,6 +3807,12 @@ def main(argv: list[str] | None = None) -> int:
         max_depth = int(run_config.get("max_depth") or 0)
         beam_width = int(run_config.get("beam_width") or 1)
         max_parallel_evals = int(run_config.get("max_parallel_evals") or 1)
+        try:
+            eval_start_stagger_seconds = float(run_config.get("eval_start_stagger_seconds") or 0.0)
+        except Exception:
+            eval_start_stagger_seconds = 0.0
+        if eval_start_stagger_seconds < 0:
+            eval_start_stagger_seconds = 0.0
         _max_parallel_per_node_raw = run_config.get("max_parallel_per_node")
         max_parallel_per_node = (int(_max_parallel_per_node_raw) if _max_parallel_per_node_raw is not None else None)
         parallel_backend = str(run_config.get("parallel_backend") or "threadpool")
@@ -4301,6 +4348,7 @@ def main(argv: list[str] | None = None) -> int:
         running_by_parent: dict[str, int] = {}
         futures: dict[Any, tuple[dict[str, Any], dict[str, Any]]] = {}
         strict_halt_depth = False
+        next_launch_not_before: Optional[float] = None
 
         # Preflight uniqueness checks for per-eval isolation guarantees.
         seen_output_roots: set[str] = set()
@@ -4589,13 +4637,43 @@ def main(argv: list[str] | None = None) -> int:
                     next_idx = _next_dispatch_index()
                     if next_idx is None:
                         break
+                    if eval_start_stagger_seconds > 0 and next_launch_not_before is not None:
+                        remaining = next_launch_not_before - time.monotonic()
+                        if remaining > 0:
+                            break
                     planned = pending_tasks.pop(next_idx)
                     _start_task(planned=planned, pool=pool)
+                    if eval_start_stagger_seconds > 0:
+                        next_launch_not_before = time.monotonic() + float(eval_start_stagger_seconds)
 
                 if not futures:
+                    if (
+                        pending_tasks
+                        and eval_start_stagger_seconds > 0
+                        and next_launch_not_before is not None
+                    ):
+                        remaining = next_launch_not_before - time.monotonic()
+                        if remaining > 0:
+                            time.sleep(min(remaining, 0.5))
+                            continue
                     break
 
-                done, _ = _futures.wait(list(futures.keys()), return_when=_futures.FIRST_COMPLETED)
+                wait_timeout: Optional[float] = None
+                if (
+                    pending_tasks
+                    and len(futures) < int(max_parallel_evals)
+                    and eval_start_stagger_seconds > 0
+                    and next_launch_not_before is not None
+                ):
+                    wait_timeout = max(0.0, next_launch_not_before - time.monotonic())
+
+                done, _ = _futures.wait(
+                    list(futures.keys()),
+                    timeout=wait_timeout,
+                    return_when=_futures.FIRST_COMPLETED,
+                )
+                if not done:
+                    continue
                 for fut in done:
                     planned, eval_rec = futures.pop(fut)
                     parent_id = str(planned.get("parent_node_id") or "")
