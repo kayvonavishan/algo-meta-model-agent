@@ -40,6 +40,11 @@ graph TD
 
 - Instantiate `MetaConfig` defaults (can be tweaked inline at the top of the script).
 - Resolve the aligned returns path (`period_returns_weeks_2_aligned.csv` by default); error if missing.
+- Optional CLI/env inputs:
+  - `--output-dir` or `AGENTIC_OUTPUT_DIR`/`OUTPUT_DIR` to control the run directory.
+  - `--results-csv` or `AGENTIC_RESULTS_CSV` to control the sweep results path.
+  - `--sweep-config-limit` or `AGENTIC_SWEEP_CONFIG_LIMIT` to limit the config grid.
+  - `--per-symbol-outer-trial-cap` to cap per-outer-trial selections (see Section 8).
 
 ### 4.2 Step 1: Load aligned data
 
@@ -60,6 +65,7 @@ graph TD
 
 - Call `run_config_sweep` with `aligned_returns`, `long_df`, and the current `MetaConfig`.
 - Sweep hyperparameters over `n_configs` (default 100) with fixed seed/warmup/oos parameters.
+- Current defaults in `adaptive_vol_momentum.py`: `seed=42`, `warmup_periods=20`, `oos_start_date="2024-11-09"`, `scorecard_every=cfg.scorecard_every`.
 - For each config, select models, compute equity curves, plots, and metrics. Scoring per ticker uses the logic in Section 6 (Score computation for one ticker).
 - Append results to `meta_config_sweep_results.csv`; emit per-config plots/metrics under `avg_trade_return_plots/` and related CSVs.
 
@@ -400,7 +406,43 @@ Config value used here:
 
 - `delta_weight` (from `MetaConfig`)
 
-### 6.6 Step 5: Ticker-local baseline
+### 6.6 Step 5: Additional feature signals (optional)
+
+The base forecast can include several optional, training-free signals. Each is only added when its weight in `MetaConfig` is non-zero.
+
+1) **Efficiency ratio** (`efficiency_weight`)
+   - Computed from raw returns over a rolling lookback:
+     - `eff = net_return / sum(abs(returns))`, clipped to [-1, 1]
+   - Normalized to [0,1] and added to the base forecast.
+
+2) **Win rate** (`win_rate_weight`)
+   - Rolling fraction of positive returns over the lookback window.
+
+3) **Momentum Sharpe** (`momentum_sharpe_weight`)
+   - `mom_sharpe = M / rolling_std(Q)` over `momentum_sharpe_lookback`
+   - Normalized by percentile rank per period.
+
+4) **Rank persistence** (`rank_persistence_weight`)
+   - Rolling fraction of periods where `Q > 0.5` over `rank_persistence_lookback`
+   - Normalized by percentile rank per period.
+
+5) **Hit-rate asymmetry** (`hit_asymmetry_weight`)
+   - Split periods into "good" vs "bad" based on the cross-sectional median return.
+   - Compute hit rates of being above a rank threshold in good vs bad periods.
+   - Asymmetry = bad-hit-rate / (good-hit-rate + 0.01), clipped and normalized.
+
+These components are added to the base forecast after the delta term:
+
+```
+base_forecast = M + delta_weight * D
+base_forecast += efficiency_weight * eff_norm
+base_forecast += win_rate_weight * win_norm
+base_forecast += momentum_sharpe_weight * mom_sharpe_norm
+base_forecast += rank_persistence_weight * rank_persist_norm
+base_forecast += hit_asymmetry_weight * hit_asym_norm
+```
+
+### 6.7 Step 6: Ticker-local baseline
 
 Subtract a cross-sectional baseline to convert to "relative" performance within the ticker:
 
@@ -411,7 +453,7 @@ Intuition:
 
 - Raw scores (`base_{i,t}`) can drift up or down together if the whole ticker is in a strong or weak regime.
 - Subtracting the baseline recenters the scores so we measure *relative* strength within the ticker for that period.
-- This keeps the ranking fair even if the entire ticker’s models are having a great (or terrible) period.
+- This keeps the ranking fair even if the entire ticker's models are having a great (or terrible) period.
 
 Toy example (one period):
 
@@ -431,11 +473,17 @@ Model C: 0.05 - 0.075 = -0.025
 Model D: 0.00 - 0.075 = -0.075
 ```
 
+Optional regime adjustment:
+
+- If `regime_baseline_adjust > 0`, the baseline is shifted by a z-score of the rolling standard deviation of `base_forecast`.
+- This uses `regime_dispersion_lookback` and clips the adjustment to [-1.5, 1.5].
+
 Config value used here:
 
 - `baseline_method` (`median` or `mean`)
+- `regime_baseline_adjust`, `regime_dispersion_lookback`
 
-### 6.7 Step 6: Confidence (training-free)
+### 6.8 Step 7: Confidence (training-free)
 
 Confidence is higher when a model's rank is stable and participation is high:
 
@@ -446,7 +494,7 @@ Confidence is higher when a model's rank is stable and participation is high:
 
 Intuition:
 
-- If a model’s rank is steady over the last `conf_lookback` periods, its `std_{i,t}` is small.
+- If a model's rank is steady over the last `conf_lookback` periods, its `std_{i,t}` is small.
 - Small std means the model is consistently good (or consistently bad), which is more reliable than a model that whipsaws.
 - `participation_{i,t}` downweights models that are missing lots of data.
 - The final `CONF_{i,t}` is a percentile rank so confidence is compared *within* the ticker at each period.
@@ -476,7 +524,7 @@ Config values used here:
 - `conf_lookback` (window length)
 - `conf_eps` (stability floor to avoid divide-by-zero)
 
-### 6.8 Step 7: Risk penalty (downside CVaR)
+### 6.9 Step 8: Risk penalty (downside CVaR)
 
 A risk penalty is computed on rank residuals:
 
@@ -520,7 +568,13 @@ Config values used here:
 - `cvar_risk_aversion` (penalty strength)
 - `cvar_window_stride` (optional downsampling inside the window for speed)
 
-### 6.9 Step 8: Uniqueness weighting
+Additional downside volatility cap (optional):
+
+- If `downside_vol_cap_weight > 0`, a penalty is computed from the rolling std of negative returns.
+- A z-score threshold (`downside_vol_threshold_z`) controls when the penalty activates.
+- This adds an additional penalty term to the final score.
+
+### 6.10 Step 9: Uniqueness weighting
 
 `compute_uniqueness_weights` currently returns all-ones to avoid leakage. The intended behavior is:
 
@@ -529,11 +583,11 @@ Config values used here:
 
 If activated, this scales the final score by a per-model weight.
 
-### 6.10 Step 9: Final score and causal shift
+### 6.11 Step 10: Final score and causal shift
 
 Final score:
 
-- `S_{i,t} = uniq_i * (rel_{i,t} * CONF_{i,t} - risk_pen_{i,t})`
+- `S_{i,t} = uniq_i * (rel_{i,t} * CONF_{i,t} - risk_pen_{i,t} - downside_vol_pen_{i,t})`
 
 Then the score is shifted by 1 period to keep it causal:
 
@@ -544,6 +598,7 @@ Intuition:
 - `rel_{i,t}` says whether a model is better or worse than its peers this period.
 - `CONF_{i,t}` scales that by how *stable* the model has been.
 - `risk_pen_{i,t}` subtracts a penalty for downside rank shocks.
+- `downside_vol_pen_{i,t}` subtracts a penalty for spikes in downside volatility (if enabled).
 - `uniq_i` (when enabled) shrinks scores for highly redundant models.
 
 So the final score is: "relative strength, adjusted for stability, penalized for downside risk, and de-duplicated."
@@ -569,7 +624,7 @@ scores_df = scores_df.shift(axis=1)
 ticker_score = ticker_score.shift(1)
 ```
 
-### 6.11 Step 10: Ticker score
+### 6.12 Step 11: Ticker score
 
 For each period, compute a per-ticker gate score:
 
@@ -584,11 +639,12 @@ This selection runs once per config during the sweep (see `select_models_univers
 1) Build a long table of `(ticker, model_id, period, score)`.
 2) For each ticker, compute `ticker_score` as median of top `top_m_for_ticker_gate` model scores.
 3) Optionally filter tickers by `min_ticker_score`.
-4) For each period, rank tickers by ticker_score.
+4) For each period, rank tickers by `ticker_score` (deterministic tie-breakers).
 5) Choose tickers for the period. If `include_n_top_tickers` is `None`, keep all tickers; otherwise keep the top `include_n_top_tickers` tickers by `ticker_score`.
 6) From chosen tickers, rank models within each ticker by score.
-7) Apply `per_ticker_cap` if set.
-8) Global ranking by score across tickers; keep top `top_n_global`.
+7) Optional `per_symbol_outer_trial_cap`: infer an "outer trial" id from numeric parts of `model_id` and cap per (ticker, period, outer trial).
+8) Apply `per_ticker_cap` if set.
+9) Global ranking by score across tickers; keep top `top_n_global` (deterministic tie-breakers).
 
 This intentionally balances breadth (multiple tickers) and depth (best models) per period.
 
@@ -681,9 +737,12 @@ These are in `MetaConfig`:
 
 - `vol_window`, `alpha_low`, `alpha_high`, `alpha_smooth`: adaptive alpha for momentum.
 - `momentum_lookback`, `delta_weight`: rank momentum and acceleration.
+- `efficiency_weight`, `win_rate_weight`, `momentum_sharpe_weight`, `rank_persistence_weight`, `hit_asymmetry_weight`: optional feature signals.
 - `conf_lookback`, `conf_eps`: confidence window and stability control.
-- `risk_lookback`, `cvar_alpha`, `cvar_risk_aversion`: downside risk penalty.
-- `top_n_global`, `top_m_for_ticker_gate`, `per_ticker_cap`, `min_ticker_score`: selection rules.
+- `risk_lookback`, `cvar_alpha`, `cvar_risk_aversion`, `cvar_window_stride`: downside risk penalty.
+- `downside_vol_lookback`, `downside_vol_threshold_z`, `downside_vol_cap_weight`: downside volatility cap penalty.
+- `regime_baseline_adjust`, `regime_dispersion_lookback`: regime-aware baseline adjustment.
+- `top_n_global`, `top_m_for_ticker_gate`, `per_ticker_cap`, `min_ticker_score`, `include_n_top_tickers`, `per_symbol_outer_trial_cap`: selection rules.
 
 ## 15. Pointers into code
 
