@@ -1253,6 +1253,10 @@ async def _main_async():
                             "review_issues": review_issues,
                         }
                     )
+                    # In skip-reviewer mode, this is a local gate result (no LLM reviewer call).
+                    # Stop after first no-diff outcome to avoid confusing extra review_round_N files.
+                    if skip_reviewer:
+                        break
                     continue
 
                 if skip_reviewer:
