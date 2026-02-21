@@ -49,6 +49,35 @@ def rolling_zscore_v2(series: np.ndarray, window: int) -> np.ndarray:
         return z
 
 
+def compute_efficiency_ratio(returns: pd.DataFrame) -> pd.Series:
+    """
+    Efficiency ratio: net return / sum(abs(returns)) per strategy.
+    Values are clipped to [-1, 1]; empty or flat series map to 0.
+    """
+    net = returns.sum(axis=0, skipna=True)
+    path = returns.abs().sum(axis=0, skipna=True)
+    counts = returns.count(axis=0)
+    eff = net / path
+    eff = eff.where(path != 0.0, 0.0)
+    eff = eff.where(counts > 0, 0.0)
+    eff = eff.fillna(0.0)
+    return eff.clip(-1.0, 1.0)
+
+
+def compute_win_rate(returns: pd.DataFrame, lookback: int) -> np.ndarray:
+    """
+    Compute rolling win-rate (fraction of positive returns) over lookback window.
+    Returns matrix of shape (n_models, T) with values in [0, 1].
+    """
+    if lookback <= 0:
+        raise ValueError("lookback must be positive.")
+    positive = returns.gt(0).astype(float)
+    positive = positive.where(returns.notna())
+    win_rate = positive.rolling(window=lookback, min_periods=1).mean()
+    win_rate = win_rate.fillna(0.0)
+    return win_rate.to_numpy().T
+
+
 def map_z_to_alpha(z: float, cfg: MetaConfig) -> float:
     if np.isnan(z):
         return 0.5 * (cfg.alpha_low + cfg.alpha_high)
@@ -301,6 +330,33 @@ def downside_cvar_matrix_v2(
         return out
 
 
+def _compute_downside_volatility_penalty(
+    R: np.ndarray,
+    lookback: int,
+    threshold_z: float,
+    weight: float,
+) -> np.ndarray | None:
+    if weight <= 0:
+        return None
+    if lookback <= 0:
+        return None
+    T = R.shape[1]
+    L = min(lookback, T)
+    if L < 2:
+        return None
+    R_negative = np.where(R < 0, R, np.nan)
+    R_neg_df = pd.DataFrame(R_negative.T)
+    downside_std = R_neg_df.rolling(window=L, min_periods=2).std(ddof=1).to_numpy().T
+    ds_series = pd.DataFrame(downside_std.T)
+    roll_mean = ds_series.rolling(window=L, min_periods=2).mean().to_numpy().T
+    roll_std_ds = ds_series.rolling(window=L, min_periods=2).std(ddof=1).to_numpy().T
+    z_downside = (downside_std - roll_mean) / (roll_std_ds + 1e-8)
+    excess_z = np.maximum(0, z_downside - threshold_z)
+    penalty = weight * excess_z
+    penalty = np.where(np.isfinite(penalty), penalty, 0.0)
+    return penalty
+
+
 def compute_scores_for_ticker_v2(
     returns_matrix: pd.DataFrame,
     cfg: MetaConfig,
@@ -315,6 +371,12 @@ def compute_scores_for_ticker_v2(
         periods = list(sorted_matrix.columns)
         R = sorted_matrix.to_numpy(dtype=float)
         n_models, T = R.shape
+        downside_vol_pen = _compute_downside_volatility_penalty(
+            R,
+            cfg.downside_vol_lookback,
+            cfg.downside_vol_threshold_z,
+            cfg.downside_vol_cap_weight,
+        )
     
         # 1) Per-period dispersion (within ticker) using MAD
         counts = np.sum(~np.isnan(R), axis=0)
@@ -336,6 +398,7 @@ def compute_scores_for_ticker_v2(
         alpha_t = ema_smooth(alpha_raw, cfg.alpha_smooth)
     
         # 4) Percentile ranks per period across models
+        # Q shape: (n_models, T) with time axis last (most recent at end).
         Q = percentile_ranks_across_models_v2(R, axis=0)
     
         # 5) Adaptive EWMA momentum on Q (time-varying alpha)
@@ -346,17 +409,120 @@ def compute_scores_for_ticker_v2(
                 M = _adaptive_momentum_window(Q, alpha_t, cfg.momentum_lookback)
         else:
             M = _adaptive_momentum_recursive(Q, alpha_t)
+
+        # M shape: (n_models, T) adaptive momentum per period.
+
+        rank_persist_norm = None
+        if cfg.rank_persistence_weight != 0:
+            rp_L = min(cfg.rank_persistence_lookback, T)
+            if rp_L >= 2:
+                above_median = (Q > 0.5).astype(float)
+                above_median = np.where(np.isnan(Q), np.nan, above_median)
+                Q_above_df = pd.DataFrame(above_median.T)
+                rank_persist = Q_above_df.rolling(window=rp_L, min_periods=2).mean().to_numpy().T
+                rank_persist_norm = percentile_ranks_across_models_v2(rank_persist, axis=0)
     
+        mom_sharpe_norm = None
+        if cfg.momentum_sharpe_weight != 0:
+            L = min(cfg.momentum_sharpe_lookback, Q.shape[1])
+            if L >= 2:
+                Q_df = pd.DataFrame(Q)
+                mom_vol = Q_df.rolling(
+                    window=L,
+                    axis=1,
+                    min_periods=2,
+                ).std(ddof=1).to_numpy()
+                mom_vol[~np.isfinite(mom_vol)] = np.inf
+                mom_sharpe = M / (mom_vol + 1e-6)
+                mom_sharpe_norm = percentile_ranks_across_models_v2(mom_sharpe, axis=0)
+
+        hit_asym_norm = None
+        if cfg.hit_asymmetry_weight != 0:
+            ha_L = min(cfg.hit_asymmetry_lookback, T)
+            if ha_L >= 4:
+                Q_df = pd.DataFrame(Q.T)
+                R_df = pd.DataFrame(R.T)
+                cs_median = R_df.median(axis=1)
+                is_bad_period = cs_median < 0
+                is_good_period = cs_median >= 0
+                is_top = Q_df > cfg.hit_asymmetry_threshold
+
+                top_and_bad = (is_top.T & is_bad_period).T.astype(float)
+                bad_count = is_bad_period.astype(float)
+                roll_top_bad = top_and_bad.rolling(window=ha_L, min_periods=2).sum()
+                roll_bad = bad_count.rolling(window=ha_L, min_periods=2).sum()
+                hit_rate_bad = roll_top_bad.div(roll_bad.where(roll_bad > 0), axis=0).fillna(0.0)
+
+                top_and_good = (is_top.T & is_good_period).T.astype(float)
+                good_count = is_good_period.astype(float)
+                roll_top_good = top_and_good.rolling(window=ha_L, min_periods=2).sum()
+                roll_good = good_count.rolling(window=ha_L, min_periods=2).sum()
+                hit_rate_good = roll_top_good.div(roll_good.where(roll_good > 0), axis=0).fillna(0.0)
+
+                asymmetry = hit_rate_bad / (hit_rate_good + 0.01)
+                asymmetry = asymmetry.clip(0.0, 5.0)
+                hit_asym_norm = percentile_ranks_across_models_v2(asymmetry.to_numpy().T, axis=0)
+
         # 6) Empirical delta (no ML)
         D = np.zeros_like(Q, dtype=float)
         D[:, 1:] = Q[:, 1:] - Q[:, :-1]
+
+        # 6b) Efficiency ratio (momentum smoothness) over a rolling window
+        returns_t = None
+        eff_norm = None
+        win_norm = None
+        if cfg.efficiency_weight != 0 or cfg.win_rate_weight != 0:
+            returns_t = sorted_matrix.T
+        if cfg.efficiency_weight != 0:
+            eff_lookback = cfg.momentum_lookback if cfg.enable_momentum_lookback else T
+            if eff_lookback <= 0:
+                eff_lookback = max(1, T)
+            net = returns_t.rolling(window=eff_lookback, min_periods=1).sum()
+            path = returns_t.abs().rolling(window=eff_lookback, min_periods=1).sum()
+            counts = returns_t.rolling(window=eff_lookback, min_periods=1).count()
+            eff = net.divide(path)
+            eff = eff.where(path != 0.0, 0.0)
+            eff = eff.where(counts > 0, 0.0)
+            eff = eff.fillna(0.0).clip(-1.0, 1.0)
+            eff_norm = ((eff + 1.0) * 0.5).clip(0.0, 1.0).to_numpy().T
+        if cfg.win_rate_weight != 0:
+            wr_lookback = cfg.momentum_lookback if cfg.enable_momentum_lookback else T
+            if wr_lookback <= 0:
+                wr_lookback = max(1, T)
+            win_norm = compute_win_rate(returns_t, wr_lookback)
+
         base_forecast = M + cfg.delta_weight * D
+        if eff_norm is not None:
+            base_forecast = base_forecast + cfg.efficiency_weight * eff_norm
+        if win_norm is not None:
+            base_forecast = base_forecast + cfg.win_rate_weight * win_norm
+        if mom_sharpe_norm is not None:
+            base_forecast = base_forecast + cfg.momentum_sharpe_weight * mom_sharpe_norm
+        if rank_persist_norm is not None:
+            base_forecast = base_forecast + cfg.rank_persistence_weight * rank_persist_norm
+        if hit_asym_norm is not None:
+            base_forecast = base_forecast + cfg.hit_asymmetry_weight * hit_asym_norm
     
         # 7) Ticker-local baseline
         if cfg.baseline_method == "mean":
             baseline = np.nanmean(base_forecast, axis=0)
         else:
             baseline = np.nanmedian(base_forecast, axis=0)
+        if cfg.regime_baseline_adjust > 0:
+            forecast_std = np.nanstd(base_forecast, axis=0)
+            L = min(cfg.regime_dispersion_lookback, len(forecast_std))
+            if L >= 2:
+                fs_series = pd.Series(forecast_std, dtype=float)
+                roll = fs_series.rolling(window=L, min_periods=2)
+                roll_mean = roll.mean().to_numpy()
+                roll_std = roll.std(ddof=1).to_numpy()
+                z_regime = (forecast_std - roll_mean) / (roll_std + 1e-8)
+                baseline_shift = cfg.regime_baseline_adjust * np.clip(z_regime, -1.5, 1.5)
+                baseline_shift = np.where(np.isfinite(baseline_shift), baseline_shift, 0.0)
+                if isinstance(baseline, pd.Series):
+                    baseline = baseline + pd.Series(baseline_shift, index=baseline.index)
+                else:
+                    baseline = baseline + baseline_shift
         rel = base_forecast - baseline
     
         # 8) Confidence (training-free)
@@ -387,6 +553,8 @@ def compute_scores_for_ticker_v2(
         uniq_w = compute_uniqueness_weights(returns_matrix, cfg).to_numpy(dtype=float)
     
         SCORE = (rel * CONF) - risk_pen
+        if downside_vol_pen is not None:
+            SCORE = SCORE - downside_vol_pen
         SCORE = (uniq_w[:, None] * SCORE)
         scores_df = pd.DataFrame(SCORE, index=models, columns=periods)
     
