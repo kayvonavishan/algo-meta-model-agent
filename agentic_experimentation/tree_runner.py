@@ -4136,12 +4136,14 @@ def main(argv: list[str] | None = None) -> int:
 
             # Dedupe seed: avoid repeating an identical idea already present in ancestors (and optionally globally).
             dedupe_scope = str(getattr(args, "dedupe_scope", "node_plus_ancestors"))
-            seed_hashes = _collect_dedupe_hashes(manifest, node_id=node_id, scope=dedupe_scope)
+            rerun_mode = bool(args.rerun_evals)
+            seed_hashes = set() if rerun_mode else _collect_dedupe_hashes(manifest, node_id=node_id, scope=dedupe_scope)
             node.setdefault("dedupe", {})
             if isinstance(node.get("dedupe"), dict):
                 node["dedupe"]["policy"] = {
                     "scope": dedupe_scope,
                     "normalization": "lower+trim+drop_blank+normalize_bullets",
+                    "rerun_bypass": rerun_mode,
                 }
                 node["dedupe"].setdefault("skipped", [])
             seen_hashes = set(seed_hashes)
