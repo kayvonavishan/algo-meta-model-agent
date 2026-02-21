@@ -198,6 +198,27 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Comma or space-separated denylist of tool names for idea generation.",
     )
     parser.add_argument(
+        "--area-id",
+        default="default",
+        help="Logical area identifier for idea history (used by the idea ledger).",
+    )
+    parser.add_argument(
+        "--idea-ledger-root",
+        default="agentic_experimentation/idea_ledger",
+        help="Root directory for persistent idea history (default: agentic_experimentation/idea_ledger).",
+    )
+    parser.add_argument(
+        "--idea-ledger-context-limit",
+        type=int,
+        default=200,
+        help="Max number of recent ideas to keep in the ledger context directory.",
+    )
+    parser.add_argument(
+        "--ideas-context-strategy",
+        default="node_plus_ancestors+ledger",
+        help="Context sources for idea generation (e.g., node_plus_ancestors, ledger, node_plus_ancestors+ledger).",
+    )
+    parser.add_argument(
         "--dedupe-scope",
         choices=["node_plus_ancestors", "global", "none"],
         default="node_plus_ancestors",
@@ -430,6 +451,182 @@ def _llm_debug_log_paths(*, run_root: Path, repo_root: Path) -> dict[str, Option
     consolidated = _ensure_log_dirs(run_root)["llm_root"] / "openai_llm_debug.log"
     return {"primary": consolidated, "secondary": None}
 
+
+def _resolve_idea_ledger_root(*, repo_root: Path, raw_root: str) -> Path:
+    raw = str(raw_root or "").strip()
+    if not raw:
+        raw = "agentic_experimentation/idea_ledger"
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = repo_root / p
+    return p.resolve()
+
+
+def _ensure_idea_ledger_manifest(
+    *,
+    manifest: dict[str, Any],
+    repo_root: Path,
+    run_root: Path,
+    area_id: str,
+    ledger_root: Path,
+    context_limit: int,
+    ideas_context_strategy: str,
+) -> dict[str, Any]:
+    ledger = manifest.get("idea_ledger")
+    if not isinstance(ledger, dict):
+        ledger = {}
+
+    area_id = str(area_id or "default").strip() or "default"
+    ledger_root = Path(ledger_root)
+    area_root = ledger_root / area_id
+    runs_root = area_root / "runs"
+    context_dir = area_root / "context"
+    index_path = area_root / "index.jsonl"
+
+    for p in (ledger_root, area_root, runs_root, context_dir):
+        _safe_mkdir(p)
+
+    ledger.update(
+        {
+            "root": str(ledger_root),
+            "area_id": area_id,
+            "area_root": str(area_root),
+            "runs_root": str(runs_root),
+            "context_dir": str(context_dir),
+            "index_path": str(index_path),
+            "context_limit": int(context_limit),
+        }
+    )
+    manifest["idea_ledger"] = ledger
+
+    run_config = manifest.get("run_config")
+    if not isinstance(run_config, dict):
+        run_config = {}
+        manifest["run_config"] = run_config
+    run_config.setdefault("ideas_context_strategy", str(ideas_context_strategy))
+    run_config.setdefault("idea_ledger_root", str(ledger_root))
+    run_config.setdefault("idea_ledger_area_id", area_id)
+    run_config.setdefault("idea_ledger_context_limit", int(context_limit))
+    run_config.setdefault("node_ideas_root_dir", str(_ensure_standard_run_dirs(run_root)["node_ideas_root"]))
+    return ledger
+
+
+def _update_ledger_context_dir(*, context_dir: Path, archive_path: Path, limit: int) -> Optional[Path]:
+    try:
+        context_dir.mkdir(parents=True, exist_ok=True)
+        if not archive_path.exists():
+            return None
+        dest_name = archive_path.name
+        dest = context_dir / dest_name
+        if not dest.exists():
+            shutil.copy2(archive_path, dest)
+        # Enforce a soft cap by removing oldest files.
+        if limit and limit > 0:
+            items = [p for p in context_dir.glob("*.md") if p.is_file()]
+            if len(items) > limit:
+                items.sort(key=lambda p: p.stat().st_mtime)
+                for p in items[: max(0, len(items) - int(limit))]:
+                    with contextlib.suppress(Exception):
+                        p.unlink()
+        return dest
+    except Exception:
+        return None
+
+
+def _record_idea_ledger_event(
+    *,
+    manifest: dict[str, Any],
+    run_root: Path,
+    eval_rec: dict[str, Any],
+    node_rec: dict[str, Any],
+    idea_path: Path,
+    event_type: str,
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    ledger = manifest.get("idea_ledger")
+    if not isinstance(ledger, dict):
+        return
+    index_path = Path(str(ledger.get("index_path") or "")).expanduser()
+    if not index_path:
+        return
+
+    tree_run_id = str(manifest.get("tree_run_id") or "")
+    eval_id = str(eval_rec.get("eval_id") or "")
+    if not tree_run_id or not eval_id:
+        return
+
+    record_id = f"{tree_run_id}:{eval_id}"
+    area_id = str(ledger.get("area_id") or "")
+    node_id = str(node_rec.get("node_id") or "")
+    parent_node_id = node_rec.get("parent_node_id")
+    depth = node_rec.get("depth")
+    idea_text = ""
+    idea_hash = None
+    try:
+        idea_text = idea_path.read_text(encoding="utf-8", errors="replace")
+        idea_hash = _idea_text_hash(idea_path)
+    except Exception:
+        idea_text = ""
+        idea_hash = None
+
+    idea_archive_path = None
+    runs_root = Path(str(ledger.get("runs_root") or "")).expanduser()
+    if runs_root:
+        node_dir = runs_root / tree_run_id / "node_ideas" / (node_id or "unknown")
+        _safe_mkdir(node_dir)
+        archive_path = node_dir / idea_path.name
+        try:
+            if not archive_path.exists():
+                shutil.copy2(idea_path, archive_path)
+            idea_archive_path = str(archive_path)
+        except Exception:
+            idea_archive_path = None
+
+    context_path = None
+    context_dir_raw = ledger.get("context_dir")
+    if context_dir_raw and idea_archive_path:
+        context_dir = Path(str(context_dir_raw)).expanduser()
+        context_path = _update_ledger_context_dir(
+            context_dir=context_dir,
+            archive_path=Path(str(idea_archive_path)),
+            limit=int(ledger.get("context_limit") or 0),
+        )
+
+    record = {
+        "record_id": record_id,
+        "event_type": str(event_type),
+        "ts": _utc_now_iso(),
+        "area_id": area_id,
+        "tree_run_id": tree_run_id,
+        "eval_id": eval_id,
+        "node_id": node_id,
+        "parent_node_id": (str(parent_node_id) if parent_node_id is not None else None),
+        "depth": depth,
+        "idea_path": str(idea_path),
+        "idea_archive_path": idea_archive_path,
+        "idea_context_path": (str(context_path) if context_path else None),
+        "idea_hash": idea_hash,
+        "idea_text": idea_text.strip(),
+        "idea_chain": list(node_rec.get("idea_chain") or []),
+        "path_node_ids": _collect_ancestor_node_ids(manifest, node_id) if node_id else [],
+        "root_commit": str((manifest.get("root") or {}).get("root_commit") or ""),
+        "candidate_commit": eval_rec.get("candidate_commit"),
+        "status": eval_rec.get("status"),
+        "decision": eval_rec.get("decision"),
+    }
+    if extra and isinstance(extra, dict):
+        record["extra"] = extra
+
+    _append_jsonl(index_path, record)
+    eval_rec.setdefault("idea_ledger", {})
+    if isinstance(eval_rec.get("idea_ledger"), dict):
+        eval_rec["idea_ledger"]["record_id"] = record_id
+        eval_rec["idea_ledger"]["last_event_type"] = str(event_type)
+        eval_rec["idea_ledger"]["last_recorded_at"] = record["ts"]
+        if idea_archive_path:
+            eval_rec["idea_ledger"]["idea_archive_path"] = idea_archive_path
+        if context_path:
+            eval_rec["idea_ledger"]["idea_context_path"] = str(context_path)
 
 
 
@@ -1131,6 +1328,14 @@ def _collect_context_idea_dirs(manifest: dict[str, Any], node_id: str) -> list[s
         d = rec.get("node_ideas_dir")
         if d and str(d) not in dirs:
             dirs.append(str(d))
+    run_config = manifest.get("run_config") or {}
+    strategy = str(run_config.get("ideas_context_strategy") or "node_plus_ancestors").lower()
+    if "ledger" in strategy:
+        ledger = manifest.get("idea_ledger") or {}
+        if isinstance(ledger, dict):
+            ctx = str(ledger.get("context_dir") or "").strip()
+            if ctx and ctx not in dirs:
+                dirs.append(ctx)
     return dirs
 
 
@@ -2508,6 +2713,9 @@ def _tree_summary_markdown(*, run_root: Path, manifest: dict[str, Any]) -> str:
     lines.append(f"- idea_tools: {run_config.get('idea_tools')}")
     lines.append(f"- idea_allowed_tools: {run_config.get('idea_allowed_tools')}")
     lines.append(f"- idea_disallowed_tools: {run_config.get('idea_disallowed_tools')}")
+    lines.append(f"- idea_ledger_root: {run_config.get('idea_ledger_root')}")
+    lines.append(f"- idea_ledger_area_id: {run_config.get('idea_ledger_area_id')}")
+    lines.append(f"- idea_ledger_context_limit: {run_config.get('idea_ledger_context_limit')}")
     lines.append(f"- conversation_debug_log_jsonl_path: {conversation_config.get('debug_log_jsonl_path')}")
     lines.append(f"- stop_reason: {state.get('stop_reason')}")
     lines.append("")
@@ -3282,6 +3490,16 @@ def _init_or_resume_manifest(
                 f"but args.tree_run_id is {args.tree_run_id!r}"
             )
         _ensure_manifest_conversation_schema(manifest=manifest, run_root=run_root, args=args)
+        ledger_root = _resolve_idea_ledger_root(repo_root=repo_root, raw_root=str(getattr(args, "idea_ledger_root", "")))
+        _ensure_idea_ledger_manifest(
+            manifest=manifest,
+            repo_root=repo_root,
+            run_root=run_root,
+            area_id=str(getattr(args, "area_id", "default")),
+            ledger_root=ledger_root,
+            context_limit=int(getattr(args, "idea_ledger_context_limit", 200)),
+            ideas_context_strategy=str(getattr(args, "ideas_context_strategy", "node_plus_ancestors+ledger")),
+        )
         _manifest_write(run_root, manifest)
         return manifest
 
@@ -3334,6 +3552,10 @@ def _init_or_resume_manifest(
     }
 
     tree_run_id = str(args.tree_run_id)
+    ledger_root = _resolve_idea_ledger_root(repo_root=repo_root, raw_root=str(getattr(args, "idea_ledger_root", "")))
+    area_id = str(getattr(args, "area_id", "default"))
+    context_limit = int(getattr(args, "idea_ledger_context_limit", 200))
+    ideas_context_strategy = str(getattr(args, "ideas_context_strategy", "node_plus_ancestors+ledger"))
     manifest = {
         "manifest_version": 3,
         "tree_run_id": tree_run_id,
@@ -3357,7 +3579,7 @@ def _init_or_resume_manifest(
             "lock_stale_seconds": int(args.lock_stale_seconds),
             "artifact_policy": artifact_policy,
             "node_ideas_root_dir": str(paths["node_ideas_root"]),
-            "ideas_context_strategy": "node_plus_ancestors",
+            "ideas_context_strategy": ideas_context_strategy,
             "idea_conversation_mode": str(args.idea_conversation_mode),
             "idea_history_window_turns": int(args.idea_history_window_turns),
             "idea_history_max_chars": int(args.idea_history_max_chars),
@@ -3365,6 +3587,9 @@ def _init_or_resume_manifest(
             "idea_tools": str(args.idea_tools),
             "idea_allowed_tools": str(args.idea_allowed_tools),
             "idea_disallowed_tools": str(args.idea_disallowed_tools),
+            "idea_ledger_root": str(ledger_root),
+            "idea_ledger_area_id": area_id,
+            "idea_ledger_context_limit": int(context_limit),
             "agent_config_path": str(config_path),
             "agent_config_snapshot": config_obj,
             "runs_root": str(run_root.parent),
@@ -3402,6 +3627,15 @@ def _init_or_resume_manifest(
         "evaluations": {},
     }
 
+    _ensure_idea_ledger_manifest(
+        manifest=manifest,
+        repo_root=repo_root,
+        run_root=run_root,
+        area_id=area_id,
+        ledger_root=ledger_root,
+        context_limit=context_limit,
+        ideas_context_strategy=ideas_context_strategy,
+    )
     _ensure_manifest_conversation_schema(manifest=manifest, run_root=run_root, args=args)
     _ensure_node_conversation(
         manifest=manifest,
@@ -3913,6 +4147,20 @@ def main(argv: list[str] | None = None) -> int:
                 if idea_generation_turn_id:
                     eval_rec["idea_generation_turn_id"] = str(idea_generation_turn_id)
 
+                ledger_state = eval_rec.get("idea_ledger")
+                if not isinstance(ledger_state, dict) or not ledger_state.get("queued_recorded"):
+                    _record_idea_ledger_event(
+                        manifest=manifest,
+                        run_root=run_root,
+                        eval_rec=eval_rec,
+                        node_rec=node,
+                        idea_path=Path(str(idea_path)),
+                        event_type="queued",
+                    )
+                    eval_rec.setdefault("idea_ledger", {})
+                    if isinstance(eval_rec.get("idea_ledger"), dict):
+                        eval_rec["idea_ledger"]["queued_recorded"] = True
+
                 task_rec = {
                     "eval_id": str(eval_id),
                     "parent_node_id": str(node_id),
@@ -4287,6 +4535,25 @@ def main(argv: list[str] | None = None) -> int:
                     attempt=int(eval_rec.get("attempt") or 0),
                     reason=("timeout" if timed_out else "terminal_failure"),
                 )
+
+            if status_val == "completed" or terminal_failure:
+                ledger_state = eval_rec.get("idea_ledger")
+                if not isinstance(ledger_state, dict) or not ledger_state.get("result_recorded"):
+                    parent_id = str(eval_rec.get("parent_node_id") or "")
+                    node_rec = (manifest.get("nodes") or {}).get(parent_id) or {}
+                    idea_path_raw = eval_rec.get("idea_path") or ""
+                    _record_idea_ledger_event(
+                        manifest=manifest,
+                        run_root=run_root,
+                        eval_rec=eval_rec,
+                        node_rec=(node_rec if isinstance(node_rec, dict) else {}),
+                        idea_path=Path(str(idea_path_raw)),
+                        event_type=("completed" if status_val == "completed" else "failed"),
+                        extra={"timed_out": bool(timed_out)},
+                    )
+                    eval_rec.setdefault("idea_ledger", {})
+                    if isinstance(eval_rec.get("idea_ledger"), dict):
+                        eval_rec["idea_ledger"]["result_recorded"] = True
 
             _refresh_depth_progress(manifest=manifest, depth=int(current_depth))
             _manifest_write(run_root, manifest)
