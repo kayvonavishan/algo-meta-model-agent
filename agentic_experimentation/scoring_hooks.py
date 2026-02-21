@@ -167,9 +167,9 @@ def _recommend_follow_up(column_deltas):
     primary_metric = "core_topN_sharpe"
     metrics = [
         # Primary metric (used for primary_ok gating).
-        ("core_topN_sharpe", "higher", 1.5),
+        ("core_topN_sharpe", "higher", 2.5),
         # Supporting return metrics.
-        ("mean_topN_avg_return_per_trade_pct_oos", "higher", 1.0),
+        ("mean_topN_avg_return_per_trade_pct_oos", "higher", 0.5),
         ("mean_topN_avg_return_per_trade_pct", "higher", 1.0),
         ("core_topN_sortino", "higher", 1.0),
         ("core_topN_calmar", "higher", 1.0),

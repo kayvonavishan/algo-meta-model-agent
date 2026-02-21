@@ -18,6 +18,7 @@
   "coder_self_check_rounds": 1,
   "sweep_config_limit": 25,
   "proceed_on_max_review_rounds": true,
+  "skip_reviewer": true,
   "prompts": {
     "planner": "agentic_experimentation\\prompts\\planner\\planner_prompt.txt",
     "coder": "agentic_experimentation\\prompts\\coder\\coder_prompt.txt",
