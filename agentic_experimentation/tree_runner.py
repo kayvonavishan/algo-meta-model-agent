@@ -3879,14 +3879,29 @@ def main(argv: list[str] | None = None) -> int:
         if expanded_set:
             _append_tree_log(run_root, f"depth_resume depth={current_depth} already_expanded={sorted(expanded_set)}")
 
-        # Auto-repair: if a previous run ended with empty_frontier at this depth but left
-        # gate/rank decisions unset (common after a crash or a logic bug), reconstruct the
-        # frontier from expanded nodes and re-run promotion logic.
-        #
-        # This is intentionally narrow: it only triggers when `passed_gate` is still None.
-        if str(state.get("stop_reason") or "") == "empty_frontier" and not frontier and current_depth < max_depth and expanded_set:
-            candidate_frontier = sorted(str(x) for x in expanded_set)
-            if bool(args.rerun_evals):
+        # If rerunning evals, reopen this depth when it previously ended with empty_frontier.
+        if bool(args.rerun_evals) and str(state.get("stop_reason") or "") == "empty_frontier" and current_depth < max_depth:
+            candidate_frontier: list[str] = []
+            if frontier:
+                candidate_frontier = sorted(str(x) for x in frontier)
+            elif expanded_set:
+                candidate_frontier = sorted(str(x) for x in expanded_set)
+            else:
+                nodes_for_depth: list[str] = []
+                nodes_obj = manifest.get("nodes") or {}
+                if isinstance(nodes_obj, dict):
+                    for nid, nrec in nodes_obj.items():
+                        if not isinstance(nrec, dict):
+                            continue
+                        try:
+                            ndepth = int(nrec.get("depth") or -1)
+                        except Exception:
+                            continue
+                        if ndepth == int(current_depth):
+                            nodes_for_depth.append(str(nid))
+                candidate_frontier = sorted(nodes_for_depth)
+
+            if candidate_frontier:
                 _append_tree_log(
                     run_root,
                     f"rerun_evals_reopen_depth depth={current_depth} restored_frontier={candidate_frontier}",
@@ -3923,6 +3938,13 @@ def main(argv: list[str] | None = None) -> int:
                     existing_task_plan.pop(str(current_depth), None)
                 _manifest_write(run_root, manifest)
 
+        # Auto-repair: if a previous run ended with empty_frontier at this depth but left
+        # gate/rank decisions unset (common after a crash or a logic bug), reconstruct the
+        # frontier from expanded nodes and re-run promotion logic.
+        #
+        # This is intentionally narrow: it only triggers when `passed_gate` is still None.
+        if str(state.get("stop_reason") or "") == "empty_frontier" and not frontier and current_depth < max_depth and expanded_set:
+            candidate_frontier = sorted(str(x) for x in expanded_set)
             cand_frontier_set = set(candidate_frontier)
             needs_repair = False
             for rec in (manifest.get("evaluations") or {}).values():
@@ -3979,7 +4001,7 @@ def main(argv: list[str] | None = None) -> int:
         for node_id in frontier:
             if stop_reason:
                 break
-            if node_id in expanded_set:
+            if node_id in expanded_set and not bool(args.rerun_evals):
                 continue
 
             node = (manifest.get("nodes") or {}).get(node_id)
