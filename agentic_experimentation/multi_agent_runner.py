@@ -977,6 +977,9 @@ async def _main_async():
             coder_system = _read_text(coder_system_path) if coder_system_path else SYSTEM_PROMPT
             reviewer_system = _read_text(reviewer_system_path) if reviewer_system_path else SYSTEM_PROMPT
             max_review_rounds = args.max_review_rounds
+            skip_reviewer = bool(config.get("skip_reviewer", False))
+            if getattr(args, "skip_reviewer", None) is not None:
+                skip_reviewer = bool(args.skip_reviewer)
             if max_review_rounds is None:
                 max_review_rounds = config.get("max_review_rounds", 2)
             max_review_rounds = int(max_review_rounds)
@@ -1252,6 +1255,21 @@ async def _main_async():
                     )
                     continue
 
+                if skip_reviewer:
+                    verdict = "SKIPPED"
+                    review_text = "VERDICT: SKIPPED\nISSUES:\nNOTES:\n- reviewer skipped (max_review_rounds is None)\n"
+                    review_issues = ""
+                    _write_text(log_dir / f"review_round_{round_idx}.md", review_text)
+                    review_rounds.append(
+                        {
+                            "round": round_idx,
+                            "diff_present": True,
+                            "review_verdict": verdict,
+                            "review_issues": review_issues,
+                        }
+                    )
+                    break
+
                 coder_content = _extract_content_field(coder_output)
                 self_check_contents: list[str] = []
                 if coder_self_check_rounds:
@@ -1523,6 +1541,7 @@ async def _main_async():
                 "codex_session_id": codex_session_id,
                 "review_verdict": verdict,
                 "approved": approved,
+                "skip_reviewer": skip_reviewer,
                 "hit_max_review_rounds": hit_max_rounds,
                 "proceed_on_max_review_rounds": proceed_on_max_review_rounds,
                 "review_rounds": review_rounds,
@@ -1626,6 +1645,12 @@ def _parse_args():
         type=int,
         default=None,
         help="If set, only evaluate config_id < N for the sweep and scoring (deterministic subset).",
+    )
+    parser.add_argument(
+        "--skip-reviewer",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Skip reviewer entirely; proceed after coder based on proceed_on_max_review_rounds.",
     )
     return parser.parse_args()
 

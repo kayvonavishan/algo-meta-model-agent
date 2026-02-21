@@ -112,6 +112,155 @@ def _write_raw_llm_messages(
     return path
 
 
+def _message_to_jsonable(message: object) -> dict[str, Any]:
+    if isinstance(message, dict):
+        return message
+    try:
+        payload = _to_jsonable(message)
+        if isinstance(payload, dict):
+            return payload
+        return {"value": payload}
+    except Exception:
+        return {"value": str(message)}
+
+
+def _message_text_from_payload(payload: dict[str, Any]) -> str:
+    content = payload.get("content")
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+                msg = item.get("content")
+                if isinstance(msg, str) and msg:
+                    parts.append(msg)
+        if parts:
+            return "\n".join(parts).strip()
+    for key in ("result", "message"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def _extract_tool_calls(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    content = payload.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("name") and item.get("input") is not None:
+                calls.append(item)
+    return calls
+
+
+def _extract_tool_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    content = payload.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("tool_use_id") is not None:
+                results.append(item)
+    tool_use_result = payload.get("tool_use_result")
+    if isinstance(tool_use_result, dict):
+        results.append({"tool_use_result": tool_use_result})
+    return results
+
+
+def _emit_message_spans(
+    *,
+    tracer,
+    phoenix_obs,
+    raw_messages: list[object],
+    idea_number: int,
+    prompt_path: Path,
+    model: Optional[str],
+) -> None:
+    if tracer is None or phoenix_obs is None:
+        return
+    for idx, message in enumerate(raw_messages or []):
+        payload = _message_to_jsonable(message)
+        subtype = str(payload.get("subtype") or "").strip()
+        span_name = "claude.message"
+        if subtype:
+            span_name = f"claude.{subtype}"
+        with tracer.start_as_current_span(span_name) as span:
+            phoenix_obs.set_openinference_kind(span, "LLM")
+            phoenix_obs.set_attrs(
+                span,
+                {
+                    "message.index": int(idx),
+                    "message.subtype": subtype or None,
+                    "idea_number": int(idea_number),
+                    "prompt_path": str(prompt_path),
+                    "llm.model_name": str(model) if model else None,
+                },
+            )
+            text = _message_text_from_payload(payload)
+            if text:
+                phoenix_obs.set_text(span, "message.text", text)
+            phoenix_obs.set_text(span, "claude.raw", json.dumps(payload, ensure_ascii=False))
+
+
+def _emit_tool_spans(
+    *,
+    tracer,
+    phoenix_obs,
+    raw_messages: list[object],
+    idea_number: int,
+    prompt_path: Path,
+    model: Optional[str],
+) -> None:
+    if tracer is None or phoenix_obs is None:
+        return
+    for msg_idx, message in enumerate(raw_messages or []):
+        payload = _message_to_jsonable(message)
+        tool_calls = _extract_tool_calls(payload)
+        for call_idx, call in enumerate(tool_calls):
+            tool_name = str(call.get("name") or "tool")
+            with tracer.start_as_current_span(f"tool.{tool_name}") as span:
+                phoenix_obs.set_openinference_kind(span, "TOOL")
+                phoenix_obs.set_attrs(
+                    span,
+                    {
+                        "tool.name": tool_name,
+                        "tool.call_id": call.get("id"),
+                        "message.index": int(msg_idx),
+                        "message.call_index": int(call_idx),
+                        "idea_number": int(idea_number),
+                        "prompt_path": str(prompt_path),
+                        "llm.model_name": str(model) if model else None,
+                    },
+                )
+                phoenix_obs.set_text(span, "tool.input", json.dumps(call.get("input"), ensure_ascii=False))
+                phoenix_obs.set_text(span, "claude.raw", json.dumps(call, ensure_ascii=False))
+
+        tool_results = _extract_tool_results(payload)
+        for res_idx, result in enumerate(tool_results):
+            tool_use_id = None
+            if isinstance(result, dict):
+                tool_use_id = result.get("tool_use_id") or result.get("tool_use_result", {}).get("tool_use_id")
+            with tracer.start_as_current_span("tool.result") as span:
+                phoenix_obs.set_openinference_kind(span, "TOOL")
+                phoenix_obs.set_attrs(
+                    span,
+                    {
+                        "tool.result_id": tool_use_id,
+                        "message.index": int(msg_idx),
+                        "message.result_index": int(res_idx),
+                        "idea_number": int(idea_number),
+                        "prompt_path": str(prompt_path),
+                        "llm.model_name": str(model) if model else None,
+                    },
+                )
+                phoenix_obs.set_text(span, "tool.output", json.dumps(result, ensure_ascii=False))
+                phoenix_obs.set_text(span, "claude.raw", json.dumps(result, ensure_ascii=False))
+
 def _normalize_conversation_mode(raw: Optional[str]) -> str:
     value = str(raw or "off").strip().lower()
     if value in {"off", "auto", "native", "replay"}:
@@ -678,6 +827,7 @@ def _render_meta_model_context_block(*, repo_root: Path, baseline_ctx: Optional[
 
     lines: list[str] = []
     lines.append("===== META MODEL CONTEXT =====")
+    lines.append("Below is a list of files to explore to learn and understand the current state of the meta model. You can explore additional files, such as imports, but the files below make up the core modules.")
     for name, desc, path in files:
         lines.append(name)
         lines.append(f" - description: {desc}")
@@ -875,7 +1025,6 @@ def _resolve_cli_path(repo_root: Path, value: Optional[str]) -> Optional[Path]:
 def _render_baseline_context_block(*, baseline_ctx: dict[str, Any], repo_root: Path) -> str:
     agentic_root = repo_root / "agentic_experimentation"
     docs_root = agentic_root / "artifact_docs"
-    docs_root_exists = docs_root.exists()
 
     sweep_limit = baseline_ctx.get("sweep_config_limit")
     try:
@@ -923,7 +1072,7 @@ def _render_baseline_context_block(*, baseline_ctx: dict[str, Any], repo_root: P
     except Exception:
         changes_applied_i = None
 
-    lines.append("Current Status:")
+    lines.append("Current Status of Beam Search Experiment:")
     hdr = []
     if tree_run_id:
         hdr.append(f"tree_run_id={tree_run_id}")
@@ -947,7 +1096,15 @@ def _render_baseline_context_block(*, baseline_ctx: dict[str, Any], repo_root: P
     lines.append("")
 
     lines.append("Artifacts & How To Interpret Them:")
-    lines.append(f"- Static docs root: {docs_root} (exists={str(bool(docs_root_exists)).lower()})")
+    lines.append(
+        "- Below are locations and descriptions model performance artifacts. These are generated from the most recent form of the model and represent performance characteristics of the current state."
+    )
+    lines.append(
+        "- These files can be used to understand the current behavior, strengths, weaknesses and overall performance of the model. This can help you strategize where you may be able to improve the model."
+    )
+    lines.append(
+        "- Several output artifacts are csv files. To aid we have provided .txt files with column definitions. They can be found in  `agentic_experimentation/artifact_docs/`"
+    )
     lines.append("")
 
     col_defs = docs_root / "meta_config_sweep_results_columns.txt"
@@ -963,10 +1120,6 @@ def _render_baseline_context_block(*, baseline_ctx: dict[str, Any], repo_root: P
     lines.append("- What it stores: Per-config sweep results; each row is one meta-model backtest for a single parameter set (`config_id`).")
     lines.append("- Used for: Comparing parameter sets and computing the averaged metrics/deltas used to judge/promote ideas.")
     lines.append("- Location (current node): " + (_display_path(sweep_display) if sweep_display else "(unknown / not available)"))
-    if not is_initial_root and agentic_output_root:
-        lines.append(f"- Location (pattern): {Path(agentic_output_root) / 'run_0' / 'meta_config_sweep_results.csv'}")
-    else:
-        lines.append("- Location (pattern): <agentic_output_root>/run_0/meta_config_sweep_results.csv")
     lines.append(f"- Exists (current node path): {str(bool(sweep_exists)).lower()}")
     lines.append(f"- Column definitions: {col_defs} (exists={str(bool(col_defs.exists())).lower()})")
     lines.append("  - Format: `column_name: description` (search by column name).")
@@ -980,9 +1133,8 @@ def _render_baseline_context_block(*, baseline_ctx: dict[str, Any], repo_root: P
     lines.append("Output: avg_trade_return_plots/")
     if not avg_exists:
         lines.append("- Availability: not available yet for this node.")
-        lines.append("- Why: these diagnostics are produced only after running a candidate idea sweep.")
+        lines.append("- Why: these diagnostics are produced only after running the first candidate idea sweep.")
         lines.append("- Location (current node): (not generated yet)")
-        lines.append("- Location (pattern): <agentic_output_root>/run_0/avg_trade_return_plots/")
         lines.append(f"- Overview doc: {overview_doc} (exists={str(bool(overview_doc.exists())).lower()})")
         lines.append("- Note: once available, files are per `config_id` with suffixes `_config_000`, `_config_001`, ...")
         lines.append("")
@@ -990,10 +1142,6 @@ def _render_baseline_context_block(*, baseline_ctx: dict[str, Any], repo_root: P
         lines.append("- What it stores: Per-parameter-set diagnostics (plots + row-metric CSVs) for a node/run.")
         lines.append("- Used for: Deep-diving into *why* a specific config improved/regressed (distributions, drawdowns, stability, significance, trade quality).")
         lines.append("- Location (current node): " + (avg_plots_dir if avg_plots_dir else "(unknown / not available)"))
-        if agentic_output_root:
-            lines.append(f"- Location (pattern): {Path(agentic_output_root) / 'run_0' / 'avg_trade_return_plots'}")
-        else:
-            lines.append("- Location (pattern): <agentic_output_root>/run_0/avg_trade_return_plots/")
         lines.append(f"- Exists (current node path): {str(bool(avg_exists)).lower()}")
         lines.append(f"- Overview doc: {overview_doc} (exists={str(bool(overview_doc.exists())).lower()})")
         lines.append("- Naming convention: Files are per `config_id` and suffixed `_config_000`, `_config_001`, ... matching `meta_config_sweep_results.csv` rows.")
@@ -1079,14 +1227,13 @@ def _render_baseline_context_block(*, baseline_ctx: dict[str, Any], repo_root: P
         lines.append("- Granularity: 1 directory per node/run; inside it, many files per parameter set tested (`config_id`).")
         lines.append("")
 
-    lines.append("- Guidance: consult docs first; open only the minimum files needed.")
     lines.append("")
 
     lines.append("Branch Timeline (chronological):")
     timeline = baseline_ctx.get("branch_timeline") or []
     if not isinstance(timeline, list) or not timeline:
         lines.append("- (no timeline available)")
-        return "\n".join(lines).rstrip() + "\n"
+        timeline = []
 
     metrics_order = [
         "core_topN_sharpe",
@@ -1197,6 +1344,7 @@ def _render_baseline_context_block(*, baseline_ctx: dict[str, Any], repo_root: P
             lines.append("")
             rej_idx += 1
 
+    lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1352,6 +1500,7 @@ class IdeaGenConfig:
     tools: Optional[object]
     allowed_tools: list[str]
     disallowed_tools: list[str]
+    log_tool_spans: bool
 
 
 def _parse_tool_list(raw: Any) -> list[str]:
@@ -1412,6 +1561,7 @@ def _load_config(config_path: Path) -> IdeaGenConfig:
     tools = raw.get("tools", None)
     allowed_tools = raw.get("allowed_tools", [])
     disallowed_tools = raw.get("disallowed_tools", [])
+    log_tool_spans = raw.get("log_tool_spans", True)
 
     if not isinstance(count, int) or count <= 0:
         raise ValueError("config.count must be a positive integer.")
@@ -1442,6 +1592,7 @@ def _load_config(config_path: Path) -> IdeaGenConfig:
         tools=_parse_tools_spec(tools),
         allowed_tools=_parse_tool_list(allowed_tools),
         disallowed_tools=_parse_tool_list(disallowed_tools),
+        log_tool_spans=bool(log_tool_spans),
     )
 
 
@@ -1790,6 +1941,7 @@ def main() -> int:
     conv_state_out: Optional[Path] = _resolve_cli_path(repo_root, args.conversation_state_out) if args.conversation_state_out else None
     emit_turn_log: Optional[Path] = _resolve_cli_path(repo_root, args.emit_turn_log) if args.emit_turn_log else None
     log_raw_messages = bool(getattr(args, "idea_log_raw_messages", True))
+    log_tool_spans = bool(getattr(cfg, "log_tool_spans", True))
     if conv_state_out is None and conv_state_in is not None:
         conv_state_out = conv_state_in
 
@@ -1910,7 +2062,7 @@ def main() -> int:
                                 continue_conversation=bool(native_params.get("continue_conversation", False)),
                                 resume_session_id=native_params.get("resume_session_id"),
                                 fork_session=bool(native_params.get("fork_session", False)),
-                                capture_raw_messages=log_raw_messages,
+                                capture_raw_messages=(log_raw_messages or log_tool_spans),
                             )
                         )
                     except RuntimeError:
@@ -1931,7 +2083,7 @@ def main() -> int:
                                 continue_conversation=bool(native_params.get("continue_conversation", False)),
                                 resume_session_id=native_params.get("resume_session_id"),
                                 fork_session=bool(native_params.get("fork_session", False)),
-                                capture_raw_messages=log_raw_messages,
+                                capture_raw_messages=(log_raw_messages or log_tool_spans),
                             )
                         )
                     idea_md = _clean_idea_output(str(llm_result.get("text") or ""))
@@ -1940,6 +2092,23 @@ def main() -> int:
 
                     if phoenix_obs is not None and llm_span is not None:
                         phoenix_obs.set_io(llm_span, output_text=idea_md)
+                        if log_tool_spans and raw_messages:
+                            _emit_tool_spans(
+                                tracer=phoenix_tracer,
+                                phoenix_obs=phoenix_obs,
+                                raw_messages=raw_messages,
+                                idea_number=next_num,
+                                prompt_path=prompt_dump_path,
+                                model=model,
+                            )
+                            _emit_message_spans(
+                                tracer=phoenix_tracer,
+                                phoenix_obs=phoenix_obs,
+                                raw_messages=raw_messages,
+                                idea_number=next_num,
+                                prompt_path=prompt_dump_path,
+                                model=model,
+                            )
 
                 try:
                     _validate_idea_output(idea_md)
