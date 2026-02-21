@@ -140,7 +140,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--rerun-evals",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Allow re-running completed evaluations (not used in phase 1).",
+        help=(
+            "Allow re-running prior evaluations for the same node+idea key. "
+            "Also reopens an empty frontier depth on resume so failed evals can be retried."
+        ),
     )
     parser.add_argument(
         "--force-regenerate-ideas",
@@ -3883,6 +3886,43 @@ def main(argv: list[str] | None = None) -> int:
         # This is intentionally narrow: it only triggers when `passed_gate` is still None.
         if str(state.get("stop_reason") or "") == "empty_frontier" and not frontier and current_depth < max_depth and expanded_set:
             candidate_frontier = sorted(str(x) for x in expanded_set)
+            if bool(args.rerun_evals):
+                _append_tree_log(
+                    run_root,
+                    f"rerun_evals_reopen_depth depth={current_depth} restored_frontier={candidate_frontier}",
+                )
+                manifest.setdefault("events", []).append(
+                    {
+                        "ts": _utc_now_iso(),
+                        "type": "rerun_evals_reopen_depth",
+                        "details": {
+                            "depth": current_depth,
+                            "restored_frontier": candidate_frontier,
+                        },
+                    }
+                )
+                state.pop("stop_reason", None)
+                state["frontier_node_ids"] = list(candidate_frontier)
+                frontier = list(candidate_frontier)
+                expanded_by_depth[str(current_depth)] = []
+                expanded_set = set()
+                completed_depths = state.get("completed_depths")
+                if isinstance(completed_depths, list):
+                    retained_depths: list[Any] = []
+                    for d in completed_depths:
+                        try:
+                            if int(d) == int(current_depth):
+                                continue
+                        except Exception:
+                            if str(d) == str(current_depth):
+                                continue
+                        retained_depths.append(d)
+                    state["completed_depths"] = retained_depths
+                existing_task_plan = state.get("task_plan_by_depth")
+                if isinstance(existing_task_plan, dict):
+                    existing_task_plan.pop(str(current_depth), None)
+                _manifest_write(run_root, manifest)
+
             cand_frontier_set = set(candidate_frontier)
             needs_repair = False
             for rec in (manifest.get("evaluations") or {}).values():
