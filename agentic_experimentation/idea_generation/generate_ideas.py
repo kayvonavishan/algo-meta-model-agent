@@ -1452,11 +1452,49 @@ def _clean_idea_output(raw: str) -> str:
     return trimmed.strip() + "\n" if trimmed else ""
 
 
+_IDEA_REQUIRED_FIELDS = ("IDEA:", "RATIONALE:", "REQUIRED_CHANGES:")
+
+
+def _missing_idea_fields(markdown: str) -> list[str]:
+    text = str(markdown or "")
+    return [k for k in _IDEA_REQUIRED_FIELDS if k not in text]
+
+
+def _is_valid_idea_output(markdown: str) -> bool:
+    return not _missing_idea_fields(markdown)
+
+
 def _validate_idea_output(markdown: str) -> None:
-    required = ("IDEA:", "RATIONALE:", "REQUIRED_CHANGES:")
-    missing = [k for k in required if k not in markdown]
+    missing = _missing_idea_fields(markdown)
     if missing:
         raise ValueError(f"Claude output missing required fields: {missing}")
+
+
+def _build_output_repair_prompt(*, partial_output: str, missing_fields: list[str]) -> str:
+    missing_txt = ", ".join(missing_fields) if missing_fields else "(unknown)"
+    partial = _clip_text(str(partial_output or "").strip(), max_chars=4000).strip()
+    lines = [
+        "You have finished exploration. Now provide your final answer only.",
+        f"Your previous output is missing required fields: {missing_txt}.",
+        "",
+        "Return exactly this structure:",
+        "IDEA: <one concise, self-contained change>",
+        "RATIONALE: <why it might help, in plain terms>",
+        "REQUIRED_CHANGES: <elaborate on changes required to the meta model. Detailed code changes are not necessary>",
+        "",
+        "Do not call tools. Do not include any other sections.",
+    ]
+    if partial:
+        lines.extend(
+            [
+                "",
+                "Previous draft/context:",
+                "-----",
+                partial,
+                "-----",
+            ]
+        )
+    return "\n".join(lines).strip() + "\n"
 
 
 def _bundle_context(
@@ -2109,6 +2147,64 @@ def main() -> int:
                                 prompt_path=prompt_dump_path,
                                 model=model,
                             )
+
+                missing_fields = _missing_idea_fields(idea_md)
+                if missing_fields:
+                    repair_session_id = str(llm_result.get("provider_session_id") or "").strip() or None
+                    repair_prompt = _build_output_repair_prompt(
+                        partial_output=idea_md,
+                        missing_fields=missing_fields,
+                    )
+                    repair_result: Optional[dict[str, Any]] = None
+                    repair_max_turns = max(2, min(4, int(max_turns)))
+                    try:
+                        repair_result = asyncio.run(
+                            _run_claude_agent_sdk_once(
+                                prompt=repair_prompt,
+                                model=model,
+                                cwd=run_cwd,
+                                cli_path=cli_path,
+                                max_turns=repair_max_turns,
+                                tools=[],
+                                allowed_tools=[],
+                                disallowed_tools=[],
+                                continue_conversation=bool(repair_session_id),
+                                resume_session_id=repair_session_id,
+                                fork_session=False,
+                                capture_raw_messages=(log_raw_messages or log_tool_spans),
+                            )
+                        )
+                    except RuntimeError:
+                        if model is not None:
+                            try:
+                                repair_result = asyncio.run(
+                                    _run_claude_agent_sdk_once(
+                                        prompt=repair_prompt,
+                                        model=None,
+                                        cwd=run_cwd,
+                                        cli_path=cli_path,
+                                        max_turns=repair_max_turns,
+                                        tools=[],
+                                        allowed_tools=[],
+                                        disallowed_tools=[],
+                                        continue_conversation=bool(repair_session_id),
+                                        resume_session_id=repair_session_id,
+                                        fork_session=False,
+                                        capture_raw_messages=(log_raw_messages or log_tool_spans),
+                                    )
+                                )
+                            except Exception:  # noqa: BLE001
+                                repair_result = None
+                    except Exception:  # noqa: BLE001
+                        repair_result = None
+
+                    if isinstance(repair_result, dict):
+                        repaired_md = _clean_idea_output(str(repair_result.get("text") or ""))
+                        if _is_valid_idea_output(repaired_md):
+                            idea_md = repaired_md
+                            llm_result = repair_result
+                            provider_meta_debug = llm_result.get("provider_metadata_debug") or {}
+                            raw_messages = llm_result.get("raw_messages")
 
                 try:
                     _validate_idea_output(idea_md)

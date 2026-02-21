@@ -176,8 +176,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--idea-max-turns",
         type=int,
-        default=6,
-        help="Max turns for Claude Code idea generation (used when tools are enabled).",
+        default=None,
+        help=(
+            "Max turns for Claude Code idea generation (used when tools are enabled). "
+            "If omitted, defaults to idea_generation/config.json:max_turns (fallback=6)."
+        ),
     )
     parser.add_argument(
         "--idea-tools",
@@ -283,6 +286,21 @@ def _resolve_repo_root(start: Path) -> Path:
         if (p / "META_MODEL_GUIDE.md").exists() and (p / "adaptive_vol_momentum.py").exists():
             return p
     return start.resolve()
+
+
+def _default_idea_max_turns(*, repo_root: Path) -> int:
+    cfg_path = repo_root / "agentic_experimentation" / "idea_generation" / "config.json"
+    try:
+        raw = _read_json(cfg_path)
+    except Exception:
+        return 6
+    if not isinstance(raw, dict):
+        return 6
+    try:
+        value = int(raw.get("max_turns", 6))
+    except Exception:
+        return 6
+    return max(1, value)
 
 
 def _run_git(repo_root: Path, args: list[str]) -> str:
@@ -2409,7 +2427,8 @@ def _ensure_manifest_conversation_schema(
     run_config.setdefault("idea_conversation_mode", str(getattr(args, "idea_conversation_mode", "auto")))
     run_config.setdefault("idea_history_window_turns", int(getattr(args, "idea_history_window_turns", 12)))
     run_config.setdefault("idea_history_max_chars", int(getattr(args, "idea_history_max_chars", 20000)))
-    run_config.setdefault("idea_max_turns", int(getattr(args, "idea_max_turns", 6)))
+    _idea_max_turns_arg = getattr(args, "idea_max_turns", None)
+    run_config.setdefault("idea_max_turns", int(6 if _idea_max_turns_arg is None else _idea_max_turns_arg))
     run_config.setdefault("idea_tools", str(getattr(args, "idea_tools", "claude_code")))
     run_config.setdefault("idea_allowed_tools", str(getattr(args, "idea_allowed_tools", "Read")))
     run_config.setdefault("idea_disallowed_tools", str(getattr(args, "idea_disallowed_tools", "")))
@@ -3665,6 +3684,10 @@ def main(argv: list[str] | None = None) -> int:
     from scoring_hooks import compute_score  # type: ignore
 
     repo_root = _resolve_repo_root(Path(__file__).resolve())
+    if args.idea_max_turns is None:
+        args.idea_max_turns = _default_idea_max_turns(repo_root=repo_root)
+    if int(args.idea_max_turns) < 1:
+        raise ValueError("--idea-max-turns must be >= 1.")
     agentic_root = repo_root / "agentic_experimentation"
     tree_run_id = str(args.tree_run_id or _default_tree_run_id())
     args.tree_run_id = tree_run_id
