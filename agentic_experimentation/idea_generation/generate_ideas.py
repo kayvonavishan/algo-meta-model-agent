@@ -1331,6 +1331,17 @@ def _bundle_context(
     return base_only[:budget].rstrip() + note
 
 
+def _append_new_ideas_section(prompt: str, created: List[Path]) -> str:
+    note = "NOTE: Review the 'New Ideas Already Introduced' section at the end and do not repeat those ideas."
+    lines = ["", note, "", "===== New Ideas Already Introduced ====="]
+    if created:
+        for p in created:
+            lines.append(f"- {p}")
+    else:
+        lines.append("- (none yet)")
+    return prompt.rstrip() + "\n" + "\n".join(lines).rstrip() + "\n"
+
+
 @dataclass(frozen=True)
 class IdeaGenConfig:
     count: int
@@ -1844,6 +1855,7 @@ def main() -> int:
                     )
                     if replay_block:
                         prompt = prompt.rstrip() + "\n\n" + replay_block
+            prompt = _append_new_ideas_section(prompt, created)
             prompt_hash = _sha256_text(prompt)
             native_params = _claude_native_continuation_params(
                 mode_used=mode_used,
