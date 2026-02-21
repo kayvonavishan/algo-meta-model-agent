@@ -20,6 +20,15 @@ class MetaConfig:
     momentum_lookback: int = 12
     enable_momentum_lookback: bool = True  # when True, truncate adaptive momentum to last N periods
     delta_weight: float = 0.20       # small (0.05-0.3)
+    efficiency_weight: float = 0.10  # momentum smoothness bonus
+    win_rate_weight: float = 0.08    # fraction of positive-return periods bonus
+    momentum_sharpe_weight: float = 0.10  # volatility-adjusted momentum weight
+    momentum_sharpe_lookback: int = 8     # lookback in Q periods (percentile-rank series), not raw returns
+    rank_persistence_weight: float = 0.06  # weight for rank persistence signal
+    rank_persistence_lookback: int = 8     # lookback window for rank persistence
+    hit_asymmetry_weight: float = 0.06  # weight for hit rate asymmetry signal
+    hit_asymmetry_lookback: int = 10  # lookback window for asymmetric hit rates
+    hit_asymmetry_threshold: float = 0.75  # percentile threshold for "top" performance
     
     # Confidence (training-free)
     conf_lookback: int = 12
@@ -30,9 +39,16 @@ class MetaConfig:
     cvar_alpha: float = 0.10         # tail depth
     cvar_risk_aversion: float = 0.75 # penalty strength
     cvar_window_stride: int = 1      # downsample within CVaR lookback window (1 = exact)
+
+    # Downside volatility cap
+    downside_vol_cap_weight: float = 0.12  # 0 disables downside volatility cap
+    downside_vol_lookback: int = 8
+    downside_vol_threshold_z: float = 1.0
     
     # Baseline
     baseline_method: str = "median"  # "median" or "mean"
+    regime_baseline_adjust: float = 0.10  # 0 disables regime adjustment
+    regime_dispersion_lookback: int = 6  # lookback for regime dispersion z-score
     
     # Redundancy control (optional)
     enable_uniqueness_weighting: bool = True
@@ -49,3 +65,11 @@ class MetaConfig:
 
     # Sweep / reporting
     scorecard_every: Optional[int] = 10  # build scorecard every N configs during sweep (None = disable)
+
+    def __post_init__(self) -> None:
+        if self.downside_vol_cap_weight < 0:
+            self.downside_vol_cap_weight = 0.0
+        if self.downside_vol_lookback < 2:
+            self.downside_vol_lookback = 2
+        if self.downside_vol_threshold_z < 0:
+            self.downside_vol_threshold_z = 0.0
