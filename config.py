@@ -39,6 +39,11 @@ class MetaConfig:
     # Confidence (training-free)
     conf_lookback: int = 12
     conf_eps: float = 1e-8
+
+    # Score spread gating (training-free)
+    score_spread_boost_weight: float = 0.10
+    score_spread_lookback: int = 4
+    score_spread_z_threshold: float = 0.5
     
     # Risk penalty (training-free)
     risk_lookback: int = 20

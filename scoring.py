@@ -629,6 +629,29 @@ def compute_scores_for_ticker_v2(
         if downside_vol_pen is not None:
             SCORE = SCORE - downside_vol_pen
         SCORE = (uniq_w[:, None] * SCORE)
+
+        if cfg.score_spread_boost_weight != 0:
+            score_spread = np.full(T, np.nan, dtype=float)
+            for t in range(T):
+                col = SCORE[:, t]
+                if np.isfinite(col).sum() < 2:
+                    continue
+                q75 = np.nanpercentile(col, 75)
+                q25 = np.nanpercentile(col, 25)
+                score_spread[t] = q75 - q25
+            spread_series = pd.Series(score_spread, dtype=float)
+            roll = spread_series.shift(1).rolling(
+                window=cfg.score_spread_lookback,
+                min_periods=2,
+            )
+            roll_mean = roll.mean().to_numpy()
+            roll_std = roll.std(ddof=1).to_numpy()
+            eps = 1e-12
+            spread_z = (score_spread - roll_mean) / (roll_std + eps)
+            excess = spread_z - cfg.score_spread_z_threshold
+            excess = np.where(np.isfinite(excess), np.maximum(0.0, excess), 0.0)
+            gate = 1.0 + cfg.score_spread_boost_weight * excess
+            SCORE = SCORE * gate[None, :]
         scores_df = pd.DataFrame(SCORE, index=models, columns=periods)
     
         # Ticker gate score per period: median of TopM
