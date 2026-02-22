@@ -400,6 +400,49 @@ def compute_scores_for_ticker_v2(
         # 4) Percentile ranks per period across models
         # Q shape: (n_models, T) with time axis last (most recent at end).
         Q = percentile_ranks_across_models_v2(R, axis=0)
+
+        breakout_norm = None
+        if cfg.breakout_weight != 0:
+            L = cfg.breakout_lookback
+            thr = cfg.breakout_threshold
+            breakout_raw = np.zeros_like(Q, dtype=float)
+            for t in range(T):
+                start = max(0, t - L)
+                if start >= t:
+                    continue
+                q_t = Q[:, t]
+                q_prev = Q[:, start:t]
+                q_prev_nan = np.isnan(q_prev).any(axis=1)
+                was_below_recently = np.any(q_prev <= thr, axis=1) & ~q_prev_nan
+                is_above = (q_t > thr) & np.isfinite(q_t)
+
+                q_win = Q[:, start:t + 1]
+                if q_win.shape[1] >= 2:
+                    q_win_filled = np.where(np.isfinite(q_win), q_win, -np.inf)
+                    above_int = (q_win_filled > thr).astype(int)
+                    crossings = np.sum(np.abs(np.diff(above_int, axis=1)), axis=1)
+                else:
+                    crossings = np.zeros(n_models, dtype=int)
+
+                eligible = is_above & was_below_recently
+                if np.any(eligible):
+                    penalized = 1.0 - cfg.breakout_oscillation_penalty
+                    breakout_raw[eligible & (crossings <= 2), t] = 1.0
+                    breakout_raw[eligible & (crossings > 2), t] = penalized
+                breakout_raw[~np.isfinite(q_t), t] = 0.0
+
+            breakout_norm = np.zeros_like(breakout_raw, dtype=float)
+            for t in range(T):
+                col = breakout_raw[:, t]
+                finite = np.isfinite(col)
+                if finite.sum() < 2:
+                    continue
+                col_vals = col[finite]
+                if np.min(col_vals) == np.max(col_vals):
+                    continue
+                ranks = percentile_ranks_across_models_v2(col)
+                ranks = np.where(np.isfinite(ranks), ranks, 0.0)
+                breakout_norm[:, t] = ranks
     
         # 5) Adaptive EWMA momentum on Q (time-varying alpha)
         if cfg.enable_momentum_lookback:
@@ -502,6 +545,8 @@ def compute_scores_for_ticker_v2(
             base_forecast = base_forecast + cfg.rank_persistence_weight * rank_persist_norm
         if hit_asym_norm is not None:
             base_forecast = base_forecast + cfg.hit_asymmetry_weight * hit_asym_norm
+        if breakout_norm is not None:
+            base_forecast = base_forecast + cfg.breakout_weight * breakout_norm
     
         # 7) Ticker-local baseline
         if cfg.baseline_method == "mean":

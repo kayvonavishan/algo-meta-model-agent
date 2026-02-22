@@ -29,6 +29,10 @@ class MetaConfig:
     hit_asymmetry_weight: float = 0.06  # weight for hit rate asymmetry signal
     hit_asymmetry_lookback: int = 10  # lookback window for asymmetric hit rates
     hit_asymmetry_threshold: float = 0.75  # percentile threshold for "top" performance
+    breakout_weight: float = 0.08  # weight for top-tier breakout signal
+    breakout_threshold: float = 0.80  # rank percentile threshold for top tier
+    breakout_lookback: int = 4  # lookback window for breakout stability
+    breakout_oscillation_penalty: float = 0.5  # penalty for oscillators around threshold
     
     # Confidence (training-free)
     conf_lookback: int = 12
