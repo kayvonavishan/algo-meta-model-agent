@@ -35,6 +35,9 @@ class MetaConfig:
     breakout_oscillation_penalty: float = 0.5  # penalty for oscillators around threshold
     rank_durability_weight: float = 0.08  # weight for rank durability signal
     rank_durability_cap: int = 12  # max consecutive above-median tenure counted
+    velocity_confirmation_weight: float = 0.06  # weight for velocity confirmation signal
+    velocity_lookback: int = 3  # lookback window for velocity confirmation
+    velocity_threshold: float = 0.02  # minimum delta magnitude to count as moving
     
     # Confidence (training-free)
     conf_lookback: int = 12
@@ -86,3 +89,7 @@ class MetaConfig:
             self.downside_vol_threshold_z = 0.0
         if self.rank_durability_cap < 1:
             self.rank_durability_cap = 1
+        if self.velocity_lookback < 2:
+            self.velocity_lookback = 2
+        if self.velocity_threshold < 0:
+            self.velocity_threshold = 0.0

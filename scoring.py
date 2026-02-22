@@ -536,6 +536,40 @@ def compute_scores_for_ticker_v2(
         D = np.zeros_like(Q, dtype=float)
         D[:, 1:] = Q[:, 1:] - Q[:, :-1]
 
+        velocity_confirmation_norm = None
+        if cfg.velocity_confirmation_weight != 0:
+            L = cfg.velocity_lookback
+            velocity_confirmation_raw = np.full((n_models, T), 0.5, dtype=float)
+            if T > 1 and L >= 2:
+                start_t = max(L - 1, 1)
+                for t in range(start_t, T):
+                    d_t = D[:, t]
+                    current_significant = (np.abs(d_t) > cfg.velocity_threshold) & np.isfinite(d_t)
+                    if not np.any(current_significant):
+                        continue
+                    d_window = D[:, t - L + 1:t + 1]
+                    is_finite = np.isfinite(d_window)
+                    is_significant = (np.abs(d_window) > cfg.velocity_threshold) & is_finite
+                    sign_match = (np.sign(d_window) == np.sign(d_t)[:, None]) & is_significant
+                    match_count = sign_match.sum(axis=1)
+                    total_significant = is_significant.sum(axis=1)
+                    confirmation_ratio = np.divide(
+                        match_count,
+                        total_significant,
+                        out=np.full_like(match_count, 0.5, dtype=float),
+                        where=total_significant > 0,
+                    )
+                    velocity_confirmation_raw[current_significant, t] = confirmation_ratio[current_significant]
+            velocity_confirmation_norm = percentile_ranks_across_models_v2(
+                velocity_confirmation_raw,
+                axis=0,
+            )
+            velocity_confirmation_norm = np.where(
+                np.isfinite(velocity_confirmation_norm),
+                velocity_confirmation_norm,
+                0.5,
+            )
+
         # 6b) Efficiency ratio (momentum smoothness) over a rolling window
         returns_t = None
         eff_norm = None
@@ -575,6 +609,8 @@ def compute_scores_for_ticker_v2(
             base_forecast = base_forecast + cfg.hit_asymmetry_weight * hit_asym_norm
         if breakout_norm is not None:
             base_forecast = base_forecast + cfg.breakout_weight * breakout_norm
+        if cfg.velocity_confirmation_weight != 0 and velocity_confirmation_norm is not None:
+            base_forecast = base_forecast + cfg.velocity_confirmation_weight * velocity_confirmation_norm
     
         # 7) Ticker-local baseline
         if cfg.baseline_method == "mean":
