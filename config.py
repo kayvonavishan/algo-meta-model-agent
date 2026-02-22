@@ -33,6 +33,8 @@ class MetaConfig:
     breakout_threshold: float = 0.80  # rank percentile threshold for top tier
     breakout_lookback: int = 4  # lookback window for breakout stability
     breakout_oscillation_penalty: float = 0.5  # penalty for oscillators around threshold
+    rank_durability_weight: float = 0.08  # weight for rank durability signal
+    rank_durability_cap: int = 12  # max consecutive above-median tenure counted
     
     # Confidence (training-free)
     conf_lookback: int = 12
@@ -77,3 +79,5 @@ class MetaConfig:
             self.downside_vol_lookback = 2
         if self.downside_vol_threshold_z < 0:
             self.downside_vol_threshold_z = 0.0
+        if self.rank_durability_cap < 1:
+            self.rank_durability_cap = 1

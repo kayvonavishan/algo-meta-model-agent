@@ -208,6 +208,27 @@ def percentile_ranks_across_models_v2(x: np.ndarray, axis: int = 0) -> np.ndarra
         return out
 
 
+def compute_rank_durability_raw(Q: np.ndarray, cap: int) -> np.ndarray:
+    """
+    Compute consecutive above-median tenure ending at t-1 for each period t.
+    """
+    Q = np.asarray(Q, dtype=float)
+    cap = int(max(1, cap))
+    n_models, T = Q.shape
+    if T == 0:
+        return np.zeros_like(Q, dtype=float)
+    is_above = (Q > 0.5) & np.isfinite(Q)
+    tenure_end = np.zeros((n_models, T), dtype=int)
+    tenure_end[:, 0] = is_above[:, 0].astype(int)
+    for t in range(1, T):
+        inc = tenure_end[:, t - 1] + 1
+        tenure_end[:, t] = np.where(is_above[:, t], np.minimum(inc, cap), 0)
+    durability_raw = np.zeros((n_models, T), dtype=float)
+    if T > 1:
+        durability_raw[:, 1:] = tenure_end[:, :-1]
+    return durability_raw
+
+
 def compute_uniqueness_weights(returns_matrix: pd.DataFrame, cfg: MetaConfig) -> pd.Series:
     """
     Simple duplicate control:
@@ -401,6 +422,11 @@ def compute_scores_for_ticker_v2(
         # Q shape: (n_models, T) with time axis last (most recent at end).
         Q = percentile_ranks_across_models_v2(R, axis=0)
 
+        durability_norm = None
+        if cfg.rank_durability_weight != 0:
+            durability_raw = compute_rank_durability_raw(Q, cfg.rank_durability_cap)
+            durability_norm = percentile_ranks_across_models_v2(durability_raw, axis=0)
+
         breakout_norm = None
         if cfg.breakout_weight != 0:
             L = cfg.breakout_lookback
@@ -543,6 +569,8 @@ def compute_scores_for_ticker_v2(
             base_forecast = base_forecast + cfg.momentum_sharpe_weight * mom_sharpe_norm
         if rank_persist_norm is not None:
             base_forecast = base_forecast + cfg.rank_persistence_weight * rank_persist_norm
+        if cfg.rank_durability_weight != 0 and durability_norm is not None:
+            base_forecast = base_forecast + cfg.rank_durability_weight * durability_norm
         if hit_asym_norm is not None:
             base_forecast = base_forecast + cfg.hit_asymmetry_weight * hit_asym_norm
         if breakout_norm is not None:
