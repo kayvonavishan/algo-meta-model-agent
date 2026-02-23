@@ -284,7 +284,14 @@ def _find_first_session_id(payload):  # noqa: ANN001
         return None
     if isinstance(payload, dict):
         for k, v in payload.items():
-            if k in ("session_id", "thread_id") and isinstance(v, str) and _UUID_RE.match(v):
+            if k in (
+                "session_id",
+                "thread_id",
+                "sessionId",
+                "threadId",
+                "conversationId",
+                "conversation_id",
+            ) and isinstance(v, str) and _UUID_RE.match(v):
                 return v
             found = _find_first_session_id(v)
             if found:
@@ -332,7 +339,16 @@ def _pick_session_arg_key(tool_input_schema):  # noqa: ANN001
     if not isinstance(properties, dict):
         return None
 
-    for key in ("thread_id", "session_id", "conversation_id", "thread", "session"):
+    for key in (
+        "threadId",
+        "conversationId",
+        "thread_id",
+        "session_id",
+        "sessionId",
+        "conversation_id",
+        "thread",
+        "session",
+    ):
         if key in properties:
             return key
     return None
@@ -1024,184 +1040,214 @@ async def _main_async():
                 coder_prompt_path = log_dir / f"coder_prompt_round_{round_idx}.txt"
                 _write_text(coder_prompt_path, coder_prompt)
 
-                if args.dry_run_llm:
-                    coder_output = "(dry-run) skipped Codex edits."
-                else:
-                    _ensure_trace_processor_registered()
-                    with _tracing_scope(exp_dir=log_dir, run_id=run_id, step="coder", round_idx=round_idx):
-                        codex_span_cm = contextlib.nullcontext()
-                        if phoenix_tracer is not None:
-                            codex_span_cm = phoenix_tracer.start_as_current_span(
-                                "agentic.codex_edit_repo",
-                                attributes={
-                                    "run_id": run_id,
-                                    "step": "coder",
-                                    "round_idx": round_idx,
-                                    "backend": coder_backend,
-                                    "worktree_path": str(worktree_path),
-                                    "coder_prompt_path": str(coder_prompt_path),
-                                    "codex_session_id": str(codex_session_id) if codex_session_id else None,
-                                },
-                            )
-                        with codex_span_cm as codex_span:
-                            if phoenix_obs is not None and codex_span is not None:
-                                phoenix_obs.set_openinference_kind(codex_span, "TOOL")
-                                phoenix_obs.set_attrs(codex_span, {"tool.name": "codex"})
-                                phoenix_obs.set_text(codex_span, "system_prompt", coder_system or "")
-
-                            if coder_backend in ("cli", "cli_session", "codex_cli", "codex-cli"):
-                                # For session-backed Codex CLI runs, include the system prompt only on the
-                                # first call; subsequent `resume` prompts benefit from staying small.
-                                full_prompt = ""
-                                if codex_session_id is None:
-                                    full_prompt = (coder_system or "").strip()
-                                    if full_prompt:
-                                        full_prompt += "\n\n"
-                                full_prompt += (coder_prompt or "").strip() + "\n"
+                mcp_session: Optional[_CodexMcpSession] = None
+                try:
+                    if args.dry_run_llm:
+                        coder_output = "(dry-run) skipped Codex edits."
+                    else:
+                        _ensure_trace_processor_registered()
+                        with _tracing_scope(exp_dir=log_dir, run_id=run_id, step="coder", round_idx=round_idx):
+                            codex_span_cm = contextlib.nullcontext()
+                            if phoenix_tracer is not None:
+                                codex_span_cm = phoenix_tracer.start_as_current_span(
+                                    "agentic.codex_edit_repo",
+                                    attributes={
+                                        "run_id": run_id,
+                                        "step": "coder",
+                                        "round_idx": round_idx,
+                                        "backend": coder_backend,
+                                        "worktree_path": str(worktree_path),
+                                        "coder_prompt_path": str(coder_prompt_path),
+                                        "codex_session_id": str(codex_session_id) if codex_session_id else None,
+                                    },
+                                )
+                            with codex_span_cm as codex_span:
                                 if phoenix_obs is not None and codex_span is not None:
-                                    phoenix_obs.set_io(codex_span, input_text=full_prompt)
-                                coder_output, codex_session_id = await _codex_cli_edit_repo(
-                                    worktree_path=worktree_path,
-                                    prompt=full_prompt,
-                                    exp_dir=exp_dir,
-                                    round_idx=round_idx,
-                                    session_id=codex_session_id,
-                                    codex_cli_cfg=config.get("codex_cli"),
-                                )
-                            else:
+                                    phoenix_obs.set_openinference_kind(codex_span, "TOOL")
+                                    phoenix_obs.set_attrs(codex_span, {"tool.name": "codex"})
+                                    phoenix_obs.set_text(codex_span, "system_prompt", coder_system or "")
+
+                                if coder_backend in ("cli", "cli_session", "codex_cli", "codex-cli"):
+                                    # For session-backed Codex CLI runs, include the system prompt only on the
+                                    # first call; subsequent `resume` prompts benefit from staying small.
+                                    full_prompt = ""
+                                    if codex_session_id is None:
+                                        full_prompt = (coder_system or "").strip()
+                                        if full_prompt:
+                                            full_prompt += "\n\n"
+                                    full_prompt += (coder_prompt or "").strip() + "\n"
+                                    if phoenix_obs is not None and codex_span is not None:
+                                        phoenix_obs.set_io(codex_span, input_text=full_prompt)
+                                    coder_output, codex_session_id = await _codex_cli_edit_repo(
+                                        worktree_path=worktree_path,
+                                        prompt=full_prompt,
+                                        exp_dir=exp_dir,
+                                        round_idx=round_idx,
+                                        session_id=codex_session_id,
+                                        codex_cli_cfg=config.get("codex_cli"),
+                                    )
+                                else:
+                                    if phoenix_obs is not None and codex_span is not None:
+                                        phoenix_obs.set_io(codex_span, input_text=coder_prompt)
+                                    if mcp_session is None:
+                                        mcp_session = await _open_codex_mcp_session(
+                                            worktree_path=worktree_path, codex_mcp_cfg=codex_mcp_cfg
+                                        )
+                                    coder_output, codex_session_id = await _codex_mcp_edit_repo(
+                                        worktree_path=worktree_path,
+                                        codex_mcp_cfg=codex_mcp_cfg,
+                                        agent_cfg=config.get("agents", {}).get("coder", {}),
+                                        system_prompt=coder_system,
+                                        user_prompt=coder_prompt,
+                                        max_turns=max_turns,
+                                        session_id=codex_session_id,
+                                        mcp_session=mcp_session,
+                                    )
+
                                 if phoenix_obs is not None and codex_span is not None:
-                                    phoenix_obs.set_io(codex_span, input_text=coder_prompt)
-                                coder_output, codex_session_id = await _codex_mcp_edit_repo(
-                                    worktree_path=worktree_path,
-                                    codex_mcp_cfg=codex_mcp_cfg,
-                                    agent_cfg=config.get("agents", {}).get("coder", {}),
-                                    system_prompt=coder_system,
-                                    user_prompt=coder_prompt,
-                                    max_turns=max_turns,
-                                    session_id=codex_session_id,
-                                )
-
-                            if phoenix_obs is not None and codex_span is not None:
-                                phoenix_obs.set_attrs(
-                                    codex_span,
-                                    {"codex_session_id": str(codex_session_id) if codex_session_id else None},
-                                )
-                                phoenix_obs.set_io(codex_span, output_text=coder_output)
-
-                            codex_details_path, codex_details_preview = _write_codex_run_details(
-                                exp_dir=exp_dir,
-                                run_id=run_id,
-                                round_idx=round_idx,
-                                backend=coder_backend,
-                                worktree_path=worktree_path,
-                            )
-                            if phoenix_obs is not None and codex_span is not None and codex_details_path:
-                                try:
                                     phoenix_obs.set_attrs(
                                         codex_span,
-                                        {
-                                            "codex.run_details_path": codex_details_path,
-                                        },
+                                        {"codex_session_id": str(codex_session_id) if codex_session_id else None},
                                     )
-                                    if codex_details_preview:
-                                        phoenix_obs.set_text(codex_span, "codex.run_details_json", codex_details_preview)
-                                except Exception:  # pylint: disable=broad-except
-                                    pass
-                coder_output_path = log_dir / f"coder_output_round_{round_idx}.txt"
-                _write_text(coder_output_path, coder_output)
+                                    phoenix_obs.set_io(codex_span, output_text=coder_output)
 
-                diff_text = _git_diff_with_untracked(worktree_path)
-                diff_path = log_dir / f"diff_round_{round_idx}.diff"
-                _write_text(diff_path, diff_text)
-
-                if coder_self_check_rounds:
-                    if diff_text.strip():
-                        _write_text(log_dir / f"diff_round_{round_idx}_pre_self_check.diff", diff_text)
-                    for pass_idx in range(1, coder_self_check_rounds + 1):
-                        self_check_prompt = _render_prompt(
-                            _read_text(coder_self_check_prompt_path),
-                            idea_text=idea_text,
-                            plan_text=plan_text,
-                            repo_context=coder_context,
-                            prev_diff_text=diff_text,
-                            meta_model_context=meta_model_context,
-                        )
-                        self_check_prompt_path = log_dir / f"coder_self_check_prompt_round_{round_idx}_pass_{pass_idx}.txt"
-                        _write_text(self_check_prompt_path, self_check_prompt)
-                        self_check_output = ""
-                        if args.dry_run_llm:
-                            self_check_output = "(dry-run) skipped Codex self-check edits."
-                        else:
-                            _ensure_trace_processor_registered()
-                            round_tag = f"{round_idx}_selfcheck_{pass_idx}"
-                            with _tracing_scope(
-                                exp_dir=log_dir,
-                                run_id=run_id,
-                                step="coder_self_check",
-                                round_idx=round_tag,
-                            ):
-                                codex_span_cm = contextlib.nullcontext()
-                                if phoenix_tracer is not None:
-                                    codex_span_cm = phoenix_tracer.start_as_current_span(
-                                        "agentic.codex_self_check",
-                                        attributes={
-                                            "run_id": run_id,
-                                            "step": "coder_self_check",
-                                            "round_idx": round_tag,
-                                            "backend": coder_backend,
-                                            "worktree_path": str(worktree_path),
-                                            "coder_self_check_prompt_path": str(self_check_prompt_path),
-                                            "codex_session_id": str(codex_session_id) if codex_session_id else None,
-                                        },
-                                    )
-                                with codex_span_cm as codex_span:
-                                    if phoenix_obs is not None and codex_span is not None:
-                                        phoenix_obs.set_openinference_kind(codex_span, "TOOL")
-                                        phoenix_obs.set_attrs(codex_span, {"tool.name": "codex"})
-                                        phoenix_obs.set_text(codex_span, "system_prompt", coder_system or "")
-
-                                    if coder_backend in ("cli", "cli_session", "codex_cli", "codex-cli"):
-                                        full_prompt = ""
-                                        if codex_session_id is None:
-                                            full_prompt = (coder_system or "").strip()
-                                            if full_prompt:
-                                                full_prompt += "\n\n"
-                                        full_prompt += (self_check_prompt or "").strip() + "\n"
-                                        if phoenix_obs is not None and codex_span is not None:
-                                            phoenix_obs.set_io(codex_span, input_text=full_prompt)
-                                        self_check_output, codex_session_id = await _codex_cli_edit_repo(
-                                            worktree_path=worktree_path,
-                                            prompt=full_prompt,
-                                            exp_dir=exp_dir,
-                                            round_idx=round_tag,
-                                            session_id=codex_session_id,
-                                            codex_cli_cfg=config.get("codex_cli"),
-                                        )
-                                    else:
-                                        if phoenix_obs is not None and codex_span is not None:
-                                            phoenix_obs.set_io(codex_span, input_text=self_check_prompt)
-                                        self_check_output, codex_session_id = await _codex_mcp_edit_repo(
-                                            worktree_path=worktree_path,
-                                            codex_mcp_cfg=codex_mcp_cfg,
-                                            agent_cfg=config.get("agents", {}).get("coder", {}),
-                                            system_prompt=coder_system,
-                                            user_prompt=self_check_prompt,
-                                            max_turns=max_turns,
-                                            session_id=codex_session_id,
-                                        )
-
-                                    if phoenix_obs is not None and codex_span is not None:
+                                codex_details_path, codex_details_preview = _write_codex_run_details(
+                                    exp_dir=exp_dir,
+                                    run_id=run_id,
+                                    round_idx=round_idx,
+                                    backend=coder_backend,
+                                    worktree_path=worktree_path,
+                                )
+                                if phoenix_obs is not None and codex_span is not None and codex_details_path:
+                                    try:
                                         phoenix_obs.set_attrs(
                                             codex_span,
-                                            {"codex_session_id": str(codex_session_id) if codex_session_id else None},
+                                            {
+                                                "codex.run_details_path": codex_details_path,
+                                            },
                                         )
-                                        phoenix_obs.set_io(codex_span, output_text=self_check_output)
+                                        if codex_details_preview:
+                                            phoenix_obs.set_text(
+                                                codex_span, "codex.run_details_json", codex_details_preview
+                                            )
+                                    except Exception:  # pylint: disable=broad-except
+                                        pass
 
-                        self_check_output_path = log_dir / f"coder_self_check_output_round_{round_idx}_pass_{pass_idx}.txt"
-                        _write_text(self_check_output_path, self_check_output)
-                        self_check_outputs.append(self_check_output)
-                        diff_text = _git_diff_with_untracked(worktree_path)
-                        _write_text(diff_path, diff_text)
+                                if mcp_session is not None and not coder_self_check_rounds:
+                                    await mcp_session.aclose()
+                                    mcp_session = None
+                    coder_output_path = log_dir / f"coder_output_round_{round_idx}.txt"
+                    _write_text(coder_output_path, coder_output)
+
+                    diff_text = _git_diff_with_untracked(worktree_path)
+                    diff_path = log_dir / f"diff_round_{round_idx}.diff"
+                    _write_text(diff_path, diff_text)
+
+                    if coder_self_check_rounds:
+                        if diff_text.strip():
+                            _write_text(log_dir / f"diff_round_{round_idx}_pre_self_check.diff", diff_text)
+                        for pass_idx in range(1, coder_self_check_rounds + 1):
+                            self_check_prompt = _render_prompt(
+                                _read_text(coder_self_check_prompt_path),
+                                idea_text=idea_text,
+                                plan_text=plan_text,
+                                repo_context=coder_context,
+                                prev_diff_text=diff_text,
+                                meta_model_context=meta_model_context,
+                            )
+                            self_check_prompt_path = (
+                                log_dir / f"coder_self_check_prompt_round_{round_idx}_pass_{pass_idx}.txt"
+                            )
+                            _write_text(self_check_prompt_path, self_check_prompt)
+                            self_check_output = ""
+                            if args.dry_run_llm:
+                                self_check_output = "(dry-run) skipped Codex self-check edits."
+                            else:
+                                _ensure_trace_processor_registered()
+                                round_tag = f"{round_idx}_selfcheck_{pass_idx}"
+                                with _tracing_scope(
+                                    exp_dir=log_dir,
+                                    run_id=run_id,
+                                    step="coder_self_check",
+                                    round_idx=round_tag,
+                                ):
+                                    codex_span_cm = contextlib.nullcontext()
+                                    if phoenix_tracer is not None:
+                                        codex_span_cm = phoenix_tracer.start_as_current_span(
+                                            "agentic.codex_self_check",
+                                            attributes={
+                                                "run_id": run_id,
+                                                "step": "coder_self_check",
+                                                "round_idx": round_tag,
+                                                "backend": coder_backend,
+                                                "worktree_path": str(worktree_path),
+                                                "coder_self_check_prompt_path": str(self_check_prompt_path),
+                                                "codex_session_id": str(codex_session_id) if codex_session_id else None,
+                                            },
+                                        )
+                                    with codex_span_cm as codex_span:
+                                        if phoenix_obs is not None and codex_span is not None:
+                                            phoenix_obs.set_openinference_kind(codex_span, "TOOL")
+                                            phoenix_obs.set_attrs(codex_span, {"tool.name": "codex"})
+                                            phoenix_obs.set_text(codex_span, "system_prompt", coder_system or "")
+
+                                        if coder_backend in ("cli", "cli_session", "codex_cli", "codex-cli"):
+                                            full_prompt = ""
+                                            if codex_session_id is None:
+                                                full_prompt = (coder_system or "").strip()
+                                                if full_prompt:
+                                                    full_prompt += "\n\n"
+                                            full_prompt += (self_check_prompt or "").strip() + "\n"
+                                            if phoenix_obs is not None and codex_span is not None:
+                                                phoenix_obs.set_io(codex_span, input_text=full_prompt)
+                                            self_check_output, codex_session_id = await _codex_cli_edit_repo(
+                                                worktree_path=worktree_path,
+                                                prompt=full_prompt,
+                                                exp_dir=exp_dir,
+                                                round_idx=round_tag,
+                                                session_id=codex_session_id,
+                                                codex_cli_cfg=config.get("codex_cli"),
+                                            )
+                                        else:
+                                            if phoenix_obs is not None and codex_span is not None:
+                                                phoenix_obs.set_io(codex_span, input_text=self_check_prompt)
+                                            if mcp_session is None:
+                                                mcp_session = await _open_codex_mcp_session(
+                                                    worktree_path=worktree_path, codex_mcp_cfg=codex_mcp_cfg
+                                                )
+                                            self_check_output, codex_session_id = await _codex_mcp_edit_repo(
+                                                worktree_path=worktree_path,
+                                                codex_mcp_cfg=codex_mcp_cfg,
+                                                agent_cfg=config.get("agents", {}).get("coder", {}),
+                                                system_prompt=coder_system,
+                                                user_prompt=self_check_prompt,
+                                                max_turns=max_turns,
+                                                session_id=codex_session_id,
+                                                mcp_session=mcp_session,
+                                            )
+
+                                        if phoenix_obs is not None and codex_span is not None:
+                                            phoenix_obs.set_attrs(
+                                                codex_span,
+                                                {"codex_session_id": str(codex_session_id) if codex_session_id else None},
+                                            )
+                                            phoenix_obs.set_io(codex_span, output_text=self_check_output)
+
+                                        if mcp_session is not None and pass_idx == coder_self_check_rounds:
+                                            await mcp_session.aclose()
+                                            mcp_session = None
+
+                            self_check_output_path = (
+                                log_dir / f"coder_self_check_output_round_{round_idx}_pass_{pass_idx}.txt"
+                            )
+                            _write_text(self_check_output_path, self_check_output)
+                            self_check_outputs.append(self_check_output)
+                            diff_text = _git_diff_with_untracked(worktree_path)
+                            _write_text(diff_path, diff_text)
+                finally:
+                    if mcp_session is not None:
+                        await mcp_session.aclose()
+                        mcp_session = None
 
                 if run_span is not None:
                     try:
@@ -1977,7 +2023,39 @@ def _resolve_codex_cli_prefix(*, codex_cli_cfg=None):
     return ["codex"]
 
 
-async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, system_prompt, user_prompt, max_turns, session_id=None):
+@dataclasses.dataclass
+class _CodexMcpSession:
+    session: Any
+    stack: contextlib.AsyncExitStack
+    session_arg_key: Optional[str]
+    reply_session_arg_key: Optional[str]
+    command: str
+    args: list[str]
+    worktree_path: str
+    client_session_timeout_seconds: int
+    prev_cwd: str
+    closed: bool = False
+
+    async def aclose(self) -> None:
+        if self.closed:
+            return
+        try:
+            _append_codex_transcript(
+                {
+                    "event": "mcp_server_stop",
+                    "server": "Codex CLI",
+                    "cwd": str(Path(self.worktree_path).resolve()),
+                }
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                await self.stack.aclose()
+            with contextlib.suppress(Exception):
+                os.chdir(self.prev_cwd)
+            self.closed = True
+
+
+async def _open_codex_mcp_session(*, worktree_path, codex_mcp_cfg):
     # The coder step delegates to Codex CLI via MCP. We intentionally avoid the Agents SDK MCP wrapper
     # so we can supply an elicitation callback. Codex uses MCP elicitation to request approvals for
     # commands/patches; without this callback, the default MCP client responds "Elicitation not supported",
@@ -2001,15 +2079,6 @@ async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, syste
     args = (codex_mcp_cfg or {}).get("args") or ["-y", "codex", "mcp-server"]
     client_session_timeout_seconds = int((codex_mcp_cfg or {}).get("client_session_timeout_seconds", 360000))
 
-    # Keep the prompt small after we have a session/thread handle; this mirrors the CLI backend's
-    # `exec resume <id>` behavior and avoids repeatedly sending the full system prompt.
-    full_prompt = ""
-    if not session_id:
-        full_prompt = (system_prompt or "").strip()
-        if full_prompt:
-            full_prompt += "\n\n"
-    full_prompt += (user_prompt or "").strip() + "\n"
-
     async def _elicitation_callback(_context, params):  # noqa: ANN001
         # Auto-accept elicitation so Codex can proceed non-interactively.
         #
@@ -2030,6 +2099,7 @@ async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, syste
 
     prev = os.getcwd()
     os.chdir(worktree_path)
+    stack = contextlib.AsyncExitStack()
     try:
         _append_codex_transcript(
             {
@@ -2043,104 +2113,181 @@ async def _codex_mcp_edit_repo(*, worktree_path, codex_mcp_cfg, agent_cfg, syste
         )
 
         server_params = mcp_stdio.StdioServerParameters(command=command, args=list(args), cwd=str(worktree_path))
-        async with mcp_stdio.stdio_client(server_params) as (read, write):
-            async with ClientSession(
+        read, write = await stack.enter_async_context(mcp_stdio.stdio_client(server_params))
+        session = await stack.enter_async_context(
+            ClientSession(
                 read,
                 write,
                 timedelta(seconds=client_session_timeout_seconds) if client_session_timeout_seconds else None,
                 elicitation_callback=_elicitation_callback,
-            ) as session:
-                await session.initialize()
+            )
+        )
+        await session.initialize()
 
-                # Record tools (useful for debugging version/config mismatches).
-                codex_tool_json = None
-                session_arg_key = None
-                try:
-                    tools_result = await session.list_tools()
-                    tools_json = _to_jsonable(tools_result)
-                    codex_tool = None
-                    try:
-                        for tool in (getattr(tools_result, "tools", None) or []):
-                            if getattr(tool, "name", None) == "codex":
-                                codex_tool = tool
-                                break
-                    except Exception:  # pylint: disable=broad-except
-                        codex_tool = None
-                    codex_tool_json = _to_jsonable(codex_tool) if codex_tool else None
-                    if isinstance(codex_tool_json, dict):
-                        session_arg_key = _pick_session_arg_key(
-                            codex_tool_json.get("inputSchema") or codex_tool_json.get("input_schema")
+        # Record tools (useful for debugging version/config mismatches).
+        codex_tool_json = None
+        codex_reply_tool_json = None
+        session_arg_key = None
+        reply_session_arg_key = None
+        try:
+            tools_result = await session.list_tools()
+            tools_json = _to_jsonable(tools_result)
+            codex_tool = None
+            codex_reply_tool = None
+            try:
+                for tool in (getattr(tools_result, "tools", None) or []):
+                    tool_name = getattr(tool, "name", None)
+                    if tool_name == "codex":
+                        codex_tool = tool
+                    elif tool_name == "codex-reply":
+                        codex_reply_tool = tool
+            except Exception:  # pylint: disable=broad-except
+                codex_tool = None
+                codex_reply_tool = None
+            codex_tool_json = _to_jsonable(codex_tool) if codex_tool else None
+            codex_reply_tool_json = _to_jsonable(codex_reply_tool) if codex_reply_tool else None
+            if isinstance(codex_tool_json, dict):
+                session_arg_key = _pick_session_arg_key(
+                    codex_tool_json.get("inputSchema") or codex_tool_json.get("input_schema")
+                )
+            if isinstance(codex_reply_tool_json, dict):
+                reply_session_arg_key = _pick_session_arg_key(
+                    codex_reply_tool_json.get("inputSchema") or codex_reply_tool_json.get("input_schema")
+                )
+            _append_codex_transcript(
+                {
+                    "event": "mcp_list_tools",
+                    "server": "Codex CLI",
+                    "tools": [t.name for t in getattr(tools_result, "tools", [])],
+                    "codex_tool_input_keys": (
+                        sorted(
+                            (
+                                (codex_tool_json.get("inputSchema") or {}).get("properties") or {}
+                                if isinstance(codex_tool_json, dict)
+                                else {}
+                            ).keys()
                         )
-                    _append_codex_transcript(
-                        {
-                            "event": "mcp_list_tools",
-                            "server": "Codex CLI",
-                            "tools": [t.name for t in getattr(tools_result, "tools", [])],
-                            "codex_tool_input_keys": (
-                                sorted(
-                                    (
-                                        (codex_tool_json.get("inputSchema") or {}).get("properties") or {}
-                                        if isinstance(codex_tool_json, dict)
-                                        else {}
-                                    ).keys()
-                                )
-                                if codex_tool_json
-                                else None
-                            ),
-                            "codex_tool_session_arg_key": session_arg_key,
-                            "mcp_list_tools_raw": tools_json,
-                        }
-                    )
-                except Exception as exc:  # pylint: disable=broad-except
-                    _append_codex_transcript(
-                        {
-                            "event": "mcp_list_tools_error",
-                            "server": "Codex CLI",
-                            "error": str(exc),
-                        }
-                    )
-
-                # Best-effort: if the Codex MCP tool exposes a session/thread handle in its input
-                # schema, pass it back to resume conversation state across calls.
-                call_args = {
-                    "prompt": full_prompt,
-                    "approval-policy": "on-request",
-                    "sandbox": "workspace-write",
+                        if codex_tool_json
+                        else None
+                    ),
+                    "codex_tool_session_arg_key": session_arg_key,
+                    "codex_reply_tool_input_keys": (
+                        sorted(
+                            (
+                                (codex_reply_tool_json.get("inputSchema") or {}).get("properties") or {}
+                                if isinstance(codex_reply_tool_json, dict)
+                                else {}
+                            ).keys()
+                        )
+                        if codex_reply_tool_json
+                        else None
+                    ),
+                    "codex_reply_tool_session_arg_key": reply_session_arg_key,
+                    "mcp_list_tools_raw": tools_json,
                 }
-                if session_id and session_arg_key:
-                    call_args[session_arg_key] = str(session_id)
-                _append_codex_transcript(
-                    {
-                        "event": "tool_call",
-                        "server": "Codex CLI",
-                        "tool": "codex",
-                        "input": call_args,
-                        "resume_session_id": str(session_id) if session_id else None,
-                        "resume_session_arg_key": session_arg_key,
-                    }
-                )
-                result = await session.call_tool("codex", call_args)
-                result_json = _to_jsonable(result)
-                new_session_id = _find_first_session_id(result_json) or session_id
-                _append_codex_transcript(
-                    {
-                        "event": "tool_result",
-                        "server": "Codex CLI",
-                        "tool": "codex",
-                        "output": result_json,
-                        "new_session_id": str(new_session_id) if new_session_id else None,
-                    }
-                )
-                return _call_tool_result_to_text(result), new_session_id
-    finally:
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            _append_codex_transcript(
+                {
+                    "event": "mcp_list_tools_error",
+                    "server": "Codex CLI",
+                    "error": str(exc),
+                }
+            )
+
+        return _CodexMcpSession(
+            session=session,
+            stack=stack,
+            session_arg_key=session_arg_key,
+            reply_session_arg_key=reply_session_arg_key,
+            command=command,
+            args=list(args),
+            worktree_path=str(worktree_path),
+            client_session_timeout_seconds=client_session_timeout_seconds,
+            prev_cwd=prev,
+        )
+    except Exception:
+        with contextlib.suppress(Exception):
+            await stack.aclose()
+        with contextlib.suppress(Exception):
+            os.chdir(prev)
+        raise
+
+
+async def _codex_mcp_edit_repo(
+    *,
+    worktree_path,
+    codex_mcp_cfg,
+    agent_cfg,
+    system_prompt,
+    user_prompt,
+    max_turns,
+    session_id=None,
+    mcp_session: Optional[_CodexMcpSession] = None,
+):
+    # Keep the prompt small after we have a session/thread handle; this mirrors the CLI backend's
+    # `exec resume <id>` behavior and avoids repeatedly sending the full system prompt.
+    full_prompt = ""
+    if not session_id:
+        full_prompt = (system_prompt or "").strip()
+        if full_prompt:
+            full_prompt += "\n\n"
+    full_prompt += (user_prompt or "").strip() + "\n"
+
+    close_session = False
+    session_ctx = mcp_session
+    if session_ctx is None:
+        session_ctx = await _open_codex_mcp_session(worktree_path=worktree_path, codex_mcp_cfg=codex_mcp_cfg)
+        close_session = True
+
+    try:
+        # Best-effort: if Codex exposes a reply tool, use it to resume an existing thread.
+        # Otherwise fall back to the base Codex tool (optionally passing session id if supported).
+        tool_name = "codex"
+        resume_session_arg_key = session_ctx.session_arg_key
+        if session_id and session_ctx.reply_session_arg_key:
+            tool_name = "codex-reply"
+            resume_session_arg_key = session_ctx.reply_session_arg_key
+
+        if tool_name == "codex-reply":
+            call_args = {
+                "prompt": full_prompt,
+                resume_session_arg_key: str(session_id),
+            }
+        else:
+            call_args = {
+                "prompt": full_prompt,
+                "approval-policy": "on-request",
+                "sandbox": "workspace-write",
+            }
+            if session_id and resume_session_arg_key:
+                call_args[resume_session_arg_key] = str(session_id)
         _append_codex_transcript(
             {
-                "event": "mcp_server_stop",
+                "event": "tool_call",
                 "server": "Codex CLI",
-                "cwd": str(Path(worktree_path).resolve()),
+                "tool": tool_name,
+                "input": call_args,
+                "resume_session_id": str(session_id) if session_id else None,
+                "resume_session_arg_key": resume_session_arg_key,
             }
         )
-        os.chdir(prev)
+        result = await session_ctx.session.call_tool(tool_name, call_args)
+        result_json = _to_jsonable(result)
+        new_session_id = _find_first_session_id(result_json) or session_id
+        _append_codex_transcript(
+            {
+                "event": "tool_result",
+                "server": "Codex CLI",
+                "tool": tool_name,
+                "output": result_json,
+                "new_session_id": str(new_session_id) if new_session_id else None,
+            }
+        )
+        return _call_tool_result_to_text(result), new_session_id
+    finally:
+        if close_session and session_ctx is not None:
+            await session_ctx.aclose()
 
 
 def _parse_reviewer_verdict(text):
