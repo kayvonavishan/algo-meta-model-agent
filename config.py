@@ -29,10 +29,24 @@ class MetaConfig:
     hit_asymmetry_weight: float = 0.06  # weight for hit rate asymmetry signal
     hit_asymmetry_lookback: int = 10  # lookback window for asymmetric hit rates
     hit_asymmetry_threshold: float = 0.75  # percentile threshold for "top" performance
+    breakout_weight: float = 0.08  # weight for top-tier breakout signal
+    breakout_threshold: float = 0.80  # rank percentile threshold for top tier
+    breakout_lookback: int = 4  # lookback window for breakout stability
+    breakout_oscillation_penalty: float = 0.5  # penalty for oscillators around threshold
+    rank_durability_weight: float = 0.08  # weight for rank durability signal
+    rank_durability_cap: int = 12  # max consecutive above-median tenure counted
+    velocity_confirmation_weight: float = 0.06  # weight for velocity confirmation signal
+    velocity_lookback: int = 3  # lookback window for velocity confirmation
+    velocity_threshold: float = 0.02  # minimum delta magnitude to count as moving
     
     # Confidence (training-free)
     conf_lookback: int = 12
     conf_eps: float = 1e-8
+
+    # Score spread gating (training-free)
+    score_spread_boost_weight: float = 0.10
+    score_spread_lookback: int = 4
+    score_spread_z_threshold: float = 0.5
     
     # Risk penalty (training-free)
     risk_lookback: int = 20
@@ -73,3 +87,9 @@ class MetaConfig:
             self.downside_vol_lookback = 2
         if self.downside_vol_threshold_z < 0:
             self.downside_vol_threshold_z = 0.0
+        if self.rank_durability_cap < 1:
+            self.rank_durability_cap = 1
+        if self.velocity_lookback < 2:
+            self.velocity_lookback = 2
+        if self.velocity_threshold < 0:
+            self.velocity_threshold = 0.0

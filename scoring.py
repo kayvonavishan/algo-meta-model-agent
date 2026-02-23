@@ -208,6 +208,27 @@ def percentile_ranks_across_models_v2(x: np.ndarray, axis: int = 0) -> np.ndarra
         return out
 
 
+def compute_rank_durability_raw(Q: np.ndarray, cap: int) -> np.ndarray:
+    """
+    Compute consecutive above-median tenure ending at t-1 for each period t.
+    """
+    Q = np.asarray(Q, dtype=float)
+    cap = int(max(1, cap))
+    n_models, T = Q.shape
+    if T == 0:
+        return np.zeros_like(Q, dtype=float)
+    is_above = (Q > 0.5) & np.isfinite(Q)
+    tenure_end = np.zeros((n_models, T), dtype=int)
+    tenure_end[:, 0] = is_above[:, 0].astype(int)
+    for t in range(1, T):
+        inc = tenure_end[:, t - 1] + 1
+        tenure_end[:, t] = np.where(is_above[:, t], np.minimum(inc, cap), 0)
+    durability_raw = np.zeros((n_models, T), dtype=float)
+    if T > 1:
+        durability_raw[:, 1:] = tenure_end[:, :-1]
+    return durability_raw
+
+
 def compute_uniqueness_weights(returns_matrix: pd.DataFrame, cfg: MetaConfig) -> pd.Series:
     """
     Simple duplicate control:
@@ -400,6 +421,54 @@ def compute_scores_for_ticker_v2(
         # 4) Percentile ranks per period across models
         # Q shape: (n_models, T) with time axis last (most recent at end).
         Q = percentile_ranks_across_models_v2(R, axis=0)
+
+        durability_norm = None
+        if cfg.rank_durability_weight != 0:
+            durability_raw = compute_rank_durability_raw(Q, cfg.rank_durability_cap)
+            durability_norm = percentile_ranks_across_models_v2(durability_raw, axis=0)
+
+        breakout_norm = None
+        if cfg.breakout_weight != 0:
+            L = cfg.breakout_lookback
+            thr = cfg.breakout_threshold
+            breakout_raw = np.zeros_like(Q, dtype=float)
+            for t in range(T):
+                start = max(0, t - L)
+                if start >= t:
+                    continue
+                q_t = Q[:, t]
+                q_prev = Q[:, start:t]
+                q_prev_nan = np.isnan(q_prev).any(axis=1)
+                was_below_recently = np.any(q_prev <= thr, axis=1) & ~q_prev_nan
+                is_above = (q_t > thr) & np.isfinite(q_t)
+
+                q_win = Q[:, start:t + 1]
+                if q_win.shape[1] >= 2:
+                    q_win_filled = np.where(np.isfinite(q_win), q_win, -np.inf)
+                    above_int = (q_win_filled > thr).astype(int)
+                    crossings = np.sum(np.abs(np.diff(above_int, axis=1)), axis=1)
+                else:
+                    crossings = np.zeros(n_models, dtype=int)
+
+                eligible = is_above & was_below_recently
+                if np.any(eligible):
+                    penalized = 1.0 - cfg.breakout_oscillation_penalty
+                    breakout_raw[eligible & (crossings <= 2), t] = 1.0
+                    breakout_raw[eligible & (crossings > 2), t] = penalized
+                breakout_raw[~np.isfinite(q_t), t] = 0.0
+
+            breakout_norm = np.zeros_like(breakout_raw, dtype=float)
+            for t in range(T):
+                col = breakout_raw[:, t]
+                finite = np.isfinite(col)
+                if finite.sum() < 2:
+                    continue
+                col_vals = col[finite]
+                if np.min(col_vals) == np.max(col_vals):
+                    continue
+                ranks = percentile_ranks_across_models_v2(col)
+                ranks = np.where(np.isfinite(ranks), ranks, 0.0)
+                breakout_norm[:, t] = ranks
     
         # 5) Adaptive EWMA momentum on Q (time-varying alpha)
         if cfg.enable_momentum_lookback:
@@ -467,6 +536,40 @@ def compute_scores_for_ticker_v2(
         D = np.zeros_like(Q, dtype=float)
         D[:, 1:] = Q[:, 1:] - Q[:, :-1]
 
+        velocity_confirmation_norm = None
+        if cfg.velocity_confirmation_weight != 0:
+            L = cfg.velocity_lookback
+            velocity_confirmation_raw = np.full((n_models, T), 0.5, dtype=float)
+            if T > 1 and L >= 2:
+                start_t = max(L - 1, 1)
+                for t in range(start_t, T):
+                    d_t = D[:, t]
+                    current_significant = (np.abs(d_t) > cfg.velocity_threshold) & np.isfinite(d_t)
+                    if not np.any(current_significant):
+                        continue
+                    d_window = D[:, t - L + 1:t + 1]
+                    is_finite = np.isfinite(d_window)
+                    is_significant = (np.abs(d_window) > cfg.velocity_threshold) & is_finite
+                    sign_match = (np.sign(d_window) == np.sign(d_t)[:, None]) & is_significant
+                    match_count = sign_match.sum(axis=1)
+                    total_significant = is_significant.sum(axis=1)
+                    confirmation_ratio = np.divide(
+                        match_count,
+                        total_significant,
+                        out=np.full_like(match_count, 0.5, dtype=float),
+                        where=total_significant > 0,
+                    )
+                    velocity_confirmation_raw[current_significant, t] = confirmation_ratio[current_significant]
+            velocity_confirmation_norm = percentile_ranks_across_models_v2(
+                velocity_confirmation_raw,
+                axis=0,
+            )
+            velocity_confirmation_norm = np.where(
+                np.isfinite(velocity_confirmation_norm),
+                velocity_confirmation_norm,
+                0.5,
+            )
+
         # 6b) Efficiency ratio (momentum smoothness) over a rolling window
         returns_t = None
         eff_norm = None
@@ -500,8 +603,14 @@ def compute_scores_for_ticker_v2(
             base_forecast = base_forecast + cfg.momentum_sharpe_weight * mom_sharpe_norm
         if rank_persist_norm is not None:
             base_forecast = base_forecast + cfg.rank_persistence_weight * rank_persist_norm
+        if cfg.rank_durability_weight != 0 and durability_norm is not None:
+            base_forecast = base_forecast + cfg.rank_durability_weight * durability_norm
         if hit_asym_norm is not None:
             base_forecast = base_forecast + cfg.hit_asymmetry_weight * hit_asym_norm
+        if breakout_norm is not None:
+            base_forecast = base_forecast + cfg.breakout_weight * breakout_norm
+        if cfg.velocity_confirmation_weight != 0 and velocity_confirmation_norm is not None:
+            base_forecast = base_forecast + cfg.velocity_confirmation_weight * velocity_confirmation_norm
     
         # 7) Ticker-local baseline
         if cfg.baseline_method == "mean":
@@ -556,6 +665,29 @@ def compute_scores_for_ticker_v2(
         if downside_vol_pen is not None:
             SCORE = SCORE - downside_vol_pen
         SCORE = (uniq_w[:, None] * SCORE)
+
+        if cfg.score_spread_boost_weight != 0:
+            score_spread = np.full(T, np.nan, dtype=float)
+            for t in range(T):
+                col = SCORE[:, t]
+                if np.isfinite(col).sum() < 2:
+                    continue
+                q75 = np.nanpercentile(col, 75)
+                q25 = np.nanpercentile(col, 25)
+                score_spread[t] = q75 - q25
+            spread_series = pd.Series(score_spread, dtype=float)
+            roll = spread_series.shift(1).rolling(
+                window=cfg.score_spread_lookback,
+                min_periods=2,
+            )
+            roll_mean = roll.mean().to_numpy()
+            roll_std = roll.std(ddof=1).to_numpy()
+            eps = 1e-12
+            spread_z = (score_spread - roll_mean) / (roll_std + eps)
+            excess = spread_z - cfg.score_spread_z_threshold
+            excess = np.where(np.isfinite(excess), np.maximum(0.0, excess), 0.0)
+            gate = 1.0 + cfg.score_spread_boost_weight * excess
+            SCORE = SCORE * gate[None, :]
         scores_df = pd.DataFrame(SCORE, index=models, columns=periods)
     
         # Ticker gate score per period: median of TopM
