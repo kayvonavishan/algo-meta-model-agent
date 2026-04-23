@@ -65,9 +65,9 @@ def build_config_grid_v1(n_configs: int = 100, seed: int = 42) -> List[Dict[str,
     alpha_pairs = [(0.25, 0.65), (0.30, 0.70), (0.35, 0.75)]
     alpha_smooths = [0.2, 0.3, 0.4]
     momentum_lookbacks = [8, 12, 16]
-    delta_weights = [0.0, 0.1, 0.2, 0.3]
+    delta_weights = [0.0, 0.1, 0.2]
     conf_lookbacks = [8, 12, 16]
-    risk_lookbacks = [10, 20, 30]
+    risk_lookbacks = [20, 30]
     cvar_alphas = [0.05, 0.10, 0.15]
     cvar_risk_aversions = [0.5, 0.75, 1.0]
     grid = {
